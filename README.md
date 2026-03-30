@@ -8,7 +8,7 @@ TurboQuant compresses the KV cache to ~3 bits per element (down from 16-bit fp16
 
 | Model | Without TurboQuant | With TurboQuant |
 |-------|-------------------|-----------------|
-| Llama 3.3 70B (AWQ) | ~6K context | **32K context** |
+| Llama 3.3 70B (AWQ) | ~12K context | **32K context** |
 | Qwen 2.5 72B (AWQ) | ~8K context | **16K context** |
 
 ## Architecture
