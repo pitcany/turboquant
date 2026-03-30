@@ -177,6 +177,10 @@ def update_env_file(config: Config) -> None:
         "VLLM_TP_MAX_MODEL_LEN": str(config.max_model_len),
         "VLLM_TP_EXTRA_ARGS": config.extra_args,
         "TQ_HYBRID": "1" if config.hybrid else "0",
+        # Disable TQ KV cache patch for standard (non-TQ) configs so the
+        # plugin doesn't allocate compressed-sized pages for fp16 data.
+        "TQ_USE_TRITON": "1" if config.turboquant else "0",
+        "TQ_PATCH_KV": "1" if config.turboquant else "0",
     }
     new_lines = []
     seen_keys = set()
