@@ -50,7 +50,34 @@ class Config:
 # Only difference between standard/TQ/hybrid: --attention-backend and TQ_HYBRID
 # Everything else (quantization, enforce-eager, context) is held constant.
 CONFIGS = [
-    # Llama 3.3 70B — all at 32768, awq_marlin, enforce-eager
+    # ── Llama 3.3 70B: find max standard context ────────────────────
+    Config(
+        name="llama70b-standard-8k",
+        hf_model="casperhansen/llama-3.3-70b-instruct-awq",
+        served_name="llama-3.3-70b-bench",
+        quantization="awq_marlin",
+        max_model_len=8192,
+        extra_args="--enforce-eager",
+        turboquant=False,
+    ),
+    Config(
+        name="llama70b-standard-12k",
+        hf_model="casperhansen/llama-3.3-70b-instruct-awq",
+        served_name="llama-3.3-70b-bench",
+        quantization="awq_marlin",
+        max_model_len=12288,
+        extra_args="--enforce-eager",
+        turboquant=False,
+    ),
+    Config(
+        name="llama70b-standard-16k",
+        hf_model="casperhansen/llama-3.3-70b-instruct-awq",
+        served_name="llama-3.3-70b-bench",
+        quantization="awq_marlin",
+        max_model_len=16384,
+        extra_args="--enforce-eager",
+        turboquant=False,
+    ),
     Config(
         name="llama70b-standard-32k",
         hf_model="casperhansen/llama-3.3-70b-instruct-awq",
@@ -60,6 +87,7 @@ CONFIGS = [
         extra_args="--enforce-eager",
         turboquant=False,
     ),
+    # ── Llama 3.3 70B: TQ and hybrid at 32K ─────────────────────────
     Config(
         name="llama70b-turboquant-32k",
         hf_model="casperhansen/llama-3.3-70b-instruct-awq",
@@ -79,7 +107,25 @@ CONFIGS = [
         turboquant=True,
         hybrid=True,
     ),
-    # Qwen 2.5 72B — all at 16384, awq_marlin, enforce-eager
+    # ── Qwen 2.5 72B: find max standard context ─────────────────────
+    Config(
+        name="qwen2.5-72b-standard-8k",
+        hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
+        served_name="qwen2.5-72b-bench",
+        quantization="awq_marlin",
+        max_model_len=8192,
+        extra_args="--enforce-eager",
+        turboquant=False,
+    ),
+    Config(
+        name="qwen2.5-72b-standard-12k",
+        hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
+        served_name="qwen2.5-72b-bench",
+        quantization="awq_marlin",
+        max_model_len=12288,
+        extra_args="--enforce-eager",
+        turboquant=False,
+    ),
     Config(
         name="qwen2.5-72b-standard-16k",
         hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
@@ -89,6 +135,7 @@ CONFIGS = [
         extra_args="--enforce-eager",
         turboquant=False,
     ),
+    # ── Qwen 2.5 72B: TQ and hybrid at 16K ──────────────────────────
     Config(
         name="qwen2.5-72b-turboquant-16k",
         hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
