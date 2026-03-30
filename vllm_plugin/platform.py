@@ -15,18 +15,31 @@ logger = logging.getLogger(__name__)
 
 
 def register_turboquant() -> None:
-    """Register TurboQuant backend + patch KV cache allocation."""
+    """Register TurboQuant backend + patch KV cache allocation.
+
+    Set TQ_HYBRID=1 to use the hybrid backend (TQ compressed storage +
+    SDPA attention compute) instead of the default pure TQ backend.
+    """
+    import os
     try:
         from vllm.v1.attention.backends.registry import (
             AttentionBackendEnum,
             register_backend,
         )
-        register_backend(
-            AttentionBackendEnum.CUSTOM,
-            "vllm_plugin.attention.TurboQuantAttentionBackend",
-        )
+        use_hybrid = os.environ.get("TQ_HYBRID", "0") == "1"
+        if use_hybrid:
+            register_backend(
+                AttentionBackendEnum.CUSTOM,
+                "vllm_plugin.attention_hybrid.HybridTQAttentionBackend",
+            )
+            logger.info("[TurboQuant] Registered HYBRID (TQ storage + SDPA) as CUSTOM backend")
+        else:
+            register_backend(
+                AttentionBackendEnum.CUSTOM,
+                "vllm_plugin.attention.TurboQuantAttentionBackend",
+            )
+            logger.info("[TurboQuant] Registered as CUSTOM attention backend")
         _patch_kv_cache_spec()
-        logger.info("[TurboQuant] Registered as CUSTOM attention backend")
     except ImportError:
         logger.warning(
             "[TurboQuant] vLLM not available — skipping backend registration"

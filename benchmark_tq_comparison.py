@@ -44,12 +44,13 @@ class Config:
     max_model_len: int
     extra_args: str
     turboquant: bool
+    hybrid: bool = False
 
 
-# Only difference between standard/TQ pairs: --attention-backend CUSTOM
+# Only difference between standard/TQ/hybrid: --attention-backend and TQ_HYBRID
 # Everything else (quantization, enforce-eager, context) is held constant.
 CONFIGS = [
-    # Llama 3.3 70B — both at 32768, awq_marlin, enforce-eager
+    # Llama 3.3 70B — all at 32768, awq_marlin, enforce-eager
     Config(
         name="llama70b-standard-32k",
         hf_model="casperhansen/llama-3.3-70b-instruct-awq",
@@ -68,7 +69,17 @@ CONFIGS = [
         extra_args="--enforce-eager --attention-backend CUSTOM",
         turboquant=True,
     ),
-    # Qwen 2.5 72B — both at 16384, awq_marlin, enforce-eager
+    Config(
+        name="llama70b-hybrid-32k",
+        hf_model="casperhansen/llama-3.3-70b-instruct-awq",
+        served_name="llama-3.3-70b-bench",
+        quantization="awq_marlin",
+        max_model_len=32768,
+        extra_args="--enforce-eager --attention-backend CUSTOM",
+        turboquant=True,
+        hybrid=True,
+    ),
+    # Qwen 2.5 72B — all at 16384, awq_marlin, enforce-eager
     Config(
         name="qwen2.5-72b-standard-16k",
         hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
@@ -86,6 +97,16 @@ CONFIGS = [
         max_model_len=16384,
         extra_args="--enforce-eager --attention-backend CUSTOM",
         turboquant=True,
+    ),
+    Config(
+        name="qwen2.5-72b-hybrid-16k",
+        hf_model="Qwen/Qwen2.5-72B-Instruct-AWQ",
+        served_name="qwen2.5-72b-bench",
+        quantization="awq_marlin",
+        max_model_len=16384,
+        extra_args="--enforce-eager --attention-backend CUSTOM",
+        turboquant=True,
+        hybrid=True,
     ),
 ]
 
@@ -108,6 +129,7 @@ def update_env_file(config: Config) -> None:
         "VLLM_TP_QUANTIZATION": config.quantization,
         "VLLM_TP_MAX_MODEL_LEN": str(config.max_model_len),
         "VLLM_TP_EXTRA_ARGS": config.extra_args,
+        "TQ_HYBRID": "1" if config.hybrid else "0",
     }
     new_lines = []
     seen_keys = set()
@@ -218,6 +240,7 @@ def main():
         print(f"  Quant:   {config.quantization}")
         print(f"  Context: {config.max_model_len}")
         print(f"  TQ:      {config.turboquant}")
+        print(f"  Hybrid:  {config.hybrid}")
         print(f"{'='*60}")
 
         # Update env file
