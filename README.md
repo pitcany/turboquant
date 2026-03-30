@@ -91,18 +91,15 @@ bash serve_turboquant_vllm.sh all      # Server + smoke + bench
 | `TQ_B_MSE` | `2` | MSE quantization bits (Stage 1) |
 | `TQ_B_QJL` | `1` | QJL bits (Stage 2) |
 
-### gpu-models Integration
+### systemd Integration
 
-If you use the `gpu-models` systemd service manager, TurboQuant presets are available:
+For persistent serving, a systemd service (`vllm-tp`) can manage the vLLM process. Add an `ExecStartPre` to auto-install the plugin on each start:
 
-```bash
-gpu-models vllm llama-3.3-70b-tq       # Pure TQ, Llama 70B, 32K ctx
-gpu-models vllm llama-3.3-70b-hybrid   # Hybrid TQ+SDPA, 32K ctx
-gpu-models vllm qwen2.5-72b-tq         # Pure TQ, Qwen 72B, 16K ctx
-gpu-models vllm qwen2.5-72b-hybrid     # Hybrid TQ+SDPA, 16K ctx
+```ini
+ExecStartPre=/path/to/venv/bin/pip install --quiet -e /path/to/turboquant
 ```
 
-The systemd service automatically installs the plugin via `ExecStartPre`.
+The env file should include `TQ_USE_TRITON=1`, `TQ_NUM_KV_SPLITS=8`, and optionally `TQ_HYBRID=1`.
 
 ## Benchmarking
 
