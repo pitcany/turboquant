@@ -4,12 +4,12 @@ A from-scratch PyTorch implementation of [TurboQuant](https://arxiv.org/abs/2504
 
 ## What It Does
 
-TurboQuant compresses the KV cache to ~3 bits per element (down from 16-bit fp16), enabling **5x longer context windows** on the same GPU hardware. On a dual-GPU setup (RTX 4090 + RTX 5090), this means running Llama 3.3 70B at 32K context instead of 6K, or Qwen 2.5 72B at 16K instead of 8K.
+TurboQuant compresses the KV cache to ~3 bits per element (down from 16-bit fp16), enabling **5x longer context windows** on the same GPU hardware. On a dual-GPU setup (RTX 4090 + RTX 5090), this means running Llama 3.3 70B at 32K context instead of 12K, or Qwen 2.5 72B at 16K instead of 6K.
 
 | Model | Without TurboQuant | With TurboQuant |
 |-------|-------------------|-----------------|
 | Llama 3.3 70B (AWQ) | ~12K context | **32K context** |
-| Qwen 2.5 72B (AWQ) | ~8K context | **16K context** |
+| Qwen 2.5 72B (AWQ) | ~6K context | **16K context** |
 
 ## Architecture
 
