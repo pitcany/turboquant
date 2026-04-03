@@ -10,9 +10,11 @@ Reference: "TurboQuant: Online Vector Quantization with Near-optimal Distortion 
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 from lloyd_max import LloydMaxCodebook
+
+_NORM_EPS = 1e-8
 
 
 def generate_rotation_matrix(d: int, seed: Optional[int] = None, device: str = "cpu") -> torch.Tensor:
@@ -54,7 +56,7 @@ class TurboQuantMSE(nn.Module):
     Randomly rotates, then applies per-coordinate Lloyd-Max quantization.
     """
 
-    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu"):
+    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu") -> None:
         super().__init__()
         self.d = d
         self.bits = bits
@@ -80,17 +82,14 @@ class TurboQuantMSE(nn.Module):
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize vectors to codebook indices. Returns integer indices."""
         y = self.rotate(x)
-        # Find nearest centroid for each coordinate
-        diffs = y.unsqueeze(-1) - self.centroids  # (..., d, n_levels)
-        indices = diffs.abs().argmin(dim=-1)  # (..., d)
-        return indices
+        return torch.bucketize(y, self.boundaries.to(y.device))
 
     def dequantize(self, indices: torch.Tensor) -> torch.Tensor:
         """Dequantize indices back to vectors."""
         y_hat = self.centroids[indices]  # (..., d)
         return self.unrotate(y_hat)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Full quantize-dequantize cycle.
         Returns: (reconstructed_x, indices)
@@ -109,7 +108,7 @@ class TurboQuantProd(nn.Module):
     Effective: ~b bits per dimension (the QJL bit replaces one MSE bit)
     """
 
-    def __init__(self, d: int, bits: int, qjl_dim: Optional[int] = None, seed: int = 42, device: str = "cpu"):
+    def __init__(self, d: int, bits: int, qjl_dim: Optional[int] = None, seed: int = 42, device: str = "cpu") -> None:
         """
         Args:
             d: vector dimension
@@ -131,7 +130,7 @@ class TurboQuantProd(nn.Module):
         # Stage 2: QJL projection matrix
         self.register_buffer("S", generate_qjl_matrix(d, m=self.qjl_dim, seed=seed + 1, device=device))
 
-    def quantize(self, x: torch.Tensor) -> dict:
+    def quantize(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Full TurboQuant quantization.
 
@@ -145,7 +144,7 @@ class TurboQuantProd(nn.Module):
 
         # Compute residual
         residual = x - x_hat
-        residual_norm = torch.norm(residual, dim=-1, keepdim=True)  # (batch, 1)
+        residual_norm = torch.norm(residual, dim=-1, keepdim=True).clamp_min(_NORM_EPS)
 
         # Stage 2: QJL - project residual and take sign
         projected = residual @ self.S.T  # (batch, qjl_dim)
@@ -158,11 +157,11 @@ class TurboQuantProd(nn.Module):
             "residual_norm": residual_norm.squeeze(-1),
         }
 
-    def dequantize(self, compressed: dict) -> torch.Tensor:
+    def dequantize(self, compressed: dict[str, torch.Tensor]) -> torch.Tensor:
         """Dequantize MSE component (for reconstruction)."""
         return self.mse.dequantize(compressed["mse_indices"])
 
-    def inner_product(self, y: torch.Tensor, compressed: dict) -> torch.Tensor:
+    def inner_product(self, y: torch.Tensor, compressed: dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Compute unbiased inner product estimate: <y, x> using compressed representation of x.
 
@@ -191,7 +190,7 @@ class TurboQuantProd(nn.Module):
 
         return term1 + term2
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Quantize input vectors."""
         return self.quantize(x)
 
@@ -202,7 +201,7 @@ class TurboQuantKVCache:
     Drop-in replacement concept for a standard KV cache.
     """
 
-    def __init__(self, d_key: int, d_value: int, bits: int = 3, seed: int = 42, device: str = "cpu"):
+    def __init__(self, d_key: int, d_value: int, bits: int = 3, seed: int = 42, device: str = "cpu") -> None:
         self.d_key = d_key
         self.d_value = d_value
         self.bits = bits
@@ -217,7 +216,7 @@ class TurboQuantKVCache:
         self.key_cache = []    # list of compressed key dicts
         self.value_cache = []  # list of (indices,) tuples
 
-    def append(self, keys: torch.Tensor, values: torch.Tensor):
+    def append(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """
         Append new key-value pairs to cache.
         keys: (batch, seq_len, d_key) or (seq_len, d_key)
@@ -227,17 +226,24 @@ class TurboQuantKVCache:
         flat_keys = keys.reshape(-1, self.d_key)
         flat_values = values.reshape(-1, self.d_value)
 
-        compressed_keys = self.key_quantizer.quantize(flat_keys)
-        value_indices = self.value_quantizer.quantize(flat_values)
+        key_norms = torch.norm(flat_keys, dim=-1).clamp_min(_NORM_EPS)
+        value_norms = torch.norm(flat_values, dim=-1).clamp_min(_NORM_EPS)
+        key_units = flat_keys / key_norms.unsqueeze(-1)
+        value_units = flat_values / value_norms.unsqueeze(-1)
+
+        compressed_keys = self.key_quantizer.quantize(key_units)
+        value_indices = self.value_quantizer.quantize(value_units)
 
         self.key_cache.append({
             "mse_indices": compressed_keys["mse_indices"],
             "qjl_signs": compressed_keys["qjl_signs"],
             "residual_norm": compressed_keys["residual_norm"],
+            "key_norms": key_norms,
             "shape": orig_shape,
         })
         self.value_cache.append({
             "indices": value_indices,
+            "value_norms": value_norms,
             "shape": values.shape,
         })
 
@@ -251,27 +257,39 @@ class TurboQuantKVCache:
         """
         scores = []
         for cached in self.key_cache:
-            s = self.key_quantizer.inner_product(queries, cached)
+            s = self.key_quantizer.inner_product(queries, cached) * cached["key_norms"]
             scores.append(s)
-        return torch.cat(scores, dim=-1) if scores else torch.tensor([])
+        if scores:
+            return torch.cat(scores, dim=-1)
+        return torch.empty(0, device=queries.device, dtype=queries.dtype)
 
     def get_values(self) -> torch.Tensor:
         """Reconstruct all cached values."""
         values = []
         for cached in self.value_cache:
             v = self.value_quantizer.dequantize(cached["indices"])
+            v = v * cached["value_norms"].unsqueeze(-1)
             values.append(v)
-        return torch.cat(values, dim=0) if values else torch.tensor([])
+        if values:
+            return torch.cat(values, dim=0)
+        return torch.empty(0, self.d_value, device=self.value_quantizer.Pi.device)
 
-    def memory_usage_bits(self) -> dict:
+    def memory_usage_bits(self) -> dict[str, float]:
         """Estimate memory usage in bits."""
         n_keys = sum(c["mse_indices"].numel() for c in self.key_cache) if self.key_cache else 0
         n_qjl = sum(c["qjl_signs"].numel() for c in self.key_cache) if self.key_cache else 0
-        n_norms = sum(c["residual_norm"].numel() for c in self.key_cache) if self.key_cache else 0
+        n_residual_norms = sum(c["residual_norm"].numel() for c in self.key_cache) if self.key_cache else 0
+        n_key_norms = sum(c["key_norms"].numel() for c in self.key_cache) if self.key_cache else 0
         n_values = sum(c["indices"].numel() for c in self.value_cache) if self.value_cache else 0
+        n_value_norms = sum(c["value_norms"].numel() for c in self.value_cache) if self.value_cache else 0
 
-        key_bits = n_keys * self.key_quantizer.mse_bits + n_qjl * 1 + n_norms * 16
-        value_bits = n_values * self.bits
+        key_bits = (
+            n_keys * self.key_quantizer.mse_bits
+            + n_qjl
+            + n_residual_norms * 16
+            + n_key_norms * 16
+        )
+        value_bits = n_values * self.bits + n_value_norms * 16
         fp16_equivalent = (n_keys + n_values) * 16  # what fp16 would cost
 
         return {
@@ -282,5 +300,5 @@ class TurboQuantKVCache:
             "compression_ratio": fp16_equivalent / (key_bits + value_bits) if (key_bits + value_bits) > 0 else 0,
         }
 
-    def __len__(self):
+    def __len__(self) -> int:
         return sum(c["mse_indices"].shape[0] for c in self.key_cache) if self.key_cache else 0

@@ -1,7 +1,4 @@
 config	prompt	prompt_tokens	completion_tokens	wall_time_s	tokens_per_sec
-llama70b-turboquant-32k	short	38	3	0.51	5.9
-llama70b-turboquant-32k	medium	46	256	28.68	8.9
-llama70b-turboquant-32k	long	61	256	29.56	8.7
-qwen2.5-72b-turboquant-16k	short	32	10	1.28	7.8
-qwen2.5-72b-turboquant-16k	medium	40	256	28.83	8.9
-qwen2.5-72b-turboquant-16k	long	55	256	29.4	8.7
+qwen2.5-72b-turboquant-16k	short	32	10	1.61	6.2
+qwen2.5-72b-turboquant-16k	medium	40	256	28.01	9.1
+qwen2.5-72b-turboquant-16k	long	55	256	28.12	9.1

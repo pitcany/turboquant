@@ -10,9 +10,11 @@ For practical dimensions (d >= 64), this is well-approximated by N(0, 1/d).
 We solve the Lloyd-Max conditions (continuous 1-D k-means) to find optimal centroids.
 """
 
-import torch
 import math
-from scipy import integrate, special
+from typing import Tuple
+
+import torch
+from scipy import integrate
 
 
 def beta_pdf(x: float, d: int) -> float:
@@ -20,7 +22,8 @@ def beta_pdf(x: float, d: int) -> float:
     if abs(x) >= 1.0:
         return 0.0
     coeff = math.gamma(d / 2) / (math.sqrt(math.pi) * math.gamma((d - 1) / 2))
-    return coeff * (1 - x * x) ** ((d - 3) / 2)
+    base = max(0.0, 1 - x * x)
+    return coeff * base ** ((d - 3) / 2)
 
 
 def gaussian_approx_pdf(x: float, d: int) -> float:
@@ -29,7 +32,13 @@ def gaussian_approx_pdf(x: float, d: int) -> float:
     return (1.0 / math.sqrt(2 * math.pi * sigma2)) * math.exp(-x * x / (2 * sigma2))
 
 
-def solve_lloyd_max(d: int, bits: int, use_exact: bool = False, max_iter: int = 200, tol: float = 1e-10):
+def solve_lloyd_max(
+    d: int,
+    bits: int,
+    use_exact: bool = False,
+    max_iter: int = 200,
+    tol: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Solve Lloyd-Max optimal quantizer for the coordinate distribution.
 
@@ -86,7 +95,13 @@ def solve_lloyd_max(d: int, bits: int, use_exact: bool = False, max_iter: int = 
     )
 
 
-def compute_expected_distortion(d: int, bits: int, centroids: torch.Tensor, boundaries: torch.Tensor, use_exact: bool = False) -> float:
+def compute_expected_distortion(
+    d: int,
+    bits: int,
+    centroids: torch.Tensor,
+    boundaries: torch.Tensor,
+    use_exact: bool = False,
+) -> float:
     """Compute the expected MSE distortion per coordinate for the given quantizer."""
     pdf = (lambda x: beta_pdf(x, d)) if use_exact else (lambda x: gaussian_approx_pdf(x, d))
     sigma = 1.0 / math.sqrt(d)
@@ -115,16 +130,14 @@ class LloydMaxCodebook:
         self.distortion = compute_expected_distortion(d, bits, self.centroids, self.boundaries, use_exact)
 
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
-        """Quantize values to nearest centroid indices."""
-        # x: (...,) -> indices: (...,) as uint8/int16
-        diffs = (x.unsqueeze(-1) - self.centroids.to(x.device))  # (..., n_levels)
-        return diffs.abs().argmin(dim=-1)
+        """Quantize values to Lloyd-Max bins."""
+        return torch.bucketize(x, self.boundaries.to(x.device))
 
     def dequantize(self, indices: torch.Tensor) -> torch.Tensor:
         """Map indices back to centroid values."""
         return self.centroids.to(indices.device)[indices]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"LloydMaxCodebook(d={self.d}, bits={self.bits}, "
             f"levels={self.n_levels}, distortion_per_coord={self.distortion:.6f})"

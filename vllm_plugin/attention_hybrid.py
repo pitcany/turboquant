@@ -20,34 +20,22 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 
-_root = str(Path(__file__).resolve().parent.parent)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
 from turboquant import TurboQuantProd, TurboQuantMSE
 from vllm_plugin.attention import (
     _CompressedLayout,
     _compressed_fp16_elems,
-    _pack_2bit,
-    _pack_1bit,
-    _pack_4bit,
-    _unpack_2bit,
-    _unpack_1bit,
-    _unpack_4bit,
     TurboQuantMetadata,
     TurboQuantMetadataBuilder,
 )
+from vllm_plugin.compress_utils import initialize_quantizers, store_compressed_kv
 from vllm_plugin.config import TurboQuantConfig
-
-from vllm.v1.attention.backend import (
+from vllm_plugin.vllm_compat import (
     AttentionBackend,
     AttentionImpl,
     AttentionType,
@@ -152,20 +140,21 @@ class HybridTQAttentionImpl(AttentionImpl):
     def _ensure_quantizers(self, device: torch.device) -> None:
         if self._key_q is not None and self._init_device == device:
             return
-        self._key_q = TurboQuantProd(
-            self.head_size, self._b_total,
-            seed=self.layer_idx * 1000, device=str(device))
-        self._val_q = TurboQuantMSE(
-            self.head_size, self._b_total,
-            seed=self.layer_idx * 1000 + 500, device=str(device))
+        quantizers = initialize_quantizers(
+            self.head_size,
+            self._b_total,
+            self.layer_idx,
+            device,
+        )
+        self._key_q = quantizers["key_q"]
+        self._val_q = quantizers["val_q"]
         self._init_device = device
 
-        # Cache half-precision matrices for dequantization
-        self._key_Pi = self._key_q.mse.Pi.half()
-        self._key_centroids = self._key_q.mse.centroids.half()
-        self._val_Pi = self._val_q.Pi.half()
-        self._val_centroids = self._val_q.centroids.half()
-        self._S_T = self._key_q.S.T.half()
+        self._key_Pi = quantizers["key_pi"]
+        self._key_centroids = quantizers["key_centroids"]
+        self._val_Pi = quantizers["val_pi"]
+        self._val_centroids = quantizers["val_centroids"]
+        self._S_T = quantizers["s_t"]
 
     def forward(
         self,
@@ -236,30 +225,19 @@ class HybridTQAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor, slot_mapping: torch.Tensor,
         block_size: int,
     ) -> None:
-        """Compress K,V and write into kv_cache. Identical to pure TQ."""
-        n = key.shape[0]
-        nkh = self.num_kv_heads
-        blk = slot_mapping // block_size
-        off = slot_mapping % block_size
-
-        k_flat = key.reshape(n * nkh, self.head_size).float()
-        v_flat = value.reshape(n * nkh, self.head_size).float()
-
-        kn = torch.norm(k_flat, dim=-1)
-        k_unit = k_flat / (kn.unsqueeze(-1) + 1e-8)
-        vn = torch.norm(v_flat, dim=-1)
-        v_unit = v_flat / (vn.unsqueeze(-1) + 1e-8)
-
-        ck = self._key_q.quantize(k_unit)
-        vi = self._val_q.quantize(v_unit)
-
-        packed = self._layout.pack(
-            ck["mse_indices"], ck["qjl_signs"],
-            ck["residual_norm"], kn, vi, vn)
-        packed_fp16 = packed.view(kv_cache.dtype).reshape(
-            n, nkh, self._layout.fp16_elems)
-
-        kv_cache[blk, off] = packed_fp16
+        """Compress K/V tensors and write the packed bytes into ``kv_cache``."""
+        store_compressed_kv(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            block_size,
+            self.num_kv_heads,
+            self.head_size,
+            self._layout,
+            self._key_q,
+            self._val_q,
+        )
 
     def _dequantize_kv(
         self, comp_bytes: torch.Tensor,

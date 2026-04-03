@@ -18,29 +18,17 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Ensure turboquant modules are importable
-# ---------------------------------------------------------------------------
-_root = str(Path(__file__).resolve().parent.parent)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
 from turboquant import TurboQuantProd, TurboQuantMSE
+from vllm_plugin.compress_utils import initialize_quantizers, store_compressed_kv
 from vllm_plugin.config import TurboQuantConfig
 from vllm_plugin.triton_wrapper import turboquant_decode_attention
-
-# ---------------------------------------------------------------------------
-# vLLM v1 imports
-# ---------------------------------------------------------------------------
-from vllm.v1.attention.backend import (
+from vllm_plugin.vllm_compat import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadataBuilder,
@@ -122,11 +110,17 @@ class _CompressedLayout:
         ─────────  118 bytes total = 59 float16 elements
     """
 
-    def __init__(self, head_dim: int, key_mse_bits: int, key_qjl_bits: int,
-                 val_mse_bits: int):
+    def __init__(
+        self,
+        head_dim: int,
+        key_mse_bits: int,
+        key_qjl_bits: int,
+        val_mse_bits: int,
+    ):
         self.head_dim = head_dim
         self.key_mse_bits = key_mse_bits
         self.val_mse_bits = val_mse_bits
+        assert val_mse_bits <= 4, "val_mse_bits > 4 requires custom packing"
 
         # Key MSE: 2-bit packed
         self.km_off = 0
@@ -138,9 +132,12 @@ class _CompressedLayout:
         self.kr_off = self.kq_off + self.kq_len
         # Key original norm (fp16)
         self.kn_off = self.kr_off + 2
-        # Value MSE: nibble packed (val_mse_bits ≤ 4)
+        # Value MSE: nibble packed on purpose. The current storage format only
+        # supports values that fit within 4-bit indices, even when the logical
+        # value quantizer is described in terms of ``val_mse_bits``.
         self.vm_off = self.kn_off + 2
-        self.vm_len = head_dim * 4 // 8  # 4-bit nibbles
+        packed_value_bits = 4
+        self.vm_len = head_dim * packed_value_bits // 8
         # Value norm (fp16)
         self.vn_off = self.vm_off + self.vm_len
         # Total
@@ -349,21 +346,21 @@ class TurboQuantAttentionImpl(AttentionImpl):
     def _ensure_quantizers(self, device: torch.device) -> None:
         if self._key_q is not None and self._init_device == device:
             return
-        self._key_q = TurboQuantProd(
-            self.head_size, self._b_total,
-            seed=self.layer_idx * 1000, device=str(device))
-        self._val_q = TurboQuantMSE(
-            self.head_size, self._b_total,
-            seed=self.layer_idx * 1000 + 500, device=str(device))
+        quantizers = initialize_quantizers(
+            self.head_size,
+            self._b_total,
+            self.layer_idx,
+            device,
+        )
+        self._key_q = quantizers["key_q"]
+        self._val_q = quantizers["val_q"]
         self._init_device = device
 
-        # Cache half-precision copies of rotation matrices for faster dequant
-        self._key_Pi = self._key_q.mse.Pi.half()
-        self._key_centroids = self._key_q.mse.centroids.half()
-        self._val_Pi = self._val_q.Pi.half()
-        self._val_centroids = self._val_q.centroids.half()
-        # Cache half-precision QJL projection
-        self._S_T = self._key_q.S.T.half()
+        self._key_Pi = quantizers["key_pi"]
+        self._key_centroids = quantizers["key_centroids"]
+        self._val_Pi = quantizers["val_pi"]
+        self._val_centroids = quantizers["val_centroids"]
+        self._S_T = quantizers["s_t"]
 
     # ── forward ──────────────────────────────────────────────────────
 
@@ -443,39 +440,19 @@ class TurboQuantAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor, slot_mapping: torch.Tensor,
         block_size: int,
     ) -> None:
-        """Compress K,V and write packed bytes into kv_cache.
-
-        kv_cache shape: (num_blocks, block_size, num_kv_heads, fp16_elems)
-        All KV heads processed in one batch — no Python loop.
-        """
-        n = key.shape[0]
-        nkh = self.num_kv_heads
-        blk = slot_mapping // block_size
-        off = slot_mapping % block_size
-
-        # Flatten heads: (n, nkh, D) → (n*nkh, D)
-        k_flat = key.reshape(n * nkh, self.head_size).float()
-        v_flat = value.reshape(n * nkh, self.head_size).float()
-
-        # Normalize
-        kn = torch.norm(k_flat, dim=-1)
-        k_unit = k_flat / (kn.unsqueeze(-1) + 1e-8)
-        vn = torch.norm(v_flat, dim=-1)
-        v_unit = v_flat / (vn.unsqueeze(-1) + 1e-8)
-
-        # Compress all at once
-        ck = self._key_q.quantize(k_unit)
-        vi = self._val_q.quantize(v_unit)
-
-        # Pack → (n*nkh, total_bytes)
-        packed = self._layout.pack(
-            ck["mse_indices"], ck["qjl_signs"],
-            ck["residual_norm"], kn, vi, vn)
-        packed_fp16 = packed.view(kv_cache.dtype).reshape(
-            n, nkh, self._layout.fp16_elems)
-
-        # Scatter all heads at once
-        kv_cache[blk, off] = packed_fp16
+        """Compress K/V tensors and write the packed bytes into ``kv_cache``."""
+        store_compressed_kv(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            block_size,
+            self.num_kv_heads,
+            self.head_size,
+            self._layout,
+            self._key_q,
+            self._val_q,
+        )
 
     # ── attention for one request (batched across all KV heads) ─────
 

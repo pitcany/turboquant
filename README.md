@@ -59,6 +59,11 @@ Install the plugin into your vLLM environment:
 pip install -e /path/to/turboquant
 ```
 
+The editable install is required for the flat-module layout used by
+`turboquant.py`, `lloyd_max.py`, and `compressors.py`. The vLLM plugin now
+assumes those modules are available through the environment rather than
+manually rewriting `sys.path`.
+
 Start vLLM with the TurboQuant attention backend:
 
 ```bash
@@ -125,7 +130,7 @@ Results are saved to `benchmark_tq_results.tsv`.
 
 ## Validation
 
-### Synthetic Tests (`test_turboquant.py`)
+### Synthetic Tests (`tests/test_core.py`, `tests/test_stability.py`)
 
 Validates the core algorithm against theoretical bounds on random unit vectors:
 
@@ -136,7 +141,8 @@ Validates the core algorithm against theoretical bounds on random unit vectors:
 | 4-bit | 0.009 | 0.011 | 0.98 |
 
 ```bash
-python test_turboquant.py
+python3 -m pytest tests/ -v
+python3 test_turboquant.py
 ```
 
 ### Real Model Validation (`validate.py`)
@@ -188,6 +194,7 @@ turboquant/
 - Python 3.10+
 - PyTorch 2.0+ with CUDA
 - scipy (codebook computation)
+- pytest (test runner)
 - vLLM 0.6+ (for serving)
 - triton (optional, for optimized decode kernels)
 
