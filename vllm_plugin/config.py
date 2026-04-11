@@ -9,8 +9,8 @@ management.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
@@ -68,12 +68,24 @@ class TurboQuantConfig:
     # ------------------------------------------------------------------
 
     def __post_init__(self) -> None:
+        gguf_env = _gguf_env_defaults()
+
         # --- Environment-variable overrides (TQ_ prefix) ---
-        self.num_layers = _env_int("TQ_NUM_LAYERS", self.num_layers)
-        self.num_heads = _env_int("TQ_NUM_HEADS", self.num_heads)
-        self.num_kv_heads = _env_int("TQ_NUM_KV_HEADS", self.num_kv_heads)
-        self.head_dim = _env_int("TQ_HEAD_DIM", self.head_dim)
-        self.max_seq_len = _env_int("TQ_MAX_SEQ_LEN", self.max_seq_len)
+        self.num_layers = _env_int(
+            "TQ_NUM_LAYERS", int(gguf_env.get("TQ_NUM_LAYERS", self.num_layers))
+        )
+        self.num_heads = _env_int(
+            "TQ_NUM_HEADS", int(gguf_env.get("TQ_NUM_HEADS", self.num_heads))
+        )
+        self.num_kv_heads = _env_int(
+            "TQ_NUM_KV_HEADS", int(gguf_env.get("TQ_NUM_KV_HEADS", self.num_kv_heads))
+        )
+        self.head_dim = _env_int(
+            "TQ_HEAD_DIM", int(gguf_env.get("TQ_HEAD_DIM", self.head_dim))
+        )
+        self.max_seq_len = _env_int(
+            "TQ_MAX_SEQ_LEN", int(gguf_env.get("TQ_MAX_SEQ_LEN", self.max_seq_len))
+        )
         self.flush_interval = _env_int("TQ_FLUSH_INTERVAL", self.flush_interval)
         self.b_mse = _env_int("TQ_B_MSE", self.b_mse)
         self.b_qjl = _env_int("TQ_B_QJL", self.b_qjl)
@@ -138,3 +150,18 @@ class TurboQuantConfig:
             f"flush={self.flush_interval} | "
             f"~{self.compression_ratio:.1f}× vs FP16"
         )
+
+
+def _gguf_env_defaults() -> dict[str, str]:
+    """Read TQ defaults from a GGUF file when TQ_GGUF_PATH is set."""
+    gguf_path = os.environ.get("TQ_GGUF_PATH")
+    if not gguf_path:
+        return {}
+    return _gguf_env_defaults_for_path(gguf_path)
+
+
+@lru_cache(maxsize=8)
+def _gguf_env_defaults_for_path(gguf_path: str) -> dict[str, str]:
+    from ollama_resolver import read_gguf_metadata, to_tq_env
+
+    return to_tq_env(read_gguf_metadata(gguf_path))

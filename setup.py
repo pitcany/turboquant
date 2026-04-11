@@ -21,13 +21,13 @@ setup(
     license="MIT",
     python_requires=">=3.10",
     packages=["vllm_plugin"],
-    py_modules=["turboquant", "lloyd_max", "compressors"],
+    py_modules=["turboquant", "lloyd_max", "compressors", "ollama_resolver"],
     install_requires=[
         "torch>=2.0.0",
         "scipy>=1.10.0",
     ],
     extras_require={
-        "vllm": ["vllm>=0.6.0"],
+        "vllm": ["vllm>=0.6.0", "gguf>=0.18.0"],
         "validate": [
             "transformers>=4.40.0",
             "accelerate>=0.25.0",

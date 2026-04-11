@@ -51,6 +51,56 @@ vs 512 bytes for fp16 (128 dims x 2 bytes x 2 for K+V) = **4.3x compression**.
 
 ## Usage
 
+### Harbor Ollama GGUF Models
+
+For GGUF models managed by Harbor's Ollama service, pull the model with Harbor
+and serve it directly with vLLM + TurboQuant:
+
+```bash
+cd /home/yannik/AI/turboquant
+
+harbor ollama pull qwen2.5-coder:32b
+./serve_ollama_tq.sh qwen2.5-coder:32b
+```
+
+This path uses Harbor for model management and cache location, but does not
+patch Harbor's vLLM Docker image. The launcher resolves the GGUF blob from
+Harbor's Ollama cache, reads GGUF metadata, exports the matching `TQ_*`
+settings, and starts vLLM on `http://127.0.0.1:8003/v1`.
+
+The resolver checks model storage in this order:
+
+1. `OLLAMA_MODELS`
+2. `HARBOR_OLLAMA_CACHE/models`
+3. `$HARBOR_HOME/.env` -> `HARBOR_OLLAMA_CACHE/models`
+4. `~/.ollama/models`
+
+Examples:
+
+```bash
+# Single GPU, default port 8003
+./serve_ollama_tq.sh qwen2.5-coder:32b
+
+# Tensor parallel over both GPUs
+./serve_ollama_tq.sh llama3.3 --tp 2
+
+# Hybrid TurboQuant storage + SDPA compute
+./serve_ollama_tq.sh qwen2.5-coder:32b --hybrid
+```
+
+If Harbor's Ollama container is holding GPU memory, stop it before starting
+vLLM:
+
+```bash
+harbor down ollama
+```
+
+Then test the OpenAI-compatible endpoint:
+
+```bash
+curl -s http://127.0.0.1:8003/v1/models | python3 -m json.tool
+```
+
 ### Serving with vLLM
 
 Install the plugin into your vLLM environment:
@@ -75,15 +125,6 @@ python -m vllm.entrypoints.openai.api_server \
     --attention-backend CUSTOM \
     --enforce-eager \
     --served-model-name llama-3.3-70b-turboquant
-```
-
-Or use the convenience script:
-
-```bash
-bash serve_turboquant_vllm.sh serve    # Start server
-bash serve_turboquant_vllm.sh smoke    # Quick test
-bash serve_turboquant_vllm.sh bench    # Run benchmark
-bash serve_turboquant_vllm.sh all      # Server + smoke + bench
 ```
 
 ### Environment Variables
@@ -142,7 +183,6 @@ Validates the core algorithm against theoretical bounds on random unit vectors:
 
 ```bash
 python3 -m pytest tests/ -v
-python3 test_turboquant.py
 ```
 
 ### Real Model Validation (`validate.py`)
@@ -169,6 +209,8 @@ turboquant/
 ├── turboquant.py              # Core: TurboQuantMSE, TurboQuantProd, TurboQuantKVCache
 ├── lloyd_max.py               # Lloyd-Max optimal scalar quantizer
 ├── compressors.py             # Production compressors for real model tensors
+├── ollama_resolver.py          # Harbor/Ollama GGUF resolver + TQ metadata export
+├── serve_ollama_tq.sh          # Harbor Ollama GGUF launcher for vLLM + TurboQuant
 ├── vllm_plugin/
 │   ├── platform.py            # vLLM general plugin registration
 │   ├── attention.py           # Pure TQ attention backend (Triton decode)
@@ -177,11 +219,9 @@ turboquant/
 │   ├── triton_wrapper.py      # Decode dispatch wrapper
 │   ├── config.py              # TurboQuant configuration
 │   └── kv_spec.py             # Compressed KV cache spec for vLLM
-├── serve_turboquant_vllm.sh   # Server launcher with smoke/bench modes
 ├── benchmark_tq_comparison.py # Controlled A/B benchmark (standard vs TQ vs hybrid)
 ├── benchmark_openai.py        # OpenAI API benchmark client
 ├── benchmark_decode.py        # Low-level decode kernel benchmark
-├── test_turboquant.py         # Synthetic algorithm validation
 ├── validate.py                # Real model attention validation
 ├── validate_vllm.py           # vLLM plugin integration validation
 ├── autoresearch/              # Automated research experiment scripts

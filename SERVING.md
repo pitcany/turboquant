@@ -12,22 +12,86 @@
 
 ## Quick Start
 
-The helper script handles environment setup, plugin installation, and serving:
+### Harbor Ollama GGUF Models
+
+Use this path when models are pulled through Harbor's Ollama service:
 
 ```bash
-cd ~/ai/turboquant
+cd /home/yannik/AI/turboquant
 
-# Start server, run smoke test + benchmark, then stop
-bash serve_turboquant_vllm.sh all
+# Pull or update the GGUF-backed Ollama model through Harbor
+harbor ollama pull qwen2.5-coder:32b
 
-# Start server in foreground (interactive)
-bash serve_turboquant_vllm.sh serve
+# Serve the Harbor-managed Ollama model with vLLM + TurboQuant
+./serve_ollama_tq.sh qwen2.5-coder:32b
+```
 
-# Smoke test against running server
-bash serve_turboquant_vllm.sh smoke
+`serve_ollama_tq.sh` does not patch Harbor's vLLM Docker image. It uses Harbor
+for the Ollama model cache, then launches vLLM directly from the local
+`vllm-serve` conda environment.
 
-# Benchmark against running server
-bash serve_turboquant_vllm.sh bench
+Model storage resolution order:
+
+1. `OLLAMA_MODELS`
+2. `HARBOR_OLLAMA_CACHE/models`
+3. `$HARBOR_HOME/.env` -> `HARBOR_OLLAMA_CACHE/models`
+4. `~/.ollama/models`
+
+Harbor defaults to `HARBOR_OLLAMA_CACHE="~/.ollama"`, so host Ollama and
+Harbor Ollama may share the same physical store. Custom Harbor caches are also
+supported:
+
+```bash
+harbor config set ollama.cache /path/to/custom/ollama-cache
+```
+
+Useful Harbor model commands:
+
+```bash
+harbor ollama pull qwen2.5-coder:32b
+harbor ollama list
+harbor ollama rm qwen2.5-coder:32b
+```
+
+Common variants:
+
+```bash
+# Llama 3.3 over both GPUs
+./serve_ollama_tq.sh llama3.3 --tp 2
+
+# Hybrid TurboQuant compressed storage + SDPA compute
+./serve_ollama_tq.sh qwen2.5-coder:32b --hybrid
+
+# Override port or context length
+PORT=8005 ./serve_ollama_tq.sh qwen2.5-coder:32b --max-len 16384
+```
+
+If Harbor's Ollama service is using GPU memory, stop it before starting vLLM:
+
+```bash
+harbor down ollama
+```
+
+Verify the running vLLM endpoint from another terminal:
+
+```bash
+curl -s http://127.0.0.1:8003/v1/models | python3 -m json.tool
+
+curl -s http://127.0.0.1:8003/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-coder:32b-turboquant",
+    "messages": [{"role": "user", "content": "Write a Python function to reverse a linked list."}],
+    "max_tokens": 200,
+    "temperature": 0
+  }' | python3 -m json.tool
+```
+
+Inspect the resolved GGUF path and generated TurboQuant settings without
+starting vLLM:
+
+```bash
+/home/yannik/miniconda3/envs/vllm-serve/bin/python ollama_resolver.py qwen2.5-coder:32b
 ```
 
 ### Manual Start: Llama 3.3 70B AWQ (dual GPU, TP=2, 32K context)
@@ -128,27 +192,28 @@ TurboQuant parameters are set via `TQ_*` environment variables:
 | `TQ_NUM_HEADS` | `32` | Auto-detected from model |
 | `TQ_NUM_KV_HEADS` | `32` | Auto-detected from model |
 | `TQ_HEAD_DIM` | `128` | Auto-detected from model |
+| `TQ_GGUF_PATH` | unset | Optional GGUF path used to auto-populate model shape defaults |
 
 The defaults (2-bit MSE + 1-bit QJL = 3 bits total) provide ~4.3x KV cache compression.
 
 ## Helper Script Configuration
 
-`serve_turboquant_vllm.sh` accepts environment overrides for all parameters:
+`serve_ollama_tq.sh` accepts Harbor/Ollama model names and resolves them to
+GGUF blobs:
 
 ```bash
-# Example: different model, different port, Triton off
-MODEL=Qwen/Qwen2.5-7B-Instruct \
-PORT=8005 \
-TP_SIZE=1 \
-QUANTIZATION=none \
-DTYPE=float16 \
-MAX_MODEL_LEN=8192 \
-CUDA_VISIBLE_DEVICES_VALUE=1 \
-TQ_USE_TRITON_VALUE=0 \
-bash serve_turboquant_vllm.sh serve
+./serve_ollama_tq.sh qwen2.5-coder:32b
+./serve_ollama_tq.sh llama3.3 --tp 2
+./serve_ollama_tq.sh qwen2.5-coder:32b --hybrid
 ```
 
-See `bash serve_turboquant_vllm.sh help` for all options.
+Useful overrides:
+
+```bash
+HARBOR_OLLAMA_CACHE=/path/to/harbor/ollama-cache ./serve_ollama_tq.sh qwen2.5-coder:32b
+CUDA_VISIBLE_DEVICES_VALUE=0 ./serve_ollama_tq.sh qwen2.5-coder:32b
+SERVED_MODEL_NAME=qwen-coder-tq ./serve_ollama_tq.sh qwen2.5-coder:32b
+```
 
 ## Troubleshooting
 

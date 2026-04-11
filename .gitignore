@@ -10,3 +10,7 @@ build/
 .env.*
 autoresearch/*.log
 autoresearch/*.tsv
+.coverage
+.venv/
+.testenv/
+.codex
