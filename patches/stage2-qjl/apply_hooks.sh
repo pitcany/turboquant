@@ -32,7 +32,7 @@ CMAKE="$GGML/src/CMakeLists.txt"
 MARKER="tq4p"
 
 # ---------- 1. enum ----------
-if grep -q "$MARKER" "$GGML_H" 2>/dev/null; then
+if grep -qi "$MARKER" "$GGML_H" 2>/dev/null; then
     echo "[=] ggml.h already patched"
 else
     echo "[+] ggml.h: adding TQ4P_D128/TQ4P_D256 enum values"
