@@ -4,11 +4,13 @@
 # Patches ollama's OWN vendored ggml in place. No llama.cpp fork is cloned
 # or symlinked.
 #
-# Two additive patches:
+# Three additive patches:
 #   1. TQ4P ggml quant types, dropped into  ml/backend/ggml/ggml/src/
 #      and registered via 4 hooks in that same tree.
 #   2. ollama Go KV-cache-type allowlist widened to accept "tq4p_d128" and
 #      "tq4p_d256".
+#   3. ollama Go plumbing: switch-case entries in 4 Go files so the
+#      cache-type strings map to the correct GGML enum values end-to-end.
 #
 # Usage:
 #   scripts/build_ollama_tq.sh                 # full build
@@ -43,6 +45,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PATCH_ALLOWLIST="$SCRIPT_DIR/patch_ollama_kv_types.sh"
 STAGE2_DIR="$REPO_ROOT/patches/stage2-qjl"
 APPLY_HOOKS="$STAGE2_DIR/apply_hooks.sh"
+APPLY_GO_PLUMBING="$STAGE2_DIR/apply_go_plumbing.sh"
 
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -115,6 +118,10 @@ bash "$APPLY_HOOKS" "$GGML"
 # ---- Widen ollama Go allowlist -----------------------------------------------
 
 bash "$PATCH_ALLOWLIST" "$OLLAMA_DIR"
+
+# ---- Patch Go switch statements so tq4p types resolve end-to-end ------------
+
+bash "$APPLY_GO_PLUMBING" "$OLLAMA_DIR"
 
 # ---- Build -------------------------------------------------------------------
 

@@ -191,6 +191,131 @@ rm ggml/src/ggml-tq-paper.{c,h} \
    ggml/src/tqp_centroids_d{128,256}.h
 ```
 
+## Ollama Go plumbing — `apply_go_plumbing.sh`
+
+The C-level types registered above are invisible to ollama's Go layer
+until four switch statements are extended. `apply_go_plumbing.sh` does
+this automatically; the manual edits are documented below.
+
+### Summary of Go edits
+
+| File | Kind | What |
+|---|---|---|
+| `ml/backend.go` | additive | 2 `DType` iota constants |
+| `ml/backend/ggml/ggml.go` | additive | 2 cases in `DType()` + 2 in `ggmlDType()` |
+| `runner/ollamarunner/cache.go` | additive | 2 cases in `kvCacheTypeFromStr` |
+| `llama/llama.go` | additive | 2 cases in `kvCacheTypeFromStr` |
+
+### 5. `ml/backend.go` — DType constants
+
+Find:
+
+```go
+const (
+	DTypeOther DType = iota
+	DTypeF32
+	DTypeF16
+	DTypeQ80
+	DTypeQ40
+	DTypeI32
+	DTypeMXFP4
+)
+```
+
+Add after `DTypeMXFP4`:
+
+```go
+	DTypeTQ4P_D128
+	DTypeTQ4P_D256
+```
+
+### 6. `ml/backend/ggml/ggml.go` — `DType()` method (C→Go)
+
+Find the `DType()` method's switch. After:
+
+```go
+	case C.GGML_TYPE_MXFP4:
+		return ml.DTypeMXFP4
+```
+
+Add:
+
+```go
+	case C.GGML_TYPE_TQ4P_D128:
+		return ml.DTypeTQ4P_D128
+	case C.GGML_TYPE_TQ4P_D256:
+		return ml.DTypeTQ4P_D256
+```
+
+### 7. `ml/backend/ggml/ggml.go` — `ggmlDType()` function (Go→C)
+
+Find the `ggmlDType()` function's switch. After:
+
+```go
+	case ml.DTypeMXFP4:
+		return C.GGML_TYPE_MXFP4
+```
+
+Add:
+
+```go
+	case ml.DTypeTQ4P_D128:
+		return C.GGML_TYPE_TQ4P_D128
+	case ml.DTypeTQ4P_D256:
+		return C.GGML_TYPE_TQ4P_D256
+```
+
+### 8. `runner/ollamarunner/cache.go` — `kvCacheTypeFromStr`
+
+Find:
+
+```go
+	case "q4_0":
+		return ml.DTypeQ40
+	default:
+```
+
+Insert before `default:`:
+
+```go
+	case "tq4p_d128":
+		return ml.DTypeTQ4P_D128
+	case "tq4p_d256":
+		return ml.DTypeTQ4P_D256
+```
+
+### 9. `llama/llama.go` — `kvCacheTypeFromStr`
+
+Find:
+
+```go
+	case "q4_0":
+		return C.GGML_TYPE_Q4_0
+	default:
+```
+
+Insert before `default:`:
+
+```go
+	case "tq4p_d128":
+		return C.GGML_TYPE_TQ4P_D128
+	case "tq4p_d256":
+		return C.GGML_TYPE_TQ4P_D256
+```
+
+### Anchor strategy
+
+`apply_go_plumbing.sh` uses value-based anchors — it matches the
+exact text of existing case arms or constant names (e.g.
+`DTypeMXFP4`, `case "q4_0":\n\t\treturn ml.DTypeQ40\n`) and inserts
+after them. If ollama restructures these switch statements, the script
+will refuse (non-zero exit) rather than silently miss.
+
+Markers:
+- `DTypeTQ4P_D128` in `backend.go` and `ggml.go`
+- `tq4p_d128` string literal in `cache.go`
+- `GGML_TYPE_TQ4P` in `llama.go`
+
 ## Ollama-side follow-up
 
 Once the types work in llama.cpp, extend `scripts/patch_ollama_kv_types.sh`
