@@ -147,9 +147,8 @@ MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
 if [[ -n "$MODEL_LIST" ]]; then
     # Skip header, filter out embedding/cloud models, pick smallest by SIZE col.
     MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
-        | grep -viE 'embed|rerank' \
-        | awk '$3 != "-" {print $0}' \
-        | sort -t$'\t' -k3 -h \
+        | awk 'BEGIN{IGNORECASE=1} !/embed|rerank/ && $3 != "-" {print $0}' \
+        | sort -k3 -h \
         | head -1 | awk '{print $1}')
 fi
 
