@@ -1,0 +1,10 @@
+# Build artifacts
+c/*.so
+c/*.o
+c/*.a
+**/__pycache__/
+**/.pytest_cache/
+
+# Generator output that can be trivially regenerated
+# (keeping .h headers since hooks.md expects them in place).
+# c/tqp_constants.pt  # uncomment to re-generate on every test run
