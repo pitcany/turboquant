@@ -1,79 +1,75 @@
-# Fork-side hooks — 4 hand-edits for `turbo-tan/llama.cpp-tq3`
+# Fork-side hooks — exact edits for `turbo-tan/llama.cpp-tq3`
 
 After `scripts/build_ollama_tq.sh --stage2` has copied the C files into
-your fork clone (default: `~/.local/src/ollama-tq/llama.cpp-tq3/ggml/src/`),
-apply these edits once. All additions, no in-place modifications to
-existing functions.
+the fork clone (default `~/.local/src/ollama-tq/llama.cpp-tq3/ggml/src/`),
+apply these edits once. The script `patches/stage2-qjl/apply_hooks.sh`
+automates all four — this file documents what it does, so you can apply
+them by hand if the auto-apply doesn't match your fork state.
 
-Paths below are relative to the fork root.
+Line numbers below are from the fork's `main` branch at the time of
+authoring. The script uses context-based anchors (not line numbers) so it
+survives small drift.
 
-## 1. `ggml/include/ggml.h` — register the enum values
+## Summary of edits
 
-Find the `ggml_type` enum. Locate the last `GGML_TYPE_TQ3_*` entry and add
-two lines after it, picking the next free slot numbers (the fork currently
-uses 41, 44, 46 for TQ3_0, TQ3_1S, TQ3_4S — so 47 and 48 should be free;
-adjust if not):
+| File | Kind | What |
+|---|---|---|
+| `ggml/include/ggml.h` | additive | 2 enum values, bump `GGML_TYPE_COUNT` |
+| `ggml/src/ggml.c` | additive | 2 entries in backend-agnostic `type_traits` table |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | additive | 2 entries in `type_traits_cpu` dispatch table |
+| `ggml/src/CMakeLists.txt` | additive | 1 source file added |
 
-```c
-    GGML_TYPE_TQ3_4S     = 46,
-    // --- TurboQuant paper-faithful (Stage 1 + QJL) ---
-    GGML_TYPE_TQ4P_D128  = 47,
-    GGML_TYPE_TQ4P_D256  = 48,
-    GGML_TYPE_COUNT,
-```
+`ggml-common.h` is **not** touched — our block structs live in
+`ggml-tq-paper.h`, which `ggml.c` `#include`s so `sizeof(block_tq4p_d128)`
+resolves.
 
-Also find the `ggml_op` enum and add a forward-compat entry after the
-existing `GGML_OP_TURBO_WHT`:
+## 1. `ggml/include/ggml.h` — enum values
 
-```c
-    GGML_OP_TURBO_WHT,
-    // Reserved for the TurboQuant paper-faithful rotation op (CUDA follow-up).
-    GGML_OP_TQP_ROTATE,
-```
-
-(Not actually used in the CPU-only patch — vec_dot rotates q internally.
-Reserving the op keeps the CUDA follow-up's enum stable.)
-
-## 2. `ggml/src/ggml-common.h` — register the block structs
-
-Find the block_* struct definitions (near the fork's `block_tq3_0`). Add:
+Find:
 
 ```c
-// TurboQuant paper-faithful blocks; see ggml/src/ggml-tq-paper.h
-typedef struct {
-    ggml_half orig_norm;
-    ggml_half res_d;
-    uint8_t   qs[48];
-    uint8_t   qjl_signs[16];
-} block_tq4p_d128;
-static_assert(sizeof(block_tq4p_d128) == 68, "wrong block_tq4p_d128 size");
-
-typedef struct {
-    ggml_half orig_norm;
-    ggml_half res_d;
-    uint8_t   qs[96];
-    uint8_t   qjl_signs[32];
-} block_tq4p_d256;
-static_assert(sizeof(block_tq4p_d256) == 132, "wrong block_tq4p_d256 size");
+        GGML_TYPE_TQ3_4S  = 46, // TurboQuant 3-bit with four u8 per-8 scales (4.0 bpw)
+        GGML_TYPE_COUNT   = 47,
 ```
 
-Note: `ggml-tq-paper.h` uses `uint16_t` for fp16 fields to avoid a
-dependency on `ggml-common.h`. The layouts are identical because `ggml_half`
-is a `uint16_t` typedef. If your compiler complains about type mismatch at
-link time, replace the `uint16_t` fields in `ggml-tq-paper.h` with
-`ggml_half` and `#include "ggml-common.h"`.
+Replace with:
 
-## 3. `ggml/src/ggml-quants.c` — include and register
+```c
+        GGML_TYPE_TQ3_4S  = 46, // TurboQuant 3-bit with four u8 per-8 scales (4.0 bpw)
 
-Near the top, add:
+        // TurboQuant paper-faithful (Stage 1 Lloyd-Max + Stage 2 QJL).
+        // See ggml/src/ggml-tq-paper.h.
+        GGML_TYPE_TQ4P_D128 = 47,
+        GGML_TYPE_TQ4P_D256 = 48,
+
+        GGML_TYPE_COUNT   = 49,
+```
+
+If other types have been added upstream and 47/48 are now taken, bump to
+the next free values and update steps 2 and 3 accordingly.
+
+## 2. `ggml/src/ggml.c` — backend-agnostic `type_traits` table
+
+At the top of the file, after the existing includes, add:
 
 ```c
 #include "ggml-tq-paper.h"
 ```
 
-Find the big `type_traits` (or `ggml_type_traits` / `GGML_TYPE_TRAITS`)
-table. Append two entries at the bottom, just before the terminating
-`[GGML_TYPE_COUNT] = {...}` or end of the array:
+Find the `TQ3_4S` entry in the `type_traits` array (around line 911-918):
+
+```c
+    [GGML_TYPE_TQ3_4S] = {
+        .type_name                = "tq3_4s",
+        .blck_size                = QK_TQ3_0,
+        .type_size                = sizeof(block_tq3_4s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq3_4s,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq3_4s_ref,
+    },
+```
+
+Immediately after its closing `},` add:
 
 ```c
     [GGML_TYPE_TQ4P_D128] = {
@@ -83,9 +79,6 @@ table. Append two entries at the bottom, just before the terminating
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d128,
         .from_float_ref           = (ggml_from_float_t) ggml_quantize_row_tq4p_d128,
-        .vec_dot                  = ggml_vec_dot_tq4p_d128_f32,
-        .vec_dot_type             = GGML_TYPE_F32,   // reference takes fp32 query
-        .nrows                    = 1,
     },
     [GGML_TYPE_TQ4P_D256] = {
         .type_name                = "tq4p_d256",
@@ -94,52 +87,108 @@ table. Append two entries at the bottom, just before the terminating
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d256,
         .from_float_ref           = (ggml_from_float_t) ggml_quantize_row_tq4p_d256,
-        .vec_dot                  = ggml_vec_dot_tq4p_d256_f32,
+    },
+```
+
+## 3. `ggml/src/ggml-cpu/ggml-cpu.c` — `type_traits_cpu` dispatch
+
+At the top of the file, add:
+
+```c
+#include "../ggml-tq-paper.h"
+```
+
+Find the `TQ3_4S` entry in the `type_traits_cpu` array (around line 407):
+
+```c
+    [GGML_TYPE_TQ3_4S] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_tq3_4s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+```
+
+Immediately after its closing `},` add:
+
+```c
+    [GGML_TYPE_TQ4P_D128] = {
+        .from_float               = (ggml_from_float_t) ggml_quantize_row_tq4p_d128,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d128_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ4P_D256] = {
+        .from_float               = (ggml_from_float_t) ggml_quantize_row_tq4p_d256,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d256_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
 ```
 
-Fields other than the ones listed here (e.g. `from_float` optimized, or
-CUDA dispatch pointers) use whatever the type_traits struct defaults are in
-your version of the fork. If there are new fields added by the fork that
-aren't mentioned above, leave them zero-initialized — the CPU draft doesn't
-need them.
+## 4. `ggml/src/CMakeLists.txt` — add source
 
-## 4. `ggml/src/CMakeLists.txt` — add the source
-
-Find the list of source files passed to `add_library(ggml ...)` (or
-`target_sources(ggml ...)`). Add:
+Find the `add_library(ggml-base ...)` call (the library that compiles
+`ggml.c`, `ggml-alloc.c`, `ggml-quants.c`, etc.). Add `ggml-tq-paper.c` to
+its source list. Depending on your version of the CMakeLists, it looks
+like one of:
 
 ```cmake
-    ggml-tq-paper.c
+add_library(ggml-base
+    ...
+    ggml.c
+    ggml-quants.c
+    ggml-tq-paper.c            # <-- add
+    ...
+)
 ```
 
-If the fork splits CPU/CUDA into separate targets, put the file in the CPU
-target. The file has no CUDA dependency.
+Or a `target_sources(ggml-base PRIVATE ...)` block; same idea.
 
 ---
 
-## After applying all four
+## After applying
 
 ```bash
 scripts/build_ollama_tq.sh --rebuild
 ```
 
-Verify the types are recognized by `llama.cpp`:
+Check that the types are registered by running the fork's quantize test:
 
 ```bash
-~/.local/src/ollama-tq/llama.cpp-tq3/build/bin/llama-cli --help 2>&1 | grep tq4p
-# expected: tq4p_d128 and tq4p_d256 appear in the cache-type list
+cd ~/.local/src/ollama-tq/llama.cpp-tq3/build
+./bin/llama-quantize --help 2>&1 | grep -iE "tq4p|tq3_0"
+# expected: both tq3_0 and tq4p_d128 / tq4p_d256 appear
 ```
 
-If they don't, re-check steps 1-4. Most common failure is the enum number
-colliding with something added upstream since this patch was written —
-change to the next free value and update the matching `[GGML_TYPE_...]`
-entries in step 3.
+## Troubleshooting
+
+- **`undefined reference to ggml_quantize_row_tq4p_d128`** — step 4 missed;
+  ensure `ggml-tq-paper.c` is in the `ggml-base` sources list.
+- **`redefinition of 'block_tq4p_d128'`** — you added the struct to
+  `ggml-common.h` by hand; remove it. The struct is defined once, in
+  `ggml-tq-paper.h`.
+- **`no member named 'vec_dot' in 'struct ggml_type_traits'`** — you put
+  the 4-field dispatch entry in the wrong table. Steps 2 and 3 are
+  different tables: `ggml.c` (6 fields) vs `ggml-cpu/ggml-cpu.c` (4 fields).
+- **Enum value 47/48 collision** — upstream has added types since this
+  patch was written. Pick the next free enum value, update all three
+  places (ggml.h, ggml.c table indices, ggml-cpu.c table indices).
+
+## Rollback
+
+The changes are all additive, so rollback is `git checkout --`:
+
+```bash
+cd ~/.local/src/ollama-tq/llama.cpp-tq3
+git checkout -- ggml/include/ggml.h ggml/src/ggml.c \
+                ggml/src/ggml-cpu/ggml-cpu.c ggml/src/CMakeLists.txt
+rm ggml/src/ggml-tq-paper.{c,h} \
+   ggml/src/tqp_constants_d{128,256}.h \
+   ggml/src/tqp_centroids_d{128,256}.h
+```
 
 ## Ollama-side follow-up
 
 Once the types work in llama.cpp, extend `scripts/patch_ollama_kv_types.sh`
-to allowlist `tq4p_d128` (and `tq4p_d256`) the same way it does `tq3_0`.
-That's a one-line change and a separate commit.
+to allowlist `tq4p_d128` and `tq4p_d256`. This commit already does that.

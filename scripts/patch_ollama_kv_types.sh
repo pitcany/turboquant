@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Widen ollama's KV-cache-type allowlist to include tq3_0.
+# Widen ollama's KV-cache-type allowlist to include TurboQuant types.
 #
 # ollama validates OLLAMA_KV_CACHE_TYPE against a small set (f16, q8_0, q4_0)
 # and rejects anything else before it ever reaches llama.cpp. This script
-# locates the check in the Go source and appends "tq3_0" to the allowlist.
+# locates the check in the Go source and appends our custom types to the
+# allowlist:
+#   tq3_0       — turbo-tan/llama.cpp-tq3 Walsh-Hadamard TurboQuant
+#   tq4p_d128   — paper-faithful TurboQuant (Llama / Qwen2/3, head_dim 128)
+#   tq4p_d256   — paper-faithful TurboQuant (Qwen3.5 gated attention, head_dim 256)
 #
 # Designed to be idempotent and resilient: if the allowlist has moved between
 # ollama versions, it prints the candidate files and exits non-zero so the
@@ -15,7 +19,8 @@
 set -euo pipefail
 
 OLLAMA_DIR="${1:?usage: patch_ollama_kv_types.sh <ollama-source-dir>}"
-MARKER="// turboquant: tq3_0 allowlisted"
+MARKER="// turboquant: tq3_0 + tq4p_d128 + tq4p_d256 allowlisted"
+NEW_TYPES='"tq3_0", "tq4p_d128", "tq4p_d256"'
 
 # Find Go files that mention both "q8_0" and "q4_0" near each other -- this is
 # the validator signature across ollama versions.
@@ -27,7 +32,7 @@ mapfile -t CANDIDATES < <(
 if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
     echo "ERROR: could not find ollama KV cache type allowlist." >&2
     echo "Looked for a .go file containing both \"q8_0\" and \"q4_0\"." >&2
-    echo "Manually add \"tq3_0\" to the validator and rerun build with --rebuild." >&2
+    echo "Manually add $NEW_TYPES to the validator and rerun build with --rebuild." >&2
     exit 1
 fi
 
@@ -42,18 +47,20 @@ for f in "${CANDIDATES[@]}"; do
     # Common patterns we handle:
     #   "f16", "q8_0", "q4_0"
     #   case "f16", "q8_0", "q4_0":
-    # Conservative: append ", \"tq3_0\"" after the first occurrence of "q4_0"
+    # Conservative: append our types after the first occurrence of "q4_0"
     # in the file. Keeps a comment marker so reruns are idempotent.
     if grep -qE '"q4_0"' "$f"; then
-        python3 - "$f" "$MARKER" <<'PY'
+        python3 - "$f" "$MARKER" "$NEW_TYPES" <<'PY'
 import re, sys, pathlib
 path = pathlib.Path(sys.argv[1])
 marker = sys.argv[2]
+new_types = sys.argv[3]
 text = path.read_text()
-# Insert tq3_0 after the first "q4_0" literal that isn't already followed by tq3_0.
+# Insert new types after the first "q4_0" literal that isn't already followed
+# by our added types.
 def repl(m):
-    return m.group(0) + ', "tq3_0"'
-new, n = re.subn(r'"q4_0"(?!, "tq3_0")', repl, text, count=1)
+    return m.group(0) + ", " + new_types
+new, n = re.subn(r'"q4_0"(?!, "tq)', repl, text, count=1)
 if n == 0:
     sys.exit("no q4_0 literal replaced in " + str(path))
 # Add marker comment at end of file so reruns are idempotent.

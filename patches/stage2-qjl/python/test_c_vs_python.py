@@ -109,6 +109,26 @@ lib.ggml_tqp_prepare_query_d256.argtypes = [
     ctypes.POINTER(ctypes.c_float),
 ]
 
+# The ggml dispatch wrappers use ggml's vec_dot signature.
+# CRITICAL: vx is the QUANTIZED blocks (K side), vy is the QUERY — per ggml convention,
+# first ptr is quantized, second is converted to vec_dot_type.
+# A bug here is invisible from the direct per-block API above, and would silently
+# produce garbage once integrated into the fork's attention path.
+lib.ggml_vec_dot_tq4p_d128_f32.restype = None
+lib.ggml_vec_dot_tq4p_d128_f32.argtypes = [
+    ctypes.c_int,                            # n
+    ctypes.POINTER(ctypes.c_float),          # s
+    ctypes.c_size_t,                         # bs
+    ctypes.c_void_p,                         # vx (K blocks)
+    ctypes.c_size_t,                         # bx
+    ctypes.c_void_p,                         # vy (query)
+    ctypes.c_size_t,                         # by
+    ctypes.c_int,                            # nrc
+]
+
+lib.ggml_vec_dot_tq4p_d256_f32.restype = None
+lib.ggml_vec_dot_tq4p_d256_f32.argtypes = lib.ggml_vec_dot_tq4p_d128_f32.argtypes
+
 
 # ---------- Fixtures ----------
 
@@ -214,6 +234,57 @@ def test_c_vec_dot_matches_python(d, constants, vectors):
     # C uses float32 accumulation, Python uses torch fp32 — differences of
     # order 1e-5 are typical. Anything >1e-3 indicates a real bug.
     assert max_abs < 5e-4, f"C vs Python IP max diff {max_abs:.2e}"
+
+
+def test_ggml_dispatch_wrapper_matches_block_api(d, constants, vectors):
+    """Regression test: the ggml vec_dot wrapper must follow ggml's arg convention
+    (quantized K in first ptr, query in second). A previous version of this file
+    had them swapped — byte-exact tests passed, but the wrapper returned garbage.
+    """
+    import numpy as np
+    keys = vectors[:5]
+    queries = vectors[5:10]
+
+    key_bytes = b"".join(ref.quantize_block(k, constants) for k in keys)
+    n = d * len(keys)
+    KeyBuf = (ctypes.c_uint8 * len(key_bytes)).from_buffer_copy(key_bytes)
+
+    for q in queries:
+        q_flat = (ctypes.c_float * n)()
+        for ki in range(len(keys)):
+            q_np = q.float().numpy()
+            for j in range(d):
+                q_flat[ki * d + j] = float(q_np[j])
+
+        out = ctypes.c_float(0.0)
+        if d == 128:
+            lib.ggml_vec_dot_tq4p_d128_f32(
+                n, ctypes.byref(out), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), ctypes.sizeof(block_tq4p_d128),
+                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+                1,
+            )
+        else:
+            lib.ggml_vec_dot_tq4p_d256_f32(
+                n, ctypes.byref(out), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), ctypes.sizeof(block_tq4p_d256),
+                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+                1,
+            )
+        wrapper_score = out.value
+
+        # Expected: sum of per-block scores, each a real inner product.
+        # With q duplicated across all key slots, this is Σ_k ⟨q, k⟩.
+        expected = sum(
+            ref.inner_product(q, ref.quantize_block(k, constants), constants)
+            for k in keys
+        )
+        # Also: it must NOT be close to the swapped-args answer (sanity that a
+        # swap would be caught). Swapped args would treat `q_flat` as K and
+        # `key_bytes` as q — both are d floats, so the swap still runs but
+        # gives a wildly wrong number.
+        assert abs(wrapper_score - expected) < 1e-2, \
+            f"dispatch wrapper returned {wrapper_score}, expected {expected}"
 
 
 def test_c_matches_turboquant_paper_oracle(d, constants, vectors):

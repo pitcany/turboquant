@@ -103,24 +103,24 @@ float ggml_tqp_vec_dot_block_d256(const float * q, const float * Sq,
 // ----- ggml integration glue -----
 //
 // Thin wrappers matching ggml's vec_dot signature. The fork's dispatch table
-// in ggml-quants.c registers these for the new types.
+// in ggml-cpu/ggml-cpu.c registers these for the new types.
 //
-// Signature matches ggml_vec_dot_* in ggml-common.h:
+// Signature matches ggml_vec_dot_t in ggml-cpu.h:
 //   n  = number of elements
 //   s  = output scalar (1 float)
 //   bs = stride of s in bytes (usually sizeof(float))
-//   vq = query pointer (fp32 for the reference impl; may be quantized later)
-//   bq = stride of vq
-//   vk = packed block pointer
-//   bk = stride of vk
+//   vx = quantized K-side pointer (tq4p_d* blocks) — first ptr, per ggml convention
+//   bx = stride of vx
+//   vy = converted query (fp32 for our `vec_dot_type = GGML_TYPE_F32`)
+//   by = stride of vy
 //   nrc = number of rows to compute (batch; reference impl supports nrc=1)
 
 void ggml_vec_dot_tq4p_d128_f32(int n, float * s, size_t bs,
-                                 const void * vq, size_t bq,
-                                 const void * vk, size_t bk, int nrc);
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
 void ggml_vec_dot_tq4p_d256_f32(int n, float * s, size_t bs,
-                                 const void * vq, size_t bq,
-                                 const void * vk, size_t bk, int nrc);
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
 
 #ifdef __cplusplus
 }

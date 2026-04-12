@@ -329,13 +329,15 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUND
 
 #define TQP_DEFINE_VEC_DOT(D)                                                              \
     void ggml_vec_dot_tq4p_d##D##_f32(int n, float * s, size_t bs,                         \
-                                      const void * vq, size_t bq,                          \
-                                      const void * vk, size_t bk, int nrc) {               \
+                                      const void * vx, size_t bx,                          \
+                                      const void * vy, size_t by, int nrc) {               \
         assert(nrc == 1);                                                                  \
         assert(n % D == 0);                                                                \
-        (void)bs; (void)bq; (void)bk;                                                      \
-        const float * q = (const float *)vq;                                               \
-        const block_tq4p_d##D * blk = (const block_tq4p_d##D *)vk;                         \
+        (void)bs; (void)bx; (void)by;                                                      \
+        /* ggml convention: vx = quantized blocks (K side), vy = converted query           \
+         * in vec_dot_type (here GGML_TYPE_F32). */                                        \
+        const block_tq4p_d##D * blk = (const block_tq4p_d##D *)vx;                         \
+        const float * q             = (const float *)vy;                                   \
         const int64_t nb = n / D;                                                          \
                                                                                            \
         /* Amortize S·q across all blocks. */                                              \
