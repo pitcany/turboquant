@@ -87,7 +87,7 @@ set +e
     -n "$N_TOKENS" \
     --no-warmup \
     -ngl 0 \
-    2>&1 > "$OUT"
+    > "$OUT" 2>&1
 RC=$?
 set -e
 
