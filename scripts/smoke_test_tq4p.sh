@@ -139,18 +139,23 @@ echo "[+] server is up (PID $OLLAMA_PID)"
 
 # ── (f) Run inference ──────────────────────────────────────────────────
 
-# Discover a small model the user has already pulled.
+# Discover a small generative model the user has already pulled.
+# Skip embedding models (can't generate text) and cloud models (no local weights).
 MODEL=""
 MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
 
 if [[ -n "$MODEL_LIST" ]]; then
-    # Skip the header line, pick the first model name (column 1).
-    MODEL=$(echo "$MODEL_LIST" | tail -n +2 | head -1 | awk '{print $1}')
+    # Skip header, filter out embedding/cloud models, pick smallest by SIZE col.
+    MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
+        | grep -viE 'embed|rerank' \
+        | awk '$3 != "-" {print $0}' \
+        | sort -t$'\t' -k3 -h \
+        | head -1 | awk '{print $1}')
 fi
 
 if [[ -z "$MODEL" ]]; then
-    echo "ERROR: no models found. Pull a small model first:" >&2
-    echo "  ollama pull qwen2.5:3b" >&2
+    echo "ERROR: no generative (non-embedding) local models found." >&2
+    echo "  Pull a small model first: ollama pull qwen2.5:3b" >&2
     exit 1
 fi
 echo "[+] using model: $MODEL"
