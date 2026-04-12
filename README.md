@@ -51,6 +51,21 @@ vs 512 bytes for fp16 (128 dims x 2 bytes x 2 for K+V) = **4.3x compression**.
 
 ## Usage
 
+### Native Ollama (no vLLM)
+
+To run `ollama` with a TurboQuant KV cache — no vLLM, no Python serving
+layer — rebuild ollama against the
+[`turbo-tan/llama.cpp-tq3`](https://github.com/turbo-tan/llama.cpp-tq3) fork:
+
+```bash
+scripts/build_ollama_tq.sh
+OLLAMA_KV_CACHE_TYPE=tq3_0 OLLAMA_FLASH_ATTENTION=1 \
+    ~/.local/src/ollama-tq/ollama/ollama serve
+```
+
+See [docs/OLLAMA_NATIVE.md](docs/OLLAMA_NATIVE.md) for the full workflow,
+including how to edit the fork and rebuild.
+
 ### Harbor Ollama GGUF Models
 
 For GGUF models managed by Harbor's Ollama service, pull the model with Harbor
