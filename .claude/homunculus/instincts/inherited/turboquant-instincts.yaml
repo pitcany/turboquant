@@ -1,0 +1,518 @@
+# Instincts generated from https://github.com/pitcany/turboquant
+# Generated: 2026-04-12T15:56:03.903Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: turboquant-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Commit Length
+
+## Action
+
+Write moderate-length commit messages (~55 characters)
+
+## Evidence
+
+- Average commit message length: 55 chars
+- Based on 4 commits
+
+---
+id: turboquant-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: turboquant-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: turboquant-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: turboquant-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: turboquant-workflow-add-or-update-quantization-patch
+trigger: "when doing add or update quantization patch"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Workflow Add Or Update Quantization Patch
+
+## Action
+
+Follow the add-or-update-quantization-patch workflow:
+1. Draft or update a plan/README documenting the quantization algorithm and validation strategy.
+2. Implement or modify C reference code and headers for the quantization algorithm.
+3. Implement or update Python reference/oracle and test scripts for byte-exact validation.
+4. Generate or update constants using Python scripts and export to C headers.
+5. Update or add integration scripts (e.g., build_ollama_tq.sh) to automate patch application and build.
+6. Update hooks.md to document required manual or automated edits to upstream/forked code.
+7. Add or update test scripts to validate correctness and integration.
+8. Update or extend patch scripts (e.g., patch_ollama_kv_types.sh) to allowlist new quantization types.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: patches/stage2-qjl/PLAN.md, patches/stage2-qjl/README.md, patches/stage2-qjl/hooks.md
+
+---
+id: turboquant-workflow-integration-and-validation-of-patch
+trigger: "when doing integration and validation of patch"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/pitcany/turboquant
+---
+
+# Turboquant Workflow Integration And Validation Of Patch
+
+## Action
+
+Follow the integration-and-validation-of-patch workflow:
+1. Cross-read and verify the upstream/forked codebase to identify integration points and required edits.
+2. Fix any latent bugs or mismatches found during integration.
+3. Update or create hooks.md to document all required codebase edits.
+4. Automate codebase edits with scripts (e.g., apply_hooks.sh) using context anchors for idempotency.
+5. Update or extend patch scripts (e.g., patch_ollama_kv_types.sh) to allowlist new types.
+6. Add or update smoke/integration test scripts (e.g., smoke_test_tq4p.sh) to verify end-to-end functionality.
+7. Run all relevant tests and document results.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: patches/stage2-qjl/hooks.md, patches/stage2-qjl/apply_hooks.sh, patches/stage2-qjl/c/ggml-tq-paper.c
+
+---
+id: turboquant-instinct-file-naming
+trigger: "When creating or renaming a file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct File Naming
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in namingConventions.files
+- Observed in patches/stage2-qjl/python/generate_constants.py
+
+---
+id: turboquant-instinct-function-naming
+trigger: "When defining a function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in namingConventions.functions
+
+---
+id: turboquant-instinct-class-naming
+trigger: "When defining a class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in namingConventions.classes
+
+---
+id: turboquant-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in namingConventions.constants
+
+---
+id: turboquant-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle
+- Seen in patches/stage2-qjl/python/generate_constants.py
+
+---
+id: turboquant-instinct-export-style
+trigger: "When exporting functions or classes"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle
+
+---
+id: turboquant-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Test Location
+
+## Action
+
+Place tests in a separate directory from source code
+
+## Evidence
+
+- Pattern in architecture.testLocation
+- Seen in patches/stage2-qjl/python/test_*.py
+
+---
+id: turboquant-instinct-test-pattern
+trigger: "When writing tests for quantization algorithms"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Test Pattern
+
+## Action
+
+Write Python tests that compare C and Python implementations for byte-exact validation
+
+## Evidence
+
+- Seen in patches/stage2-qjl/python/test_c_vs_python.py
+- Workflow step: Implement or update Python reference/oracle and test scripts for byte-exact validation
+
+---
+id: turboquant-instinct-test-script-naming
+trigger: "When naming test scripts"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Test Script Naming
+
+## Action
+
+Prefix test scripts with 'test_'
+
+## Evidence
+
+- Pattern in patches/stage2-qjl/python/test_*.py
+
+---
+id: turboquant-instinct-commit-format
+trigger: "When writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Commit Format
+
+## Action
+
+Write concise, imperative, freeform commit messages without prefixes, averaging ~55 characters
+
+## Evidence
+
+- Pattern in commits
+- Examples: 'Add native Ollama + TurboQuant build path (no vLLM)'
+
+---
+id: turboquant-instinct-commit-sequence-quantization-patch
+trigger: "When adding or updating a quantization patch"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Commit Sequence Quantization Patch
+
+## Action
+
+Follow the sequence: plan/README → C code/headers → Python oracle/tests → constants → integration scripts → hooks.md → test scripts → patch scripts
+
+## Evidence
+
+- Workflow: add-or-update-quantization-patch
+- Commit sequence and example
+
+---
+id: turboquant-instinct-commit-sequence-integration-validation
+trigger: "When integrating and validating a patch"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Commit Sequence Integration Validation
+
+## Action
+
+Follow the sequence: cross-read upstream → fix bugs → update hooks.md → automate edits with scripts → update patch scripts → add/update smoke/integration tests → run and document tests
+
+## Evidence
+
+- Workflow: integration-and-validation-of-patch
+- Commit sequence and example
+
+---
+id: turboquant-instinct-update-hooks-md
+trigger: "When manual or automated codebase edits are required for integration"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Update Hooks Md
+
+## Action
+
+Document all required edits in hooks.md
+
+## Evidence
+
+- Seen in workflow steps for both workflows
+- Files: patches/stage2-qjl/hooks.md
+
+---
+id: turboquant-instinct-automate-edits-with-scripts
+trigger: "When codebase edits are needed for integration"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Automate Edits With Scripts
+
+## Action
+
+Automate edits using scripts (e.g., apply_hooks.sh) with context anchors for idempotency
+
+## Evidence
+
+- Workflow: integration-and-validation-of-patch
+- Files: patches/stage2-qjl/apply_hooks.sh
+
+---
+id: turboquant-instinct-allowlist-new-types
+trigger: "When adding a new quantization type"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Allowlist New Types
+
+## Action
+
+Update patch scripts (e.g., patch_ollama_kv_types.sh) to allowlist the new type
+
+## Evidence
+
+- Workflow steps in both workflows
+- Files: scripts/patch_ollama_kv_types.sh
+
+---
+id: turboquant-instinct-generate-constants
+trigger: "When constants are needed for C code"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Generate Constants
+
+## Action
+
+Generate constants using Python scripts and export to C headers
+
+## Evidence
+
+- Workflow: add-or-update-quantization-patch
+- Files: patches/stage2-qjl/python/generate_constants.py, patches/stage2-qjl/c/tqp_constants_*.h
+
+---
+id: turboquant-instinct-update-integration-scripts
+trigger: "When a new patch or quantization method is added"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Update Integration Scripts
+
+## Action
+
+Update or add integration scripts (e.g., build_ollama_tq.sh) to automate patch application and build
+
+## Evidence
+
+- Workflow: add-or-update-quantization-patch
+- Files: scripts/build_ollama_tq.sh
+
+---
+id: turboquant-instinct-add-smoke-tests
+trigger: "When validating patch integration"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: pitcany/turboquant
+---
+
+# Turboquant Instinct Add Smoke Tests
+
+## Action
+
+Add or update smoke/integration test scripts (e.g., smoke_test_tq4p.sh) to verify end-to-end functionality
+
+## Evidence
+
+- Workflow: integration-and-validation-of-patch
+- Files: scripts/smoke_test_tq4p.sh
+
