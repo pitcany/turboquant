@@ -10,6 +10,10 @@
 # Usage:
 #   scripts/build_ollama_tq.sh                 # full build
 #   scripts/build_ollama_tq.sh --rebuild       # skip clones, just rebuild
+#   scripts/build_ollama_tq.sh --stage2        # copy Stage-2 QJL C sources
+#                                              # into the fork clone; prints
+#                                              # the 4 hand-edits to apply.
+#                                              # See patches/stage2-qjl/hooks.md
 #   WORKDIR=/path bash scripts/build_ollama_tq.sh
 #
 # Env:
@@ -30,9 +34,11 @@ OLLAMA_REF="${OLLAMA_REF:-}"
 CUDA="${CUDA:-1}"
 
 REBUILD_ONLY=0
+STAGE2=0
 for arg in "$@"; do
     case "$arg" in
         --rebuild) REBUILD_ONLY=1 ;;
+        --stage2)  STAGE2=1 ;;
         -h|--help)
             sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
@@ -83,6 +89,42 @@ ln -s "$LLAMACPP_DIR" "$VENDOR"
 # Patch the ollama KV-cache-type allowlist so OLLAMA_KV_CACHE_TYPE=tq3_0 is
 # accepted by the runner. Idempotent.
 bash "$PATCH_SCRIPT" "$OLLAMA_DIR"
+
+# Stage-2 QJL patch: copy paper-faithful C source into the fork's ggml/src
+# and print the hand-edits the user has to apply before rebuilding.
+if [[ $STAGE2 -eq 1 ]]; then
+    STAGE2_DIR="$(cd -- "$SCRIPT_DIR/../patches/stage2-qjl" && pwd)"
+    GGML_SRC="$LLAMACPP_DIR/ggml/src"
+    if [[ ! -d "$GGML_SRC" ]]; then
+        echo "ERROR: $GGML_SRC not found. Is the fork cloned?" >&2
+        exit 1
+    fi
+
+    echo "[+] stage2: regenerating constants (Π, S, centroids)"
+    (cd "$STAGE2_DIR/python" && python3 generate_constants.py)
+
+    echo "[+] stage2: copying C sources into $GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/ggml-tq-paper.h"          "$GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/ggml-tq-paper.c"          "$GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/tqp_centroids_d128.h"     "$GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/tqp_centroids_d256.h"     "$GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/tqp_constants_d128.h"     "$GGML_SRC/"
+    cp -v "$STAGE2_DIR/c/tqp_constants_d256.h"     "$GGML_SRC/"
+
+    cat <<HOOKS_BANNER
+
+===================================================================
+Stage-2 sources copied. You now need to apply 4 hand-edits to the
+fork (adds enum values, block structs, dispatch entries, CMake source).
+
+See: $STAGE2_DIR/hooks.md
+
+After applying the hand-edits, rebuild with:
+    $0 --rebuild
+===================================================================
+HOOKS_BANNER
+    exit 0
+fi
 
 # Build. ollama's CMake preset for CUDA expects nvcc in PATH.
 cd "$OLLAMA_DIR"
