@@ -51,10 +51,10 @@ static inline uint16_t tqp_fp32_to_fp16(float f) {
     if (e <= 0) {                          // subnormal or underflow
         if (e < -10) return (uint16_t)(sign << 15);
         mant = (mant | 0x800000u) >> (1 - e);
-        mant += 0x1000u;                   // round to nearest even
+        mant += 0x0FFFu + ((mant >> 13) & 1u);  // round to nearest even
         return (uint16_t)((sign << 15) | (mant >> 13));
     }
-    mant += 0x1000u;                       // round to nearest even
+    mant += 0x0FFFu + ((mant >> 13) & 1u);  // round to nearest even
     if (mant & 0x800000u) { mant = 0; e += 1; if (e >= 0x1f) return (uint16_t)((sign << 15) | 0x7c00u); }
     return (uint16_t)((sign << 15) | ((uint32_t)e << 10) | (mant >> 13));
 }
@@ -121,18 +121,18 @@ static inline void tqp_unpack_indices_bitplane(const uint8_t * in, uint8_t * idx
 // Linear search over 7 boundaries; branchless via comparisons and adds.
 // For bits=3 this is always 7 comparisons — short enough not to warrant
 // binary search. Matches torch.bucketize exactly: returns the number of
-// boundaries strictly less than or equal to x (i.e., the right-most bin
-// whose left edge is ≤ x).
+// boundaries strictly less than x (i.e., the left-most bin whose left edge
+// is ≥ x).
 
 static inline uint8_t tqp_bucketize_d3(float x, const float * bounds) {
     uint8_t b = 0;
-    b += (x >= bounds[0]);
-    b += (x >= bounds[1]);
-    b += (x >= bounds[2]);
-    b += (x >= bounds[3]);
-    b += (x >= bounds[4]);
-    b += (x >= bounds[5]);
-    b += (x >= bounds[6]);
+    b += (x > bounds[0]);
+    b += (x > bounds[1]);
+    b += (x > bounds[2]);
+    b += (x > bounds[3]);
+    b += (x > bounds[4]);
+    b += (x > bounds[5]);
+    b += (x > bounds[6]);
     return b;
 }
 
@@ -340,12 +340,10 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUND
         const float * q             = (const float *)vy;                                   \
         const int64_t nb = n / D;                                                          \
                                                                                            \
-        /* Amortize S·q across all blocks. */                                              \
-        float Sq[D];                                                                       \
-        ggml_tqp_prepare_query_d##D(q, Sq);                                                \
-                                                                                           \
         float acc = 0.0f;                                                                  \
         for (int64_t b = 0; b < nb; ++b) {                                                 \
+            float Sq[D];                                                                   \
+            ggml_tqp_prepare_query_d##D(q + b * D, Sq);                                    \
             acc += ggml_tqp_vec_dot_block_d##D(q + b * D, Sq, &blk[b]);                    \
         }                                                                                  \
         *s = acc;                                                                          \
