@@ -1,4 +1,0 @@
-config	prompt	prompt_tokens	completion_tokens	wall_time_s	tokens_per_sec
-qwen2.5-72b-turboquant-16k	short	32	10	1.61	6.2
-qwen2.5-72b-turboquant-16k	medium	40	256	28.01	9.1
-qwen2.5-72b-turboquant-16k	long	55	256	28.12	9.1
