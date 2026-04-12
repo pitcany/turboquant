@@ -53,18 +53,21 @@ vs 512 bytes for fp16 (128 dims x 2 bytes x 2 for K+V) = **4.3x compression**.
 
 ### Native Ollama (no vLLM)
 
-To run `ollama` with a TurboQuant KV cache — no vLLM, no Python serving
-layer — rebuild ollama against the
-[`turbo-tan/llama.cpp-tq3`](https://github.com/turbo-tan/llama.cpp-tq3) fork:
+Run `ollama` with the paper-faithful TurboQuant `TQ4P` KV cache.
+`scripts/build_ollama_tq.sh` patches ollama's own vendored ggml in place —
+no llama.cpp fork, no symlinks, just two new ggml quantization types
+(`tq4p_d128` for head_dim 128, `tq4p_d256` for Qwen 3.5):
 
 ```bash
 scripts/build_ollama_tq.sh
-OLLAMA_KV_CACHE_TYPE=tq3_0 OLLAMA_FLASH_ATTENTION=1 \
+OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 \
     ~/.local/src/ollama-tq/ollama/ollama serve
 ```
 
-See [docs/OLLAMA_NATIVE.md](docs/OLLAMA_NATIVE.md) for the full workflow,
-including how to edit the fork and rebuild.
+The TQ4P sources are in [patches/stage2-qjl/](patches/stage2-qjl/); see
+[docs/OLLAMA_NATIVE.md](docs/OLLAMA_NATIVE.md) for the full workflow and
+[patches/stage2-qjl/PLAN.md](patches/stage2-qjl/PLAN.md) for the algorithm
+and validation strategy.
 
 ### Harbor Ollama GGUF Models
 

@@ -1,10 +1,13 @@
-# Fork-side hooks — exact edits for `turbo-tan/llama.cpp-tq3`
+# ggml-side hooks — exact edits `apply_hooks.sh` makes
 
-After `scripts/build_ollama_tq.sh --stage2` has copied the C files into
-the fork clone (default `~/.local/src/ollama-tq/llama.cpp-tq3/ggml/src/`),
-apply these edits once. The script `patches/stage2-qjl/apply_hooks.sh`
-automates all four — this file documents what it does, so you can apply
-them by hand if the auto-apply doesn't match your fork state.
+`scripts/build_ollama_tq.sh` copies the TQ4P C files into ollama's ggml
+tree (`ml/backend/ggml/ggml/src/`) and then runs
+`patches/stage2-qjl/apply_hooks.sh` to make these four additive edits.
+This file documents them, so if the auto-apply fails you can apply by hand.
+
+Anchors below are based on ollama's vendored ggml at the time of writing.
+`apply_hooks.sh` uses value-based anchors (it reads `GGML_TYPE_COUNT = N`
+dynamically) so small upstream drift doesn't break it.
 
 Line numbers below are from the fork's `main` branch at the time of
 authoring. The script uses context-based anchors (not line numbers) so it

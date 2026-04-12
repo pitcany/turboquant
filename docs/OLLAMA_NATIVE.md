@@ -1,17 +1,15 @@
-# Native Ollama with TurboQuant
+# Native Ollama with TurboQuant (TQ4P)
 
-Run `ollama` with a TurboQuant KV cache — no vLLM, no Harbor, no Python
-serving layer. This path rebuilds `ollama` against the
-[`turbo-tan/llama.cpp-tq3`](https://github.com/turbo-tan/llama.cpp-tq3) fork
-of llama.cpp, which adds the `tq3_0` KV cache type (3.5-bit TurboQuant
-quantization, CUDA kernels) from Zandieh et al.'s [TurboQuant: Online Vector
-Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874)
-(ICLR 2026).
+Run `ollama` with the paper-faithful TurboQuant KV cache — no vLLM, no
+Harbor, no Python serving layer. `scripts/build_ollama_tq.sh` patches
+ollama's own vendored ggml in place with two new quantization types,
+`tq4p_d128` and `tq4p_d256`, implementing Zandieh et al.'s [TurboQuant:
+Online Vector Quantization with Near-optimal Distortion
+Rate](https://arxiv.org/abs/2504.19874) (ICLR 2026).
 
-This is an end-run around upstream: neither `ollama` nor `llama.cpp` has
-merged TurboQuant as of April 2026. The build script swaps the vendored
-llama.cpp and widens ollama's KV cache type allowlist so
-`OLLAMA_KV_CACHE_TYPE=tq3_0` is accepted.
+Neither ollama nor upstream llama.cpp has merged TurboQuant as of April 2026.
+This patch set is an end-run around that — a thin, additive layer on top of
+ollama's own sources.
 
 ## One-time build
 
@@ -19,27 +17,26 @@ llama.cpp and widens ollama's KV cache type allowlist so
 scripts/build_ollama_tq.sh
 ```
 
-This clones, patches, and compiles everything under
-`$HOME/.local/src/ollama-tq/` (override with `WORKDIR=...`):
-
-```
-~/.local/src/ollama-tq/
-├── llama.cpp-tq3/        # editable fork clone
-└── ollama/
-    ├── llama/llama.cpp   -> ../../llama.cpp-tq3   (symlink)
-    └── ollama            # patched binary
-```
+This clones ollama under `$HOME/.local/src/ollama-tq/` (override with
+`WORKDIR=...`), patches `ml/backend/ggml/ggml/src/` with the TQ4P sources,
+applies four additive edits (enum, two dispatch tables, CMakeLists), widens
+ollama's Go KV-cache-type allowlist to accept `tq4p_d128` and `tq4p_d256`,
+then runs `go generate` and `go build`.
 
 CUDA is on by default (`CUDA=0` for CPU-only). `nvcc` must be in `PATH`.
 
 ## Run
 
 ```bash
-# Stop any existing ollama daemon first
 systemctl --user stop ollama 2>/dev/null || pkill -x ollama || true
 
-# Use the rebuilt binary with the TurboQuant cache type
-OLLAMA_KV_CACHE_TYPE=tq3_0 \
+# Llama 3.x, Qwen 2.5, Qwen 3 — head_dim 128
+OLLAMA_KV_CACHE_TYPE=tq4p_d128 \
+OLLAMA_FLASH_ATTENTION=1 \
+~/.local/src/ollama-tq/ollama/ollama serve
+
+# Qwen 3.5 (Gated Attention) — head_dim 256
+OLLAMA_KV_CACHE_TYPE=tq4p_d256 \
 OLLAMA_FLASH_ATTENTION=1 \
 ~/.local/src/ollama-tq/ollama/ollama serve
 
@@ -47,85 +44,123 @@ OLLAMA_FLASH_ATTENTION=1 \
 ollama run qwen2.5-coder:32b
 ```
 
-Your existing pulled GGUFs under `~/.ollama/models` work unchanged —
-TurboQuant only rewrites the runtime KV cache; it does not touch weights on
-disk.
+Your pulled GGUFs under `~/.ollama/models` work unchanged — TurboQuant
+only rewrites the runtime KV cache; it does not touch weights on disk.
 
-`OLLAMA_FLASH_ATTENTION=1` is recommended: the fork's TQ kernels are wired
-into the flash-attention path.
+## Iterating on TQ4P
 
-## Making changes to the fork
-
-The fork lives at `~/.local/src/ollama-tq/llama.cpp-tq3/` as a normal git
-clone. Edit it however you like — add your own branch, modify kernels in
-`ggml/src/ggml-cuda/`, tweak the `tq3_0` codebook — then rebuild:
+The TQ4P sources live at `patches/stage2-qjl/c/` in this repo. Edits there
+are picked up on the next build:
 
 ```bash
 scripts/build_ollama_tq.sh --rebuild
 ```
 
-`--rebuild` skips the clone step and just re-runs `go generate` + `go build`
-in the ollama tree. Because ollama's `llama/llama.cpp` is a symlink into your
-fork clone, your edits are picked up automatically.
+`--rebuild` skips the clone step, re-copies `patches/stage2-qjl/c/*.{c,h}`
+into ollama's `ml/backend/ggml/ggml/src/`, re-runs `apply_hooks.sh`
+(idempotent), then rebuilds ollama.
 
-To pin a specific branch or commit of the fork:
+## What the build script actually does
+
+1. Clones (or updates) ollama into `$WORKDIR/ollama`.
+2. Recovers from earlier symlink-based builds if detected: if
+   `ollama/llama/llama.cpp` is a symlink and `llama.cpp.orig` exists, it
+   restores the original tree. (An older version of this script replaced
+   the tree wholesale; that broke ollama's build because the replacement
+   was missing Go package stubs. The new flow doesn't touch
+   `llama/llama.cpp` at all.)
+3. Regenerates Π, S, and Lloyd-Max centroids from seeds.
+4. Copies the TQ4P `.c`/`.h` files into `ml/backend/ggml/ggml/src/`.
+5. Applies four hooks via `patches/stage2-qjl/apply_hooks.sh`:
+   - new enum values in `include/ggml.h`
+   - new entries in `src/ggml.c` `type_traits` table
+   - new entries in `src/ggml-cpu/ggml-cpu.c` `type_traits_cpu` table
+   - `ggml-tq-paper.c` added to `src/CMakeLists.txt` ggml-base sources
+6. Widens ollama's Go KV-cache-type allowlist
+   (`scripts/patch_ollama_kv_types.sh`, idempotent).
+7. Runs `go generate ./... && go build .` in the ollama tree.
+
+Ollama's own `llama/llama.cpp/` is **not touched** — that's the llama.cpp
+C++ layer, separate from ggml, and ollama maintains Go package stubs
+inside it that the build depends on.
+
+## Validation (before running a model)
+
+End-to-end byte-exact tests for the TQ4P C sources:
 
 ```bash
-LLAMACPP_REF=my-tq-experiments scripts/build_ollama_tq.sh
+cd patches/stage2-qjl/c && make test
 ```
 
-## Cross-checking against this repo's reference
-
-`turboquant.py` and `lloyd_max.py` in the repo root are a PyTorch reference
-implementation of the same algorithm. They're useful for validating fork
-changes: dump a batch of KV vectors from the fork's C implementation,
-round-trip them through `TurboQuantMSE` in Python, and compare MSE. See
-`tests/test_core.py` for the MSE/correlation bounds the paper specifies:
-
-| Bits | Expected MSE | Inner Product Corr |
-|------|-------------|--------------------|
-| 2-bit | ≤ 0.170 | ~0.80 |
-| 3-bit | ≤ 0.043 | ~0.93 |
-| 4-bit | ≤ 0.011 | ~0.98 |
+This compiles the C as a shared library, loads it via ctypes, and
+cross-checks 30 byte-exact assertions against `turboquant.py` (the
+paper-accurate Python reference). All 30 must pass before the patch
+gets applied.
 
 ## Rolling back
 
 ```bash
-# Restore original vendored llama.cpp in the ollama tree
 cd ~/.local/src/ollama-tq/ollama
-rm llama/llama.cpp
-mv llama/llama.cpp.orig llama/llama.cpp
 
-# Or just delete the whole workdir and use distro ollama
+# Revert the hook edits and the allowlist patch
+git checkout -- ml/backend/ggml/ggml/include/ggml.h \
+                ml/backend/ggml/ggml/src/ggml.c \
+                ml/backend/ggml/ggml/src/ggml-cpu/ggml-cpu.c \
+                ml/backend/ggml/ggml/src/CMakeLists.txt \
+                $(grep -rl "turboquant:" --include='*.go' .)
+
+# Remove the added source files
+rm ml/backend/ggml/ggml/src/ggml-tq-paper.{c,h} \
+   ml/backend/ggml/ggml/src/tqp_{centroids,constants}_d{128,256}.h
+
+# Rebuild
+go generate ./... && go build -o ollama .
+
+# Or nuclear: delete the workdir and reinstall ollama from your distro
 rm -rf ~/.local/src/ollama-tq
 ```
 
-The `patch_ollama_kv_types.sh` allowlist edit is marked with the comment
-`// turboquant: tq3_0 allowlisted` in whichever Go file holds the validator,
-so you can `git -C ~/.local/src/ollama-tq/ollama diff` to inspect it or
-`git checkout` to revert.
+Everything the patch adds is marked with the `tq4p` prefix (or a
+`// turboquant:` comment for the Go allowlist), so you can verify the
+rollback with `grep -r tq4p ~/.local/src/ollama-tq/ollama`.
 
 ## Troubleshooting
 
-**`OLLAMA_KV_CACHE_TYPE=tq3_0` silently falls back to f16.** Check logs for
-`unsupported KV cache type`. The patch script failed to find the allowlist —
-run `bash scripts/patch_ollama_kv_types.sh ~/.local/src/ollama-tq/ollama` by
-hand and follow the error output; the validator may have moved in a newer
-ollama release.
+**`OLLAMA_KV_CACHE_TYPE=tq4p_d128` silently falls back to f16.** Check logs
+for `unsupported KV cache type`. The allowlist patch failed to find the
+validator — run `bash scripts/patch_ollama_kv_types.sh
+~/.local/src/ollama-tq/ollama` manually and follow the error output.
 
-**CUDA build errors in the fork.** The fork requires a CUDA toolkit matching
-your driver. Check `nvcc --version` and the compute capability of your GPUs
-(RTX 4090 = `sm_89`, RTX 5090 = `sm_120`). Override with
-`CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=89;120"` in the environment before
-calling `build_ollama_tq.sh --rebuild`.
+**`ollama ggml tree not found at ml/backend/ggml/ggml`**. ollama's repo
+layout changed. Check the current path to `include/ggml.h` inside ollama
+and update the `GGML=` line in `build_ollama_tq.sh`.
 
-**Two ollama binaries competing.** Distro ollama (`/usr/local/bin/ollama`)
-and the patched one will fight over `:11434`. Always stop the system service
-before running the rebuilt binary.
+**CUDA build errors.** CUDA toolkit must match your driver.
+`nvcc --version`. For RTX 4090 + RTX 5090 set
+`CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=89;120"` before `--rebuild`.
 
-## Why not `serve_ollama_tq.sh`?
+**Two ollama binaries competing.** Distro `/usr/local/bin/ollama` and the
+rebuilt one will both try to bind `:11434`. Stop the system service before
+running the rebuilt binary.
 
-That script (at the repo root) routes Ollama-managed GGUFs through vLLM for
-serving. This doc is the opposite: keep ollama doing the serving, just make
-it use TurboQuant underneath. The two paths are independent — pick one per
-workflow.
+**Hook apply claims "already patched" but the type is missing.** The
+idempotency marker (`tq4p`) is present but a file got reverted. Remove the
+marker line and rerun.
+
+## Note on the old turbo-tan fork approach
+
+Earlier revisions of this script replaced ollama's `llama/llama.cpp` with
+a symlink to `turbo-tan/llama.cpp-tq3` (a non-paper-faithful TurboQuant
+implementation). That approach was abandoned because:
+
+1. The fork is *not* paper-faithful — it uses a Walsh-Hadamard rotation
+   instead of Haar, has no QJL stage, and operates per-32-block instead of
+   per-head. Details in `patches/stage2-qjl/PLAN.md`.
+2. Replacing `llama/llama.cpp` removed ollama's required Go package stubs,
+   breaking the build.
+3. Our TQ4P patch doesn't need anything from that fork — it's paper-faithful
+   from scratch and lives entirely in `patches/stage2-qjl/`.
+
+If you specifically want the fork's (non-paper) `tq3_0` type, check it out
+manually and apply it alongside — but that's opt-in and unsupported by
+this script.

@@ -1,8 +1,9 @@
-# Stage-2 QJL patch for `turbo-tan/llama.cpp-tq3`
+# TQ4P — paper-faithful TurboQuant for ollama's ggml
 
 Paper-faithful TurboQuant (ICLR 2026, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874))
-as two new ggml block quantization types — additive to the fork, does not
-touch its existing `TQ3_0` / `TQ3_1S` / `TQ3_4S` paths.
+as two new ggml block quantization types — additive to whichever ggml tree
+you drop it into (tested against ollama's vendored `ml/backend/ggml/ggml/`).
+Nothing existing is modified in place.
 
 | Type | head_dim | Covers | Block size | bpw |
 |---|---|---|---|---|
@@ -38,26 +39,27 @@ gcc -O2 -fPIC -shared -o ../c/libggml_tq_paper.so ../c/ggml-tq-paper.c
 python3 -m pytest test_tq_paper.py test_c_vs_python.py -v
 ```
 
-## How to apply to your fork clone
+## How it gets applied
 
 ```bash
-# From the repo root, assuming build_ollama_tq.sh has already set up the
-# fork clone at $WORKDIR/llama.cpp-tq3 (default $HOME/.local/src/ollama-tq).
-scripts/build_ollama_tq.sh --stage2
+scripts/build_ollama_tq.sh           # full: clone ollama, patch ggml, build
+scripts/build_ollama_tq.sh --rebuild  # reapply + rebuild only
 ```
 
-What `--stage2` does:
+What the build script does on the ollama tree:
 
-1. Runs `generate_constants.py` to ensure the `.h` files exist.
-2. Copies `c/ggml-tq-paper.{c,h}` + `c/tqp_{constants,centroids}_*.h` into
-   `llama.cpp-tq3/ggml/src/`.
-3. Prints the contents of [`hooks.md`](hooks.md) — the ~5 hand-edits you
-   need to apply to fork files (enum + struct + dispatch + CMakeLists).
-4. Stops. Re-run `scripts/build_ollama_tq.sh --rebuild` after applying the
-   hand-edits.
+1. Runs `generate_constants.py` so the `.h` files are current.
+2. Copies `c/ggml-tq-paper.{c,h}` + `c/tqp_{constants,centroids}_*.h`
+   into `ollama/ml/backend/ggml/ggml/src/`.
+3. Runs [`apply_hooks.sh`](apply_hooks.sh) — 4 additive edits:
+   new enum values, 2 dispatch table entries, `CMakeLists.txt` source
+   addition. All idempotent via a `tq4p` marker.
+4. Widens ollama's Go KV-cache-type allowlist to accept `tq4p_d128`
+   and `tq4p_d256`.
+5. Runs `go generate && go build` on ollama.
 
-Deliberately stops short of editing existing fork files — those edits
-depend on exact line context we don't have control of upstream.
+See [`hooks.md`](hooks.md) for the exact edits, in case you prefer to
+apply them by hand or need to adjust for an ollama layout change.
 
 ## Layout
 
@@ -105,4 +107,6 @@ load the same bits the C headers contain. `c/libggml_tq_paper.so` and
 
 - [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Zandieh et al., ICLR 2026
 - Paper reference Python: [`turboquant.py`](../../turboquant.py), [`lloyd_max.py`](../../lloyd_max.py)
-- Fork being patched: [turbo-tan/llama.cpp-tq3](https://github.com/turbo-tan/llama.cpp-tq3)
+- Target ggml tree: ollama's vendored `ml/backend/ggml/ggml/`, or any
+  compatible llama.cpp ggml tree (hooks auto-adapt to the `GGML_TYPE_COUNT`
+  value in use).
