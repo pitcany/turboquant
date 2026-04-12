@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the 4 TQ4P hook edits to a ggml source tree. Additive only.
+# Apply the 5 TQ4P hook edits to a ggml source tree. Additive only.
 #
 # Usage: apply_hooks.sh <ggml-root>
 #
@@ -12,6 +12,7 @@
 #   2. src/ggml.c              — 2 entries in type_traits + #include
 #   3. src/ggml-cpu/ggml-cpu.c — 2 entries in type_traits_cpu + #include
 #   4. src/CMakeLists.txt      — add ggml-tq-paper.c to ggml-base sources
+#   5. src/ggml-cuda/ggml-cuda.cu — TQ4P CUDA vec_dot dispatch
 #
 # Anchors are value-based (reads GGML_TYPE_COUNT = N dynamically) so this
 # survives minor ggml drift. Idempotent via "tq4p" marker check.
@@ -28,6 +29,7 @@ GGML_H="$GGML/include/ggml.h"
 GGML_C="$GGML/src/ggml.c"
 CPU_C="$GGML/src/ggml-cpu/ggml-cpu.c"
 CMAKE="$GGML/src/CMakeLists.txt"
+CUDA_CU="$GGML/src/ggml-cuda/ggml-cuda.cu"
 
 MARKER="tq4p"
 
@@ -201,6 +203,62 @@ indent = t[line_start:m.start()]
 t = t[:line_end] + "\n" + indent + "ggml-tq-paper.c" + t[line_end:]
 p.write_text(t)
 PY
+fi
+
+# ---------- 5. ggml-cuda.cu dispatch (CUDA only) ----------
+if [[ -f "$CUDA_CU" && -f "$GGML/src/ggml-cuda/tqp-vec-dot.cu" ]]; then
+    if grep -q "ggml_cuda_op_tqp_vec_dot" "$CUDA_CU" 2>/dev/null; then
+        echo "[=] ggml-cuda.cu already patched"
+    else
+        echo "[+] ggml-cuda.cu: TQ4P CUDA dispatch"
+        python3 - "$CUDA_CU" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+include_anchor = '#include "ggml.h"\n'
+if include_anchor not in t:
+    sys.exit('ggml-cuda.cu: could not find #include "ggml.h" anchor')
+
+decl = (
+    '\nextern "C" void ggml_cuda_op_tqp_vec_dot(\n'
+    '    ggml_backend_cuda_context & ctx,\n'
+    '    const ggml_tensor * src0,\n'
+    '    const ggml_tensor * src1,\n'
+    '    ggml_tensor * dst);\n'
+)
+t = t.replace(include_anchor, include_anchor + decl, 1)
+
+sig = re.search(
+    r'static\s+void\s+ggml_cuda_mul_mat\s*\(\s*'
+    r'ggml_backend_cuda_context\s*&\s*ctx\s*,\s*'
+    r'const\s+ggml_tensor\s*\*\s*src0\s*,\s*'
+    r'const\s+ggml_tensor\s*\*\s*src1\s*,\s*'
+    r'ggml_tensor\s*\*\s*dst\s*\)\s*\{\s*',
+    t,
+)
+if not sig:
+    sys.exit('ggml-cuda.cu: ggml_cuda_mul_mat signature not found')
+
+split_line = re.search(
+    r'(\s*const\s+bool\s+split\s*=\s*ggml_backend_buft_is_cuda_split\s*\(\s*src0->buffer->buft\s*\)\s*;\s*)',
+    t[sig.end():],
+)
+if not split_line:
+    sys.exit('ggml-cuda.cu: split declaration in ggml_cuda_mul_mat not found')
+
+insert_at = sig.end() + split_line.end()
+dispatch = (
+    '\n'
+    '    if (!split && (src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256)) {\n'
+    '        ggml_cuda_op_tqp_vec_dot(ctx, src0, src1, dst);\n'
+    '        return;\n'
+    '    }\n'
+)
+t = t[:insert_at] + dispatch + t[insert_at:]
+p.write_text(t)
+PY
+fi
 fi
 
 echo "All hooks applied."

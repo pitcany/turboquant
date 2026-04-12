@@ -2,7 +2,7 @@
 
 `scripts/build_ollama_tq.sh` copies the TQ4P C files into ollama's ggml
 tree (`ml/backend/ggml/ggml/src/`) and then runs
-`patches/stage2-qjl/apply_hooks.sh` to make these four additive edits.
+`patches/stage2-qjl/apply_hooks.sh` to make these five additive edits.
 This file documents them, so if the auto-apply fails you can apply by hand.
 
 Anchors below are based on ollama's vendored ggml at the time of writing.
@@ -21,6 +21,7 @@ survives small drift.
 | `ggml/src/ggml.c` | additive | 2 entries in backend-agnostic `type_traits` table |
 | `ggml/src/ggml-cpu/ggml-cpu.c` | additive | 2 entries in `type_traits_cpu` dispatch table |
 | `ggml/src/CMakeLists.txt` | additive | 1 source file added |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | additive | CUDA dispatch for TQ4P vec_dot |
 
 `ggml-common.h` is **not** touched — our block structs live in
 `ggml-tq-paper.h`, which `ggml.c` `#include`s so `sizeof(block_tq4p_d128)`
@@ -147,6 +148,41 @@ add_library(ggml-base
 ```
 
 Or a `target_sources(ggml-base PRIVATE ...)` block; same idea.
+
+## 5. `ggml/src/ggml-cuda/ggml-cuda.cu` — CUDA dispatch
+
+This hook is applied only when the CUDA sources have been copied into
+`ggml/src/ggml-cuda/`.
+
+After the existing includes, add the TQ4P CUDA entry point declaration:
+
+```c++
+extern "C" void ggml_cuda_op_tqp_vec_dot(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    ggml_tensor * dst);
+```
+
+In `ggml_cuda_mul_mat()`, immediately after:
+
+```c++
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+```
+
+add:
+
+```c++
+    if (!split && (src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256)) {
+        ggml_cuda_op_tqp_vec_dot(ctx, src0, src1, dst);
+        return;
+    }
+```
+
+The implementation lives in `ggml/src/ggml-cuda/tqp-vec-dot.cu` and is
+picked up by ggml-cuda's existing `file(GLOB GGML_SOURCES_CUDA "*.cu")`.
+It currently targets the non-split CUDA path with fp32 query tensors,
+which matches the TQ4P CPU `vec_dot_type = GGML_TYPE_F32`.
 
 ---
 
