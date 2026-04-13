@@ -6,6 +6,29 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// Q8_K block layout (matches ggml block_q8_K / block_q8k_compat).
+#define QK_Q8K 256
+#pragma pack(push, 1)
+typedef struct {
+    float   d;
+    int8_t  qs[QK_Q8K];
+    int16_t bsums[QK_Q8K / 16];
+} block_q8k_cuda;
+#pragma pack(pop)
+
+// Dequantize Q8_K blocks to contiguous fp32.
+// Grid: (n_blocks,), Block: (256,).
+__global__ static void tqp_dequantize_q8k_kernel(
+        const block_q8k_cuda * __restrict__ src,
+        float * __restrict__ dst,
+        int64_t n_blocks) {
+    const int64_t b = (int64_t)blockIdx.x;
+    if (b >= n_blocks) return;
+    const int tid = threadIdx.x;
+    const float d = src[b].d;
+    dst[b * QK_Q8K + tid] = d * (float)src[b].qs[tid];
+}
+
 extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
@@ -276,6 +299,104 @@ extern "C" float tqp_cuda_vec_dot_block_d256(
     return err == 0 ? out : 0.0f;
 }
 
+// Q8_K-aware test wrappers: dequantize Q8_K query to fp32 on device,
+// then run the existing prepare_query + vec_dot pipeline.
+template<typename Block>
+static int tqp_cuda_vec_dot_q8k_host(
+        int d,
+        const void * q8k_host,    // block_q8k_cuda blocks
+        const Block * blocks_host,
+        float * out_host,
+        int64_t n_blocks,
+        void (*prepare_fn)(const float *, float *, float *, uint8_t, cudaStream_t),
+        void (*vec_dot_fn)(const void *, const float *, const float *, float *, int64_t, cudaStream_t)) {
+    if (n_blocks <= 0) return 1;
+
+    const uint8_t layer_byte = blocks_host[0].layer_idx;
+    // Q8_K has 256 elements per block. For d=128, d fits in 1/2 Q8K block;
+    // for d=256, d fits in 1 Q8K block. In either case, total fp32 = d.
+    const int64_t n_q8k_blocks = ((int64_t)d + QK_Q8K - 1) / QK_Q8K;
+    const size_t q8k_bytes = (size_t)n_q8k_blocks * sizeof(block_q8k_cuda);
+
+    float * q_fp32_dev = nullptr;
+    block_q8k_cuda * q8k_dev = nullptr;
+    float * Sq_dev = nullptr;
+    float * q_rot_dev = nullptr;
+    Block * blocks_dev = nullptr;
+    float * out_dev = nullptr;
+
+    const size_t q_bytes = (size_t)d * sizeof(float);
+    const size_t block_bytes = (size_t)n_blocks * sizeof(Block);
+    const size_t out_bytes = (size_t)n_blocks * sizeof(float);
+
+    cudaError_t err = cudaMalloc((void **)&q8k_dev, q8k_bytes);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void **)&q_fp32_dev, q_bytes);
+    if (err != cudaSuccess) goto done;
+    err = cudaMalloc((void **)&Sq_dev, q_bytes);
+    if (err != cudaSuccess) goto done;
+    err = cudaMalloc((void **)&q_rot_dev, q_bytes);
+    if (err != cudaSuccess) goto done;
+    err = cudaMalloc((void **)&blocks_dev, block_bytes);
+    if (err != cudaSuccess) goto done;
+    err = cudaMalloc((void **)&out_dev, out_bytes);
+    if (err != cudaSuccess) goto done;
+
+    err = cudaMemcpy(q8k_dev, q8k_host, q8k_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto done;
+    err = cudaMemcpy(blocks_dev, blocks_host, block_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto done;
+
+    // Dequantize Q8_K to fp32 on device.
+    tqp_dequantize_q8k_kernel<<<(unsigned int)n_q8k_blocks, QK_Q8K, 0, 0>>>(
+        q8k_dev, q_fp32_dev, n_q8k_blocks);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto done;
+
+    // Run prepare_query + vec_dot with the fp32 query.
+    prepare_fn(q_fp32_dev, Sq_dev, q_rot_dev, layer_byte, 0);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto done;
+    vec_dot_fn(blocks_dev, Sq_dev, q_rot_dev, out_dev, n_blocks, 0);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto done;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) goto done;
+
+    err = cudaMemcpy(out_host, out_dev, out_bytes, cudaMemcpyDeviceToHost);
+
+done:
+    cudaFree(out_dev);
+    cudaFree(blocks_dev);
+    cudaFree(q_rot_dev);
+    cudaFree(Sq_dev);
+    cudaFree(q_fp32_dev);
+    cudaFree(q8k_dev);
+    return (int)err;
+}
+
+extern "C" int tqp_cuda_vec_dot_q8k_d128(
+        const void * q8k_host,
+        const block_tq4p_d128 * blocks_host,
+        float * out_host,
+        int64_t n_blocks) {
+    return tqp_cuda_vec_dot_q8k_host<block_tq4p_d128>(
+        QK_TQ4P_D128, q8k_host, blocks_host, out_host, n_blocks,
+        ggml_cuda_tqp_prepare_query_d128,
+        ggml_cuda_tqp_vec_dot_blocks_d128);
+}
+
+extern "C" int tqp_cuda_vec_dot_q8k_d256(
+        const void * q8k_host,
+        const block_tq4p_d256 * blocks_host,
+        float * out_host,
+        int64_t n_blocks) {
+    return tqp_cuda_vec_dot_q8k_host<block_tq4p_d256>(
+        QK_TQ4P_D256, q8k_host, blocks_host, out_host, n_blocks,
+        ggml_cuda_tqp_prepare_query_d256,
+        ggml_cuda_tqp_vec_dot_blocks_d256);
+}
+
 #if __has_include("common.cuh")
 #include "common.cuh"
 
@@ -284,7 +405,7 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst) {
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_K);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256);
     GGML_ASSERT(ggml_is_contiguous(src0));
@@ -294,7 +415,6 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     const int d = src0->type == GGML_TYPE_TQ4P_D128 ? QK_TQ4P_D128 : QK_TQ4P_D256;
     GGML_ASSERT(ne00 == d);
     GGML_ASSERT(ne10 == d);
-    GGML_ASSERT(nb10 == (int64_t)sizeof(float));
     GGML_ASSERT(nb0 == (int64_t)sizeof(float));
     GGML_ASSERT(ne12 == ne2);
     GGML_ASSERT(ne13 == ne3);
@@ -310,10 +430,33 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     float * Sq = Sq_alloc.get();
     float * q_rot = q_rot_alloc.get();
 
-    const float * src1_d = (const float *)src1->data;
-    const int64_t q_s11 = nb11 / (int64_t)sizeof(float);
-    const int64_t q_s12 = nb12 / (int64_t)sizeof(float);
-    const int64_t q_s13 = nb13 / (int64_t)sizeof(float);
+    // If src1 is Q8_K, dequantize to a contiguous fp32 buffer first.
+    ggml_cuda_pool_alloc<float> q8k_fp32_alloc;
+    const float * src1_d;
+    int64_t q_s11, q_s12, q_s13;
+
+    if (src1->type == GGML_TYPE_Q8_K) {
+        const int64_t n_elements = ggml_nelements(src1);
+        q8k_fp32_alloc.alloc(ctx.pool(), n_elements);
+        float * fp32_buf = q8k_fp32_alloc.get();
+
+        const int64_t n_q8k_blocks = n_elements / QK_Q8K;
+        tqp_dequantize_q8k_kernel<<<(unsigned int)n_q8k_blocks, QK_Q8K, 0, stream>>>(
+            (const block_q8k_cuda *)src1->data, fp32_buf, n_q8k_blocks);
+        CUDA_CHECK(cudaGetLastError());
+
+        src1_d = fp32_buf;
+        // After dequantize, data is contiguous: stride = d per column.
+        q_s11 = (int64_t)d;
+        q_s12 = ne11 * (int64_t)d;
+        q_s13 = ne11 * ne12 * (int64_t)d;
+    } else {
+        GGML_ASSERT(nb10 == (int64_t)sizeof(float));
+        src1_d = (const float *)src1->data;
+        q_s11 = nb11 / (int64_t)sizeof(float);
+        q_s12 = nb12 / (int64_t)sizeof(float);
+        q_s13 = nb13 / (int64_t)sizeof(float);
+    }
 
     // K-cache tensors are homogeneously one (layer, rotation) pair's worth
     // of blocks; read the packed layer_byte from the first block via a
