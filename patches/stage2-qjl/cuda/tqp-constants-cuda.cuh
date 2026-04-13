@@ -23,12 +23,13 @@ inline float * d_tqp_s_d256  = nullptr;
 
 inline bool g_tqp_cuda_init_d128 = false;
 inline bool g_tqp_cuda_init_d256 = false;
+inline bool g_tqp_cuda_constants_init_d128 = false;
+inline bool g_tqp_cuda_constants_init_d256 = false;
 
 static inline cudaError_t tqp_cuda_init(int head_dim) {
     cudaError_t err = cudaSuccess;
 
     if (head_dim == QK_TQ4P_D128) {
-        static bool g_tqp_cuda_constants_init_d128 = false;
         if (!g_tqp_cuda_constants_init_d128) {
             err = cudaMemcpyToSymbol(c_tqp_centroids_d128, TQP_CENTROIDS_D128, sizeof(TQP_CENTROIDS_D128));
             if (err != cudaSuccess) return err;
@@ -66,7 +67,6 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
     }
 
     if (head_dim == QK_TQ4P_D256) {
-        static bool g_tqp_cuda_constants_init_d256 = false;
         if (!g_tqp_cuda_constants_init_d256) {
             err = cudaMemcpyToSymbol(c_tqp_centroids_d256, TQP_CENTROIDS_D256, sizeof(TQP_CENTROIDS_D256));
             if (err != cudaSuccess) return err;
@@ -118,4 +118,6 @@ static inline void tqp_cuda_cleanup() {
     d_tqp_s_d256  = nullptr;
     g_tqp_cuda_init_d128 = false;
     g_tqp_cuda_init_d256 = false;
+    g_tqp_cuda_constants_init_d128 = false;
+    g_tqp_cuda_constants_init_d256 = false;
 }
