@@ -377,7 +377,7 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
 
-# Add TQ4P types to the SET_ROWS supports_op case. Anchor on IQ4_NL.
+# --- SET_ROWS supports_op: add TQ4P types. Anchor on IQ4_NL. ---
 anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
 if anchor not in t:
     print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
@@ -388,6 +388,24 @@ replacement = (
     '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
 )
 t = t.replace(anchor, replacement, 1)
+
+# --- MUL_MAT supports_op: add TQ4P types to the a->type switch. ---
+# Without this, attention Q×K^T falls back to CPU (74 graph splits).
+# Anchor on BF16 which is the last type before "return true; default:".
+mulmat_anchor = '                    case GGML_TYPE_BF16:\n                        return true;\n                    default:\n                        return false;'
+if mulmat_anchor not in t:
+    print("ERROR: MUL_MAT supports_op anchor (BF16) not found", file=sys.stderr)
+    sys.exit(1)
+mulmat_new = (
+    '                    case GGML_TYPE_BF16:\n'
+    '                    case GGML_TYPE_TQ4P_D128: // Hook 7: TQ4P MUL_MAT on GPU\n'
+    '                    case GGML_TYPE_TQ4P_D256:\n'
+    '                        return true;\n'
+    '                    default:\n'
+    '                        return false;'
+)
+t = t.replace(mulmat_anchor, mulmat_new, 1)
+
 p.write_text(t)
 print(f"[+] patched: {p}")
 PY
