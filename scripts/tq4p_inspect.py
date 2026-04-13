@@ -176,6 +176,11 @@ def inspect_gguf(path: Path) -> dict:
         # stride puts byte 4 into random positions of each D256 block
         # almost always hitting a byte with bits 5 or 6 set.
         def _collect_histogram(abs_offset: int, n_blocks: int, block_size: int):
+            """Read up to `n_blocks` blocks from `abs_offset`, validate
+            reserved bits, and build a rotation histogram. Returns
+            (histogram, usable) where `usable` is the actually inspected
+            block count (may be < n_blocks on a truncated file), or None
+            if any block fails validation or no bytes were available."""
             f.seek(abs_offset)
             data = f.read(n_blocks * block_size)
             usable = len(data) // block_size
@@ -191,7 +196,7 @@ def inspect_gguf(path: Path) -> dict:
                     return None
                 r = (lb >> 7) & 1
                 histogram[r] += 1
-            return histogram
+            return histogram, usable
 
         for ti in tensor_infos:
             n_elements = 1
@@ -203,20 +208,22 @@ def inspect_gguf(path: Path) -> dict:
             # Try D128 first.
             if n_elements % 128 == 0:
                 n_blocks = n_elements // 128
-                histogram = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D128)
-                if histogram is not None:
+                res = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D128)
+                if res is not None:
+                    histogram, usable = res
                     result["tensor_name"] = ti["name"]
-                    result["n_blocks"] = n_blocks
+                    result["n_blocks"] = usable
                     result["histogram"] = histogram
                     matched = True
 
             # If D128 rejected, try D256.
             if not matched and n_elements % 256 == 0:
                 n_blocks = n_elements // 256
-                histogram = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D256)
-                if histogram is not None:
+                res = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D256)
+                if res is not None:
+                    histogram, usable = res
                     result["tensor_name"] = ti["name"]
-                    result["n_blocks"] = n_blocks
+                    result["n_blocks"] = usable
                     result["histogram"] = histogram
                     matched = True
 

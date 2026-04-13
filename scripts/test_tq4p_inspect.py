@@ -17,9 +17,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tq4p_inspect import inspect_gguf, GGUF_MAGIC, GGUF_TYPE_STRING
 
-# Also need the block size constant and layer byte packing.
-sys.path.insert(0, str(Path(__file__).resolve().parents[0] / ".." / "patches" / "stage2-qjl" / "python"))
-
 
 BLOCK_SIZE_D128 = 69
 QK_D128 = 128
