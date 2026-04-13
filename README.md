@@ -42,6 +42,13 @@ vs 512 bytes for fp16 (128 dims x 2 bytes x 2 for K+V) = **4.3x compression**.
 
 ## Quick Start
 
+### Prerequisites
+
+- Linux (tested on Ubuntu 22.04+); macOS untested
+- Go 1.22+, CMake 3.21+, GCC 11+
+- For GPU: CUDA 12 toolkit (`nvcc`), an NVIDIA GPU with compute capability ≥ 7.5
+  - CUDA arch defaults to `89;120` (RTX 4090 + 5090); override with `CUDA_ARCHS=86` etc.
+
 ### Build
 
 ```bash
@@ -65,6 +72,30 @@ ollama run qwen2.5-coder:32b
 ```
 
 For Qwen 3.5 (head_dim 256), use `OLLAMA_KV_CACHE_TYPE=tq4p_d256`.
+
+### Picking a Rotation: WHT vs Haar
+
+TurboQuant's Stage-1 random orthogonal rotation can be either a Randomized Hadamard Transform (WHT, default) or a dense Haar matrix (paper-faithful). Both have identical distortion bounds; WHT is `O(d log d)` while Haar is `O(d²)`.
+
+```bash
+# Default: fast WHT (Randomized Hadamard Transform)
+OLLAMA_TQP_ROTATION=wht  ollama serve
+
+# Paper-exact dense Haar rotation (~10x slower per block)
+OLLAMA_TQP_ROTATION=haar ollama serve
+```
+
+Resolution precedence (highest first): per-call explicit (`layer_byte` bit 6) > per-thread (`tqp_set_thread_rotation` C API) > `OLLAMA_TQP_ROTATION` env > compile-time WHT.
+
+### Inspecting a Quantized File
+
+After ollama writes a TQ4P-quantized GGUF, you can verify the metadata and per-block rotation distribution:
+
+```bash
+python3 scripts/tq4p_inspect.py ~/.ollama/models/blobs/sha256-...
+```
+
+Reports the `tq4p.default_rotation` GGUF KV and a histogram of bit-7 (rotation) over the first TQ4P-quantized tensor.
 
 ### Iterate
 
