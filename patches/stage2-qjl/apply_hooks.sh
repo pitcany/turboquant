@@ -108,7 +108,7 @@ entries = (
     "        .type_size                = sizeof(block_tq4p_d128),\n"
     "        .is_quantized             = true,\n"
     "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d128,\n"
-    "        .from_float_ref           = (ggml_from_float_t) ggml_quantize_row_tq4p_d128,\n"
+    "        .from_float_ref           = ggml_quantize_row_tq4p_d128_default,\n"
     "    },\n"
     "    [GGML_TYPE_TQ4P_D256] = {\n"
     "        .type_name                = \"tq4p_d256\",\n"
@@ -116,7 +116,7 @@ entries = (
     "        .type_size                = sizeof(block_tq4p_d256),\n"
     "        .is_quantized             = true,\n"
     "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d256,\n"
-    "        .from_float_ref           = (ggml_from_float_t) ggml_quantize_row_tq4p_d256,\n"
+    "        .from_float_ref           = ggml_quantize_row_tq4p_d256_default,\n"
     "    },\n"
 )
 t = t[:close] + entries + t[close:]
@@ -259,6 +259,92 @@ t = t[:insert_at] + dispatch + t[insert_at:]
 p.write_text(t)
 PY
 fi
+fi
+
+# ---------- 6. ggml-cuda.cu: F32 → TQ4P on-device quantize in CPY dispatch ----
+if [[ -f "$CUDA_CU" && -f "$GGML/src/ggml-cuda/tqp-quantize.cu" ]]; then
+    if grep -q "ggml_cuda_tqp_quantize_row" "$CUDA_CU" 2>/dev/null; then
+        echo "[=] ggml-cuda.cu CPY→TQ4P dispatch already patched"
+    else
+        echo "[+] ggml-cuda.cu: F32 → TQ4P on-device quantize in CPY dispatch"
+        python3 - "$CUDA_CU" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add extern declarations for TQ4P quantize kernels. Place near the
+# existing ggml_cuda_op_tqp_vec_dot declaration (added by hook 5).
+vec_dot_decl = 'extern "C" void ggml_cuda_op_tqp_vec_dot('
+if vec_dot_decl not in t:
+    sys.exit('ggml-cuda.cu: ggml_cuda_op_tqp_vec_dot declaration not found (hook 5 missing?)')
+
+quant_decl = (
+    '\nextern "C" void ggml_cuda_tqp_quantize_row_d128(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
+    'extern "C" void ggml_cuda_tqp_quantize_row_d256(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
+)
+idx = t.index(vec_dot_decl)
+# Insert before the vec_dot declaration
+t = t[:idx] + quant_decl + t[idx:]
+
+# Patch the GGML_OP_CPY case to intercept F32 → TQ4P_D128/D256 before
+# falling through to ggml_cuda_cpy. We replace the simple dispatch line
+# with a TQ4P-aware block that reads layer_byte from dst->op_params[0].
+old_cpy = 'case GGML_OP_CPY:\n            ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);\n            break;'
+if old_cpy not in t:
+    sys.exit('ggml-cuda.cu: GGML_OP_CPY dispatch not found')
+
+new_cpy = (
+    'case GGML_OP_CPY:\n'
+    '            {\n'
+    '                const ggml_tensor * cpy_src = dst->src[0];\n'
+    '                ggml_tensor * cpy_dst = dst->src[1];\n'
+    '                if (cpy_src->type == GGML_TYPE_F32 &&\n'
+    '                    (cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256)) {\n'
+    '                    const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
+    '                    cudaStream_t stream = ctx.stream();\n'
+    '                    const float * src_d = (const float *)cpy_src->data;\n'
+    '                    void * dst_d = cpy_dst->data;\n'
+    '                    const int64_t ne = ggml_nelements(cpy_src);\n'
+    '                    if (cpy_dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d128(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else {\n'
+    '                        ggml_cuda_tqp_quantize_row_d256(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    }\n'
+    '                } else {\n'
+    '                    ggml_cuda_cpy(ctx, cpy_src, cpy_dst);\n'
+    '                }\n'
+    '            }\n'
+    '            break;'
+)
+t = t.replace(old_cpy, new_cpy, 1)
+
+# Also patch the supports_op query for GGML_OP_CPY to report F32→TQ4P
+# as supported. Find the last F32→IQ4_NL check in the CPY supports block
+# and append TQ4P entries.
+support_anchor = 'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n                    return true;\n                }'
+if support_anchor not in t:
+    print('WARNING: CPY supports_op anchor not found, skipping', file=sys.stderr)
+else:
+    tq4p_support = (
+        'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D128) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D256) {\n'
+        '                    return true;\n'
+        '                }'
+    )
+    t = t.replace(support_anchor, tq4p_support, 1)
+
+p.write_text(t)
+PY
+    fi
 fi
 
 echo "All hooks applied."

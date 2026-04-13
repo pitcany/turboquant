@@ -171,6 +171,50 @@ path.write_text(text)
 print(f"[+] patched: {path}")
 PY
 
+# ---------- 5. ml/backend/ggml/ggml.go — Copy() op_params for TQ4P ----------
+
+MARKER_COPY='tq4p_layer_byte'
+info "patching Copy() to set op_params[0] for TQ4P in $GGML_GO"
+patch_file "$GGML_GO" "$MARKER_COPY" - "$GGML_GO" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+# Anchor: the Copy method body.
+old_copy = (
+    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
+    '\treturn &Tensor{\n'
+    '\t\tb: t.b,\n'
+    '\t\tt: C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),\n'
+    '\t}\n'
+    '}'
+)
+if old_copy not in text:
+    print(f"ERROR: Copy() method not found in {path}", file=sys.stderr)
+    sys.exit(1)
+
+# Replace with version that sets op_params[0] = layer_byte for TQ4P.
+# The tq4p_layer_byte marker allows idempotent re-patching.
+new_copy = (
+    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
+    '\tresult := C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t)\n'
+    '\t// tq4p_layer_byte: pass layer index to CUDA quantize dispatch.\n'
+    '\tc := ctx.(*Context)\n'
+    '\tif c.layer >= 0 {\n'
+    '\t\tdstType := t2.(*Tensor).t._type\n'
+    '\t\tif dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 {\n'
+    '\t\t\tresult.op_params[0] = C.int32_t(c.layer & 0x1f)\n'
+    '\t\t}\n'
+    '\t}\n'
+    '\treturn &Tensor{b: t.b, t: result}\n'
+    '}'
+)
+text = text.replace(old_copy, new_copy, 1)
+path.write_text(text)
+print(f"[+] patched Copy() for TQ4P layer_byte: {path}")
+PY
+
 # ---------- summary ----------------------------------------------------------
 
 echo

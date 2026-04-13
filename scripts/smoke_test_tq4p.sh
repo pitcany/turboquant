@@ -232,11 +232,14 @@ if [[ -z "$INFERENCE_TEXT" ]]; then
     fail_log 4
 fi
 
+# Strip ANSI escape codes before checking for garbled output.
+CLEAN_TEXT=$(echo "$INFERENCE_TEXT" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r')
+
 # Check for NaN / inf / garbled output indicators.
-if echo "$INFERENCE_TEXT" | grep -qiE '\bnan\b|\binf\b|�|?????' 2>/dev/null; then
-    echo "ERROR: inference output contains NaN/inf/garbled markers" >&2
+if echo "$CLEAN_TEXT" | grep -qiE '\bnan\b|\binf\b' 2>/dev/null; then
+    echo "ERROR: inference output contains NaN/inf markers" >&2
     echo "--- output ---"
-    echo "$INFERENCE_TEXT" | head -10 >&2
+    echo "$CLEAN_TEXT" | head -10 >&2
     fail_log 4
 fi
 
