@@ -44,7 +44,7 @@ from lloyd_max import LloydMaxCodebook
 from turboquant import generate_qjl_matrix, generate_rotation_matrix
 
 
-SUPPORTED_DIMS = (128, 256)
+DEFAULT_DIMS = (128, 256)
 BITS = 3                # Stage 1 Lloyd-Max bits for TQ4P_0
 MAX_LAYERS = 32
 ROT_SEED_BASE = 42      # σ_i seed = ROT_SEED_BASE + i
@@ -186,13 +186,21 @@ def main() -> None:
                         default=pathlib.Path(__file__).parent.parent / "c")
     parser.add_argument("--out-pt", type=pathlib.Path,
                         default=pathlib.Path(__file__).parent.parent / "c")
+    parser.add_argument("--dims", type=str, default=None,
+                        help="Comma-separated head dims to generate, e.g. '64,128,256'. "
+                             "Default: 128,256")
     args = parser.parse_args()
     args.out_c.mkdir(parents=True, exist_ok=True)
     args.out_pt.mkdir(parents=True, exist_ok=True)
 
+    if args.dims:
+        dims = tuple(int(d) for d in args.dims.split(","))
+    else:
+        dims = DEFAULT_DIMS
+
     state: dict[str, torch.Tensor] = {}
 
-    for d in SUPPORTED_DIMS:
+    for d in dims:
         print(f"[+] d={d}: Lloyd-Max centroids")
         cb = write_centroids_header(d, args.out_c)
         state[f"centroids_d{d}"] = cb.centroids
