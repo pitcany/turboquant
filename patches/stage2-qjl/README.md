@@ -10,21 +10,29 @@ Nothing existing is modified in place.
 | `GGML_TYPE_TQ4P_D128` | 128 | Llama 3.x, Qwen 2.5, Qwen 3 | 68 B / 128 | 4.25 |
 | `GGML_TYPE_TQ4P_D256` | 256 | Qwen 3.5 gated attention | 132 B / 256 | 4.13 |
 
-Algorithm = Haar random orthogonal rotation Π + 3-bit Lloyd-Max per coord
-+ 1-bit Gaussian QJL on residual. Unbiased inner-product estimator with
-`√(π/2)/d` correction.
+Algorithm = Randomized Hadamard Transform Π = (1/√d) · H · diag(σ)
+(replacing the paper's Haar rotation on this branch) + 3-bit Lloyd-Max
+per coord + 1-bit Gaussian QJL on residual. Unbiased inner-product
+estimator with `√(π/2)/d` correction.
+
+## Branch note: WHT swap
+
+This branch (`claude/swap-haar-to-wht-*`) intentionally diverges from the
+paper. The Haar rotation Π is replaced with the Randomized Hadamard
+Transform; per-layer storage drops from `d²` floats (Π) to `d` floats (σ)
+and apply cost drops from O(d²) to O(d log d). Still orthogonal, so the
+paper's distortion bounds still hold for random unit vector inputs, but
+the stored indices / QJL signs no longer match `turboquant.py::TurboQuantProd`
+byte-for-byte.
 
 ## Validation status
 
-The patch is **byte-exactly** verified against `turboquant.py`
-(the repo's paper reference, itself verified to reproduce paper numbers):
+The patch is **byte-exactly** self-consistent between the C and Python
+reference implementations:
 
 | Check | Result |
 |---|---|
-| `turboquant.py` measured MSE vs. paper (3-bit, d=128) | 0.0340 vs. 0.034 ✓ |
-| `turboquant.py` measured IP corr vs. paper (3-bit, d=128) | 0.9207 vs. 0.93 ✓ |
-| C `quantize_row_*` output byte-identical to Python reference | ✓ (28/28 tests) |
-| C indices + QJL signs byte-identical to `turboquant.py` | ✓ |
+| C `quantize_row_*` output byte-identical to Python reference | ✓ |
 | C `dequantize_row_*` matches Python reference (max diff < 1e-4) | ✓ |
 | C `vec_dot` matches Python reference (max diff < 5e-4) | ✓ |
 | Paper MSE bound (≤ 0.043 per vector for 3-bit) | ✓ |

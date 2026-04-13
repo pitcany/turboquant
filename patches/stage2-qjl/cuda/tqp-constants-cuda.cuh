@@ -1,5 +1,13 @@
 #pragma once
 
+// NOTE (branch: claude/swap-haar-to-wht-*): these CUDA files reference the
+// legacy TQP_PI_D{128,256} d²-float rotation matrices. After the swap to the
+// Randomized Hadamard Transform in ggml-tq-paper.c, the generated headers
+// expose TQP_SIGMA_D{128,256}[32][d] sign vectors instead. A CUDA port for
+// the WHT variant is tracked as a follow-up (needs a shared-memory WHT
+// kernel + sign-vector broadcast); this .cuh will not compile as-is against
+// the new constants header until that port lands.
+
 #include "tqp-kernels.cuh"
 
 #include "tqp_centroids_d128.h"

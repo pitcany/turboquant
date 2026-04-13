@@ -1,14 +1,20 @@
 """
-Byte-exact Python mirror of the C TurboQuant paper implementation.
+Byte-exact Python mirror of the C TurboQuant-ish implementation (WHT variant).
 
-This file operates on the same byte layouts, same per-layer Π_i, same S_i, and
+This file operates on the same byte layouts, same per-layer σ_i, same S_i, and
 same Lloyd-Max centroids as the C code in ../c/ggml-tq-paper.c, so it serves as
-the oracle for byte-exact equality tests (see test_tq_paper.py).
+the oracle for byte-exact equality tests (see test_c_vs_python.py).
+
+Branch: the paper's Haar random orthogonal rotation Π_i is replaced with the
+Randomized Hadamard Transform Π_i = (1/√d) · H · diag(σ_i), where H is the
+Walsh-Hadamard matrix and σ_i ∈ {±1}^d is the per-layer stored sign vector.
+This is still orthogonal, but O(d log d) to apply, and needs only d floats
+per layer instead of d² to store. The algorithm stops being paper-exact but
+remains TurboQuant-ish (same two-stage structure).
 
 Per-layer constants:
-    Π_i: seed = 42 + layer_idx   (i in [0, 31])
+    σ_i: seed = 42 + layer_idx   (i in [0, 31])
     S_i: seed = 43 + layer_idx
-    Matches turboquant.py::TurboQuantProd(seed=42+layer_idx)
 
 Byte layout TQ4P_D128 (69 bytes / 128 elements = 4.3125 bpw):
     offset  size  field
@@ -50,25 +56,60 @@ MAX_LAYERS = 32
 @dataclass(frozen=True)
 class TQPConstants:
     d: int
-    pi: torch.Tensor          # (MAX_LAYERS, d, d) fp32
-    s: torch.Tensor           # (MAX_LAYERS, d, d) fp32
+    sigma: torch.Tensor       # (MAX_LAYERS, d) ±1 fp32 — RHT sign vector
+    s: torch.Tensor           # (MAX_LAYERS, d, d) fp32 — QJL matrix
     centroids: torch.Tensor   # (8,)   fp32
     boundaries: torch.Tensor  # (7,)   fp32
 
 
 def load_constants(d: int) -> TQPConstants:
     state = torch.load(_CONSTANTS_PT, weights_only=True)
-    pi = state[f"pi_d{d}"].float()
+    sigma = state[f"sigma_d{d}"].float()
     s = state[f"s_d{d}"].float()
-    assert pi.shape == (MAX_LAYERS, d, d), f"Expected pi shape ({MAX_LAYERS}, {d}, {d}), got {pi.shape}"
+    assert sigma.shape == (MAX_LAYERS, d), f"Expected sigma shape ({MAX_LAYERS}, {d}), got {sigma.shape}"
     assert s.shape == (MAX_LAYERS, d, d), f"Expected s shape ({MAX_LAYERS}, {d}, {d}), got {s.shape}"
     return TQPConstants(
         d=d,
-        pi=pi,
+        sigma=sigma,
         s=s,
         centroids=state[f"centroids_d{d}"].float(),
         boundaries=state[f"boundaries_d{d}"].float(),
     )
+
+
+# ---------- Randomized Hadamard Transform ----------
+
+def _wht_inplace(x: torch.Tensor) -> torch.Tensor:
+    """In-place fast Walsh-Hadamard transform (natural ordering), unnormalized.
+    Divide by sqrt(d) afterwards for the orthogonal version.
+    """
+    d = x.numel()
+    assert (d & (d - 1)) == 0, "d must be a power of 2"
+    h = 1
+    while h < d:
+        for i in range(0, d, h << 1):
+            a = x[i : i + h].clone()
+            b = x[i + h : i + 2 * h].clone()
+            x[i : i + h]         = a + b
+            x[i + h : i + 2 * h] = a - b
+        h <<= 1
+    return x
+
+
+def rht_apply(sigma: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """y = Π · v = (1/sqrt(d)) · H · diag(σ) · v."""
+    d = v.numel()
+    y = (sigma * v).clone()
+    _wht_inplace(y)
+    return y / math.sqrt(d)
+
+
+def rht_apply_t(sigma: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """y = Πᵀ · v = (1/sqrt(d)) · diag(σ) · H · v (H is symmetric)."""
+    d = v.numel()
+    y = v.clone()
+    _wht_inplace(y)
+    return sigma * y / math.sqrt(d)
 
 
 def block_size(d: int) -> int:
@@ -156,20 +197,20 @@ def quantize_block(x: torch.Tensor, c: TQPConstants, layer_idx: int = 0) -> byte
     assert 0 <= layer_idx < MAX_LAYERS
     x = x.float()
 
-    pi = c.pi[layer_idx]  # (d, d)
-    s = c.s[layer_idx]    # (d, d)
+    sigma = c.sigma[layer_idx]  # (d,)
+    s = c.s[layer_idx]          # (d, d)
 
     orig_norm = x.norm().clamp_min(1e-8).item()
     x_unit = x / orig_norm
 
-    x_rot = pi @ x_unit                                       # Stage 1 rotation
-    indices = torch.bucketize(x_rot, c.boundaries)            # (d,) in [0, 8)
-    x_hat_rot = c.centroids[indices]                           # rotated reconstruction
-    x_hat_unit = pi.T @ x_hat_rot                              # un-rotated reconstruction
-    residual = x_unit - x_hat_unit                             # original-space residual
+    x_rot = rht_apply(sigma, x_unit)                           # Stage 1 rotation (RHT)
+    indices = torch.bucketize(x_rot, c.boundaries)             # (d,) in [0, 8)
+    x_hat_rot = c.centroids[indices]                            # rotated reconstruction
+    x_hat_unit = rht_apply_t(sigma, x_hat_rot)                  # un-rotated reconstruction
+    residual = x_unit - x_hat_unit                              # original-space residual
     res_d = residual.norm().item()
 
-    proj = s @ residual                                        # QJL in original space
+    proj = s @ residual                                         # QJL in original space
     signs = torch.where(proj < 0, torch.tensor(-1.0), torch.tensor(1.0))
 
     buf = bytearray(block_size(d))
@@ -198,13 +239,13 @@ def dequantize_block(blk: bytes, c: TQPConstants) -> torch.Tensor:
     orig_norm = struct.unpack('<e', blk[0:2])[0]
     layer_idx = blk[4]
     assert 0 <= layer_idx < MAX_LAYERS
-    pi = c.pi[layer_idx]
+    sigma = c.sigma[layer_idx]
 
     qs_off = _qs_offset()
     qs = blk[qs_off : qs_off + (d * 3) // 8]
     indices = _unpack_indices_bitplane(qs, d)
     x_hat_rot = c.centroids[indices]
-    x_hat_unit = pi.T @ x_hat_rot
+    x_hat_unit = rht_apply_t(sigma, x_hat_rot)
     return orig_norm * x_hat_unit
 
 
@@ -220,7 +261,7 @@ def inner_product(q: torch.Tensor, blk: bytes, c: TQPConstants) -> float:
     layer_idx = blk[4]
     assert 0 <= layer_idx < MAX_LAYERS
 
-    pi = c.pi[layer_idx]
+    sigma = c.sigma[layer_idx]
     s = c.s[layer_idx]
 
     qs_off = _qs_offset()
@@ -230,8 +271,8 @@ def inner_product(q: torch.Tensor, blk: bytes, c: TQPConstants) -> float:
     signs_off = _signs_offset(d)
     signs = _unpack_signs(blk[signs_off : signs_off + d // 8], d)
 
-    # Stage 1: <q, orig_norm . Pi^T . centroids[idx]> = orig_norm . <Pi.q, centroids[idx]>
-    q_rot = pi @ q
+    # Stage 1: <q, orig_norm . Πᵀ . centroids[idx]> = orig_norm . <Π.q, centroids[idx]>
+    q_rot = rht_apply(sigma, q)
     term1 = orig_norm * (q_rot * c.centroids[indices]).sum().item()
 
     # Stage 2: QJL in original space

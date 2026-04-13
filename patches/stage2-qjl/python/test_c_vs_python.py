@@ -326,30 +326,11 @@ def test_ggml_dispatch_wrapper_matches_block_api(d, constants, vectors, layer_id
             f"dispatch wrapper returned {wrapper_score}, expected {expected} at layer {layer_idx}"
 
 
-def test_c_matches_turboquant_paper_oracle(d, constants, vectors, layer_idx):
-    """End-to-end: C output must also match turboquant.py (transitive via Python ref)."""
-    from turboquant import TurboQuantProd
-    qp = TurboQuantProd(d, bits=4, seed=42 + layer_idx)
-    oracle = qp.quantize(vectors)
-
-    qs_off = ref._qs_offset()
-    signs_off = ref._signs_offset(d)
-
-    for i, x in enumerate(vectors):
-        x_np = x.float().numpy().copy()
-        c_bytes = _c_quantize(d, x_np, layer_idx)
-        # Extract C indices
-        qs = c_bytes[qs_off : qs_off + (d * 3) // 8]
-        signs = c_bytes[signs_off : signs_off + d // 8]
-        c_idx = ref._unpack_indices_bitplane(qs, d)
-        c_signs_pm = ref._unpack_signs(signs, d)
-        c_signs_bits = (c_signs_pm < 0).to(torch.uint8)
-        oracle_signs_bits = (oracle["qjl_signs"][i] < 0).to(torch.uint8)
-
-        assert torch.equal(c_idx, oracle["mse_indices"][i]), \
-            f"vec {i} idx mismatch at layer {layer_idx}"
-        assert torch.equal(c_signs_bits, oracle_signs_bits), \
-            f"vec {i} signs mismatch at layer {layer_idx}"
+# NOTE: This branch (swap-haar-to-wht) intentionally diverges from
+# turboquant.py::TurboQuantProd's Haar rotation — it uses a Randomized
+# Hadamard Transform instead. The paper-oracle byte-exact test that used
+# to live here no longer holds; the C-vs-Python byte-exact tests above
+# are still the authoritative correctness check.
 
 
 # ---------- Q8_K query path helpers ----------

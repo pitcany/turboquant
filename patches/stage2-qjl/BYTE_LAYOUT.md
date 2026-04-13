@@ -10,7 +10,7 @@ All multi-byte fields are little-endian. fp16 is IEEE 754 half-precision
 |---|---|---|---|
 | 0 | 2 | `orig_norm` (fp16) | `‖x‖` before unit normalization |
 | 2 | 2 | `res_d` (fp16) | `‖x_unit − Πᵀ · centroids[idx]‖` |
-| 4 | 1 | `layer_idx` (uint8) | Layer index [0, 31]; selects per-layer Π and S |
+| 4 | 1 | `layer_idx` (uint8) | Layer index [0, 31]; selects per-layer σ and S |
 | 5 | 48 | `qs[48]` | 128 × 3-bit Lloyd-Max indices, bitplane-packed |
 | 53 | 16 | `qjl_signs[16]` | 128 × 1-bit sign bits (1 = negative) |
 
@@ -50,39 +50,36 @@ Sign for coord `i` lives at bit `i % 8` of byte `qjl_signs[i / 8]`.
 ## Per-layer constants
 
 Each block stores a `layer_idx` byte at offset 4. This selects the per-layer
-rotation matrix Π_i and QJL projection matrix S_i:
+sign vector σ_i and QJL projection matrix S_i. The rotation Π_i applied to
+`x_unit` is the Randomized Hadamard Transform Π_i = (1/√d) · H · diag(σ_i):
 
-- Π_i: `generate_rotation_matrix(d, seed=42+layer_idx)`
-- S_i: `generate_qjl_matrix(d, m=d, seed=43+layer_idx)`
+- σ_i: Rademacher ±1 vector, seed = 42 + layer_idx.
+- S_i: `generate_qjl_matrix(d, m=d, seed=43+layer_idx)`.
 
 32 layers are precomputed (layer_idx in [0, 31]). The layer index is passed
 explicitly during quantization (not derived from tensor naming).
 
 Centroids and boundaries are shared across all layers (they depend only on
-the Gaussian post-rotation distribution, which is seed-independent).
+the post-rotation distribution — which for random unit vectors is the same
+Gaussian approximation under either Haar or RHT).
 
 ## Reference data
 
-- Π_i (Haar rotation): generated from `torch.linalg.qr(torch.randn(d, d,
-  generator=Generator().manual_seed(42+i)))`, sign-normalized so `det(Π) = +1`.
+- σ_i (RHT sign vector): `(2 * torch.randint(0, 2, (d,), generator=Generator().manual_seed(42+i)) - 1).float()`.
 - S_i (Gaussian JL): `torch.randn(d, d, generator=Generator().manual_seed(43+i))`.
 - Centroids and boundaries: `LloydMaxCodebook(d, bits=3)` with Gaussian
-  approximation (`use_exact=False`, which matches `TurboQuantProd`'s default).
+  approximation.
 
-All 32 per-layer Π and S matrices are stored fp32 in the C headers as 3D
-arrays `TQP_PI_D{D}[32][D*D]` and `TQP_S_D{D}[32][D*D]`.
+Per-layer data lives in the C headers as:
+- `TQP_SIGMA_D{D}[32][D]`: ±1 fp32 sign vector per layer.
+- `TQP_S_D{D}[32][D*D]`: fp32 QJL matrix per layer, row-major.
 
-## Paper correspondence
+## Branch note
 
-Maps to `turboquant.py::TurboQuantProd(d, bits=4, seed=42+layer_idx)`:
-
-| Block field | Python field |
-|---|---|
-| `orig_norm` | (caller-side norm in `TurboQuantCompressorV2`) |
-| `res_d` | `compressed["residual_norm"]` |
-| `layer_idx` | (new) passed explicitly, stored in block header |
-| `qs` | `compressed["mse_indices"]` (bitplane-packed) |
-| `qjl_signs` | `compressed["qjl_signs"]` (sign bit packed) |
-
-`bits=4` in `TurboQuantProd` means `mse_bits = 3` (Stage 1) + 1 QJL bit
-(Stage 2). The "4" is total per-coord budget, not Stage 1 bits.
+This branch replaces the paper's Haar random orthogonal Π with a
+Randomized Hadamard Transform (RHT): Π := (1/√d) · H · diag(σ). The apply
+cost drops from O(d²) to O(d log d) and per-layer storage drops from d²
+floats to d. This is orthogonal just like Haar, so the paper's MSE and
+inner-product-correlation bounds still apply for random unit-vector
+inputs — but the stored indices / QJL signs no longer match
+`turboquant.py::TurboQuantProd` byte-for-byte.
