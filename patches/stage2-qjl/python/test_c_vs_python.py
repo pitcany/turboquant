@@ -38,7 +38,17 @@ ROTATION_IDS = {ref.TQP_ROT_WHT: "wht", ref.TQP_ROT_HAAR: "haar"}
 
 lib = ctypes.CDLL(str(_LIB))
 
-# Block struct shapes (sizeof): d128=69, d256=133.
+# Block struct shapes (sizeof): d64=37, d128=69, d256=133.
+class block_tq4p_d64(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("orig_norm", ctypes.c_uint16),
+        ("res_d",     ctypes.c_uint16),
+        ("layer_idx", ctypes.c_uint8),
+        ("qs",        ctypes.c_uint8 * 24),
+        ("qjl_signs", ctypes.c_uint8 * 8),
+    ]
+
 class block_tq4p_d128(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
@@ -59,8 +69,49 @@ class block_tq4p_d256(ctypes.Structure):
         ("qjl_signs", ctypes.c_uint8 * 32),
     ]
 
+assert ctypes.sizeof(block_tq4p_d64) == 37
 assert ctypes.sizeof(block_tq4p_d128) == 69
 assert ctypes.sizeof(block_tq4p_d256) == 133
+
+# d=64 ctypes declarations
+lib.ggml_quantize_row_tq4p_d64.restype = None
+lib.ggml_quantize_row_tq4p_d64.argtypes = [
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(block_tq4p_d64),
+    ctypes.c_int64,
+    ctypes.c_uint8,
+]
+lib.ggml_dequantize_row_tq4p_d64.restype = None
+lib.ggml_dequantize_row_tq4p_d64.argtypes = [
+    ctypes.POINTER(block_tq4p_d64),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+lib.ggml_tqp_vec_dot_block_d64.restype = ctypes.c_float
+lib.ggml_tqp_vec_dot_block_d64.argtypes = [
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(block_tq4p_d64),
+]
+lib.ggml_tqp_prepare_query_d64.restype = None
+lib.ggml_tqp_prepare_query_d64.argtypes = [
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_uint8,
+]
+lib.ggml_vec_dot_tq4p_d64_f32.restype = None
+lib.ggml_vec_dot_tq4p_d64_f32.argtypes = [
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+]
+lib.ggml_vec_dot_tq4p_d64_q8k.restype = None
+lib.ggml_vec_dot_tq4p_d64_q8k.argtypes = lib.ggml_vec_dot_tq4p_d64_f32.argtypes
 
 # quantize_row now takes layer_idx as 4th arg
 lib.ggml_quantize_row_tq4p_d128.restype = None
@@ -162,7 +213,7 @@ assert ctypes.sizeof(block_q8k_compat) == 292
 
 # ---------- Fixtures ----------
 
-@pytest.fixture(scope="module", params=[128, 256])
+@pytest.fixture(scope="module", params=[64, 128, 256])
 def d(request):
     return request.param
 
@@ -189,20 +240,53 @@ def vectors(d):
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
+_BLOCK_TYPES = {
+    64:  (block_tq4p_d64,  lib.ggml_quantize_row_tq4p_d64),
+    128: (block_tq4p_d128, lib.ggml_quantize_row_tq4p_d128),
+    256: (block_tq4p_d256, lib.ggml_quantize_row_tq4p_d256),
+}
+
+_DEQUANT_FNS = {
+    64:  lib.ggml_dequantize_row_tq4p_d64,
+    128: lib.ggml_dequantize_row_tq4p_d128,
+    256: lib.ggml_dequantize_row_tq4p_d256,
+}
+
+_PREPARE_QUERY_FNS = {
+    64:  lib.ggml_tqp_prepare_query_d64,
+    128: lib.ggml_tqp_prepare_query_d128,
+    256: lib.ggml_tqp_prepare_query_d256,
+}
+
+_VEC_DOT_BLOCK_FNS = {
+    64:  lib.ggml_tqp_vec_dot_block_d64,
+    128: lib.ggml_tqp_vec_dot_block_d128,
+    256: lib.ggml_tqp_vec_dot_block_d256,
+}
+
+_VEC_DOT_F32_FNS = {
+    64:  lib.ggml_vec_dot_tq4p_d64_f32,
+    128: lib.ggml_vec_dot_tq4p_d128_f32,
+    256: lib.ggml_vec_dot_tq4p_d256_f32,
+}
+
+_VEC_DOT_Q8K_FNS = {
+    64:  lib.ggml_vec_dot_tq4p_d64_q8k,
+    128: lib.ggml_vec_dot_tq4p_d128_q8k,
+    256: lib.ggml_vec_dot_tq4p_d256_q8k,
+}
+
+_BLK_SIZES = {64: 37, 128: 69, 256: 133}
+
+
 def _c_quantize(d, x_np, layer_idx, rotation):
     layer_byte = ref.layer_byte(layer_idx, rotation)
-    if d == 128:
-        blk = block_tq4p_d128()
-        lib.ggml_quantize_row_tq4p_d128(
-            x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.byref(blk), d, layer_byte,
-        )
-    else:
-        blk = block_tq4p_d256()
-        lib.ggml_quantize_row_tq4p_d256(
-            x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.byref(blk), d, layer_byte,
-        )
+    blk_cls, quantize_fn = _BLOCK_TYPES[d]
+    blk = blk_cls()
+    quantize_fn(
+        x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ctypes.byref(blk), d, layer_byte,
+    )
     return bytes(blk)
 
 
@@ -231,16 +315,13 @@ def test_layer_byte_in_c_block(d, vectors, layer_idx, rotation):
 
 def test_c_dequantize_matches_python(d, constants, vectors, layer_idx, rotation):
     """C dequantize round-trip must match Python dequantize."""
+    blk_cls = _BLOCK_TYPES[d][0]
+    dequant_fn = _DEQUANT_FNS[d]
     for x in vectors:
         py_blk = ref.quantize_block(x, constants, layer_idx=layer_idx, rotation=rotation)
-        if d == 128:
-            blk = block_tq4p_d128.from_buffer_copy(py_blk)
-            out = (ctypes.c_float * d)()
-            lib.ggml_dequantize_row_tq4p_d128(ctypes.byref(blk), out, d)
-        else:
-            blk = block_tq4p_d256.from_buffer_copy(py_blk)
-            out = (ctypes.c_float * d)()
-            lib.ggml_dequantize_row_tq4p_d256(ctypes.byref(blk), out, d)
+        blk = blk_cls.from_buffer_copy(py_blk)
+        out = (ctypes.c_float * d)()
+        dequant_fn(ctypes.byref(blk), out, d)
         c_out = torch.tensor(list(out))
         py_out = ref.dequantize_block(py_blk, constants)
         max_diff = (c_out - py_out).abs().max().item()
@@ -252,30 +333,22 @@ def test_c_vec_dot_matches_python(d, constants, vectors, layer_idx, rotation):
     keys    = vectors[:25]
     queries = vectors[25:50]
 
-    layer_byte = ref.layer_byte(layer_idx, rotation)
+    blk_cls = _BLOCK_TYPES[d][0]
+    prepare_fn = _PREPARE_QUERY_FNS[d]
+    vec_dot_fn = _VEC_DOT_BLOCK_FNS[d]
+
+    layer_byte_val = ref.layer_byte(layer_idx, rotation)
     max_abs = 0.0
     for q in queries:
         q_np = q.float().numpy().copy()
         Sq = (ctypes.c_float * d)()
-        if d == 128:
-            lib.ggml_tqp_prepare_query_d128(
-                q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), Sq, layer_byte)
-        else:
-            lib.ggml_tqp_prepare_query_d256(
-                q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), Sq, layer_byte)
+        prepare_fn(q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), Sq, layer_byte_val)
 
         for k in keys:
             py_blk = ref.quantize_block(k, constants, layer_idx=layer_idx, rotation=rotation)
-            if d == 128:
-                blk = block_tq4p_d128.from_buffer_copy(py_blk)
-                c_ip = lib.ggml_tqp_vec_dot_block_d128(
-                    q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                    Sq, ctypes.byref(blk))
-            else:
-                blk = block_tq4p_d256.from_buffer_copy(py_blk)
-                c_ip = lib.ggml_tqp_vec_dot_block_d256(
-                    q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                    Sq, ctypes.byref(blk))
+            blk = blk_cls.from_buffer_copy(py_blk)
+            c_ip = vec_dot_fn(q_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                              Sq, ctypes.byref(blk))
             py_ip = ref.inner_product(q, py_blk, constants)
             max_abs = max(max_abs, abs(c_ip - py_ip))
     assert max_abs < 5e-4, f"C vs Python IP max diff {max_abs:.2e} layer {layer_idx} rot {ROTATION_IDS[rotation]}"
@@ -289,6 +362,8 @@ def test_ggml_dispatch_wrapper_matches_block_api(d, constants, vectors, layer_id
     key_bytes = b"".join(ref.quantize_block(k, constants, layer_idx=layer_idx, rotation=rotation) for k in keys)
     n = d * len(keys)
     KeyBuf = (ctypes.c_uint8 * len(key_bytes)).from_buffer_copy(key_bytes)
+    blk_size = _BLK_SIZES[d]
+    vec_dot_f32 = _VEC_DOT_F32_FNS[d]
 
     for q in queries:
         q_flat = (ctypes.c_float * n)()
@@ -298,21 +373,12 @@ def test_ggml_dispatch_wrapper_matches_block_api(d, constants, vectors, layer_id
                 q_flat[ki * d + j] = float(q_np[j])
 
         out = ctypes.c_float(0.0)
-        blk_size = 69 if d == 128 else 133
-        if d == 128:
-            lib.ggml_vec_dot_tq4p_d128_f32(
-                n, ctypes.byref(out), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
-                1,
-            )
-        else:
-            lib.ggml_vec_dot_tq4p_d256_f32(
-                n, ctypes.byref(out), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
-                1,
-            )
+        vec_dot_f32(
+            n, ctypes.byref(out), ctypes.sizeof(ctypes.c_float),
+            ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+            ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+            1,
+        )
         wrapper_score = out.value
 
         expected = sum(
@@ -377,7 +443,9 @@ def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx, rotation):
     assert n % QK_Q8K == 0
     KeyBuf = (ctypes.c_uint8 * len(key_bytes)).from_buffer_copy(key_bytes)
 
-    blk_size = 69 if d == 128 else 133
+    blk_size = _BLK_SIZES[d]
+    vec_dot_f32 = _VEC_DOT_F32_FNS[d]
+    vec_dot_q8k = _VEC_DOT_Q8K_FNS[d]
 
     max_abs_diff = 0.0
     for q in queries:
@@ -391,20 +459,12 @@ def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx, rotation):
 
         # fp32 reference
         out_f32 = ctypes.c_float(0.0)
-        if d == 128:
-            lib.ggml_vec_dot_tq4p_d128_f32(
-                n, ctypes.byref(out_f32), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
-                1,
-            )
-        else:
-            lib.ggml_vec_dot_tq4p_d256_f32(
-                n, ctypes.byref(out_f32), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
-                1,
-            )
+        vec_dot_f32(
+            n, ctypes.byref(out_f32), ctypes.sizeof(ctypes.c_float),
+            ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+            ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+            1,
+        )
 
         # Quantize query to Q8_K blocks
         q8k_blocks = _quantize_fp32_to_q8k(list(q_flat))
@@ -413,22 +473,13 @@ def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx, rotation):
 
         # Q8_K query path
         out_q8k = ctypes.c_float(0.0)
-        if d == 128:
-            lib.ggml_vec_dot_tq4p_d128_q8k(
-                n, ctypes.byref(out_q8k), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q8k_buf, ctypes.c_void_p),
-                ctypes.sizeof(block_q8k_compat),
-                1,
-            )
-        else:
-            lib.ggml_vec_dot_tq4p_d256_q8k(
-                n, ctypes.byref(out_q8k), ctypes.sizeof(ctypes.c_float),
-                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
-                ctypes.cast(q8k_buf, ctypes.c_void_p),
-                ctypes.sizeof(block_q8k_compat),
-                1,
-            )
+        vec_dot_q8k(
+            n, ctypes.byref(out_q8k), ctypes.sizeof(ctypes.c_float),
+            ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+            ctypes.cast(q8k_buf, ctypes.c_void_p),
+            ctypes.sizeof(block_q8k_compat),
+            1,
+        )
 
         diff = abs(out_q8k.value - out_f32.value)
         max_abs_diff = max(max_abs_diff, diff)

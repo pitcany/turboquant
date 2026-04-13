@@ -29,8 +29,10 @@
 
 // Generated constants. Regenerate via
 //   python3 patches/stage2-qjl/python/generate_constants.py
+#include "tqp_centroids_d64.h"
 #include "tqp_centroids_d128.h"
 #include "tqp_centroids_d256.h"
+#include "tqp_constants_d64.h"
 #include "tqp_constants_d128.h"
 #include "tqp_constants_d256.h"
 
@@ -415,6 +417,7 @@ static float tqp_vec_dot_block(
                                  tqp_fp16_to_fp32(blk->res_d));                               \
     }
 
+TQP_DEFINE_ROW_FUNCS(64,  TQP_SIGMA_D64,  TQP_PI_D64,  TQP_S_D64,  TQP_CENTROIDS_D64,  TQP_BOUNDARIES_D64)
 TQP_DEFINE_ROW_FUNCS(128, TQP_SIGMA_D128, TQP_PI_D128, TQP_S_D128, TQP_CENTROIDS_D128, TQP_BOUNDARIES_D128)
 TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUNDARIES_D256)
 
@@ -443,6 +446,7 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS
         *s = acc;                                                                              \
     }
 
+TQP_DEFINE_VEC_DOT(64)
 TQP_DEFINE_VEC_DOT(128)
 TQP_DEFINE_VEC_DOT(256)
 
@@ -494,5 +498,6 @@ static inline void tqp_dequant_q8k(const block_q8k_compat * blk, float * out) {
         *s = acc;                                                                                  \
     }
 
+TQP_DEFINE_VEC_DOT_Q8K(64)
 TQP_DEFINE_VEC_DOT_Q8K(128)
 TQP_DEFINE_VEC_DOT_Q8K(256)

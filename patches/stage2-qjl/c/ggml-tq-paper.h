@@ -53,6 +53,7 @@ extern "C" {
 
 // ----- Block sizes -----
 
+#define QK_TQ4P_D64  64
 #define QK_TQ4P_D128 128
 #define QK_TQ4P_D256 256
 
@@ -74,14 +75,27 @@ extern "C" {
 // `ggml_fp16_t` from ggml-common.h. The bit layout is identical — ggml_half
 // is a typedef of uint16_t.
 
+// Block struct: 5 header bytes + D*3/8 qs + D/8 signs = 5 + D/2 total.
+// To add a new dim D, define a block struct below with the right array sizes.
+
 #pragma pack(push, 1)
 
 typedef struct {
     uint16_t orig_norm;       // fp16; ‖x‖ before unit-normalization
     uint16_t res_d;           // fp16; ‖residual‖ in original space
     uint8_t  layer_idx;       // packed layer (low 5 bits) + rotation (bit 7)
-    uint8_t  qs[48];          // 128 × 3-bit Lloyd-Max indices (bitplane packed)
-    uint8_t  qjl_signs[16];   // 128 × 1-bit QJL signs (bit set = negative)
+    uint8_t  qs[24];          // 64 × 3-bit Lloyd-Max indices (bitplane packed)
+    uint8_t  qjl_signs[8];   // 64 × 1-bit QJL signs (bit set = negative)
+} block_tq4p_d64;
+
+_Static_assert(sizeof(block_tq4p_d64) == 37, "block_tq4p_d64 size");
+
+typedef struct {
+    uint16_t orig_norm;
+    uint16_t res_d;
+    uint8_t  layer_idx;
+    uint8_t  qs[48];          // 128 × 3-bit
+    uint8_t  qjl_signs[16];  // 128 × 1-bit
 } block_tq4p_d128;
 
 _Static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
@@ -89,9 +103,9 @@ _Static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
-    uint8_t  layer_idx;       // packed layer (low 5 bits) + rotation (bit 7)
-    uint8_t  qs[96];
-    uint8_t  qjl_signs[32];
+    uint8_t  layer_idx;
+    uint8_t  qs[96];          // 256 × 3-bit
+    uint8_t  qjl_signs[32];  // 256 × 1-bit
 } block_tq4p_d256;
 
 _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
@@ -105,12 +119,16 @@ _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 // `layer_byte` packs the per-layer index (low 5 bits) and rotation mode
 // (bit 7); use TQP_LAYER_BYTE(layer, rotation) to build it. A plain
 // `uint8_t layer_idx` in [0, 31] is treated as TQP_ROT_WHT (bit 7 = 0).
+void ggml_quantize_row_tq4p_d64 (const float * x, block_tq4p_d64  * y, int64_t k, uint8_t layer_byte);
 void ggml_quantize_row_tq4p_d128(const float * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
 void ggml_quantize_row_tq4p_d256(const float * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
 
 // 3-arg wrappers for ggml_from_float_t compatibility. Default to layer 0 +
 // TQP_ROT_WHT. The CUDA cpy dispatch uses the full 4-arg variant with
 // layer_byte from the cpy op's op_params[0].
+static inline void ggml_quantize_row_tq4p_d64_default(const float * x, void * y, int64_t k) {
+    ggml_quantize_row_tq4p_d64(x, (block_tq4p_d64 *)y, k, TQP_LAYER_BYTE(0, TQP_ROT_WHT));
+}
 static inline void ggml_quantize_row_tq4p_d128_default(const float * x, void * y, int64_t k) {
     ggml_quantize_row_tq4p_d128(x, (block_tq4p_d128 *)y, k, TQP_LAYER_BYTE(0, TQP_ROT_WHT));
 }
@@ -121,6 +139,7 @@ static inline void ggml_quantize_row_tq4p_d256_default(const float * x, void * y
 // dequantize_row_*: reconstruct fp32 from packed blocks. QJL stage is not
 // used for reconstruction (paper: Stage 2 only contributes to inner-product
 // estimation). layer_idx is read from each block's header.
+void ggml_dequantize_row_tq4p_d64 (const block_tq4p_d64  * x, float * y, int64_t k);
 void ggml_dequantize_row_tq4p_d128(const block_tq4p_d128 * x, float * y, int64_t k);
 void ggml_dequantize_row_tq4p_d256(const block_tq4p_d256 * x, float * y, int64_t k);
 
@@ -140,9 +159,12 @@ void ggml_dequantize_row_tq4p_d256(const block_tq4p_d256 * x, float * y, int64_t
 // full attention pass should amortize via prepare_query.
 
 // `layer_byte` uses the same packing as ggml_quantize_row_*.
+void  ggml_tqp_prepare_query_d64 (const float * q, float * Sq, uint8_t layer_byte);
 void  ggml_tqp_prepare_query_d128(const float * q, float * Sq, uint8_t layer_byte);
 void  ggml_tqp_prepare_query_d256(const float * q, float * Sq, uint8_t layer_byte);
 
+float ggml_tqp_vec_dot_block_d64 (const float * q, const float * Sq,
+                                  const block_tq4p_d64  * blk);
 float ggml_tqp_vec_dot_block_d128(const float * q, const float * Sq,
                                   const block_tq4p_d128 * blk);
 float ggml_tqp_vec_dot_block_d256(const float * q, const float * Sq,
@@ -163,6 +185,9 @@ float ggml_tqp_vec_dot_block_d256(const float * q, const float * Sq,
 //   by = stride of vy
 //   nrc = number of rows to compute (batch; reference impl supports nrc=1)
 
+void ggml_vec_dot_tq4p_d64_f32 (int n, float * s, size_t bs,
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
 void ggml_vec_dot_tq4p_d128_f32(int n, float * s, size_t bs,
                                  const void * vx, size_t bx,
                                  const void * vy, size_t by, int nrc);
@@ -199,6 +224,9 @@ _Static_assert(sizeof(block_q8k_compat) == 292, "block_q8k_compat size");
 //   .vec_dot      = ggml_vec_dot_tq4p_d128_q8k
 //   .vec_dot_type = GGML_TYPE_Q8_K
 
+void ggml_vec_dot_tq4p_d64_q8k (int n, float * s, size_t bs,
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
 void ggml_vec_dot_tq4p_d128_q8k(int n, float * s, size_t bs,
                                  const void * vx, size_t bx,
                                  const void * vy, size_t by, int nrc);
