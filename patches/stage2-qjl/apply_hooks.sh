@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the 5 TQ4P hook edits to a ggml source tree. Additive only.
+# Apply the TQ4P hook edits to a ggml source tree. Additive only.
 #
 # Usage: apply_hooks.sh <ggml-root>
 #
@@ -13,6 +13,9 @@
 #   3. src/ggml-cpu/ggml-cpu.c — 2 entries in type_traits_cpu + #include
 #   4. src/CMakeLists.txt      — add ggml-tq-paper.c to ggml-base sources
 #   5. src/ggml-cuda/ggml-cuda.cu — TQ4P CUDA vec_dot dispatch
+#   6. src/ggml-cuda/ggml-cuda.cu — F32 -> TQ4P CUDA quantize in CPY
+#   7. src/ggml-cuda/{ggml-cuda.cu,set-rows.cu} — TQ4P SET_ROWS dispatch
+#   8. src/ggml-cuda/{convert.cu,fattn.cu} — TQ4P flash-attention staging
 #
 # Anchors are value-based (reads GGML_TYPE_COUNT = N dynamically) so this
 # survives minor ggml drift. Idempotent via "tq4p" marker check.
@@ -30,6 +33,8 @@ GGML_C="$GGML/src/ggml.c"
 CPU_C="$GGML/src/ggml-cpu/ggml-cpu.c"
 CMAKE="$GGML/src/CMakeLists.txt"
 CUDA_CU="$GGML/src/ggml-cuda/ggml-cuda.cu"
+CONVERT_CU="$GGML/src/ggml-cuda/convert.cu"
+FATTN_CU="$GGML/src/ggml-cuda/fattn.cu"
 
 MARKER="tq4p"
 
@@ -510,6 +515,172 @@ dispatch_new = (
     '    if (src1->type == GGML_TYPE_I64) {'
 )
 t = t.replace(dispatch_anchor, dispatch_new, 1)
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
+# ---------- 8. ggml-cuda flash attention: TQ4P staging dequantize --------
+# Flash attention can consume f16 K/V data through launch_fattn's staging
+# buffer. Register TQ4P -> f16/f32 converters, and let the fattn selector map
+# TQ4P K/V tensors to the existing F16 kernel variants.
+
+TQP_DEQUANT_IMPL="$GGML/src/ggml-cuda/tqp-dequantize.cu"
+
+if [[ -f "$CONVERT_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
+    if grep -q "dequantize_row_tq4p_d128_cuda" "$CONVERT_CU" 2>/dev/null; then
+        echo "[=] convert.cu TQ4P dequantize dispatch already patched"
+    else
+        echo "[+] patching convert.cu TQ4P dequantize dispatch"
+        python3 - "$CONVERT_CU" <<'PY'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+include_anchor = '#include "dequantize.cuh"\n'
+if include_anchor not in t:
+    print('ERROR: convert.cu include anchor not found', file=sys.stderr)
+    sys.exit(1)
+
+decl = (
+    '#include "dequantize.cuh"\n'
+    '\n'
+    '// TQ4P flash-attention staging dequantizers - Hook 8.\n'
+    'extern "C" void dequantize_row_tq4p_d128_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d128_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+)
+t = t.replace(include_anchor, decl, 1)
+
+fp16_anchor = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_F32:'
+)
+if fp16_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp16_cuda MXFP4 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp16_replacement = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_cuda;\n'
+    '        case GGML_TYPE_F32:'
+)
+t = t.replace(fp16_anchor, fp16_replacement, 1)
+
+fp32_anchor = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_F16:'
+)
+if fp32_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp32_cuda MXFP4 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp32_replacement = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_f32_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_f32_cuda;\n'
+    '        case GGML_TYPE_F16:'
+)
+t = t.replace(fp32_anchor, fp32_replacement, 1)
+
+fp16_nc_anchor = (
+    '        case GGML_TYPE_Q8_0:\n'
+    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_BF16:'
+)
+if fp16_nc_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp16_nc_cuda Q8_0 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp16_nc_replacement = (
+    '        case GGML_TYPE_Q8_0:\n'
+    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_nc_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_nc_cuda;\n'
+    '        case GGML_TYPE_BF16:'
+)
+t = t.replace(fp16_nc_anchor, fp16_nc_replacement, 1)
+
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
+if [[ -f "$FATTN_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
+    if grep -q "TQ4P flash-attention staging" "$FATTN_CU" 2>/dev/null; then
+        echo "[=] fattn.cu TQ4P staging already patched"
+    else
+        echo "[+] patching fattn.cu TQ4P flash-attention staging"
+        python3 - "$FATTN_CU" <<'PY'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+old_macro = (
+    '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
+    '    {                                                                                                            \\\n'
+    '        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \\\n'
+    '        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \\\n'
+    '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n'
+)
+new_macro = (
+    '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
+    '    {                                                                                                            \\\n'
+    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_K_okay = K->type == (type_K)                                                            \\\n'
+    '            || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_K_tq4p && (type_K) == GGML_TYPE_F16); /* TQ4P flash-attention staging */                    \\\n'
+    '        const bool type_V_okay = V->type == (type_V)                                                            \\\n'
+    '            || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_V_tq4p && (type_V) == GGML_TYPE_F16);                                                       \\\n'
+    '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n'
+)
+if old_macro not in t:
+    print('ERROR: fattn.cu FATTN_VEC_CASE anchor not found', file=sys.stderr)
+    sys.exit(1)
+t = t.replace(old_macro, new_macro, 1)
+
+switch_anchor = (
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '            break;'
+)
+if switch_anchor not in t:
+    print('ERROR: fattn.cu K->type switch anchor not found', file=sys.stderr)
+    sys.exit(1)
+switch_replacement = (
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            break;'
+)
+t = t.replace(switch_anchor, switch_replacement, 1)
+
 p.write_text(t)
 print(f"[+] patched: {p}")
 PY

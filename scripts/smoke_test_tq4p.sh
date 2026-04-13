@@ -94,11 +94,8 @@ fi
 
 echo "[+] starting ollama with OLLAMA_KV_CACHE_TYPE=$CACHE_TYPE"
 
-# Flash attention kernels have hardcoded type combinations that don't include
-# TQ4P — enabling it forces 74 graph splits (CPU fallback per layer). The
-# MUL_MAT attention path handles TQ4P at full GPU speed with 2 splits.
 OLLAMA_KV_CACHE_TYPE="$CACHE_TYPE" \
-OLLAMA_FLASH_ATTENTION=0 \
+OLLAMA_FLASH_ATTENTION=1 \
 OLLAMA_DEBUG=1 \
 OLLAMA_LOG_LEVEL=debug \
     "$OLLAMA_BIN" serve > "$LOG" 2>&1 &

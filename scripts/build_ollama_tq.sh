@@ -122,6 +122,7 @@ if [[ "$CUDA" = "1" ]]; then
     if [[ -d "$GGML_CUDA" ]]; then
         echo "[+] copying TQ4P CUDA kernels into $GGML_CUDA/"
         for f in tqp-quantize.cu tqp-prepare-query.cu tqp-vec-dot.cu \
+                 tqp-dequantize.cu \
                  tqp-set-rows.cu tqp-kernels.cuh tqp-constants-cuda.cuh; do
             cp "$STAGE2_DIR/cuda/$f" "$GGML_CUDA/"
         done
@@ -225,15 +226,13 @@ Shared libs installed next to binary:
 $(ls "$OLLAMA_DIR"/*.so* "$OLLAMA_DIR"/cuda_v*/*.so 2>/dev/null | sed 's|.*/||;s/^/  /')
 
 Run with:
-    OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=0 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
 
 For Qwen 3.5 (head_dim=256):
-    OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=0 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
 
-Note: flash attention must be disabled with TQ4P. The fattn kernels have
-hardcoded type combinations that don't include TQ4P — enabling it forces
-every attention layer to fall back to CPU. The MUL_MAT path handles TQ4P
-at full GPU speed.
+TQ4P now registers CUDA dequantizers for ggml-cuda's flash-attention staging
+buffer, so flash attention can stay enabled for TQ4P KV cache runs.
 
 The TQ4P sources live at patches/stage2-qjl/c/ in this repo and are copied
 into $GGML_SRC on every run. Edit them in the repo, then rerun with --rebuild.
