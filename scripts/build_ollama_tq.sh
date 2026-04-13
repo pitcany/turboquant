@@ -117,6 +117,25 @@ for f in ggml-tq-paper.h ggml-tq-paper.c \
     cp "$STAGE2_DIR/c/$f" "$GGML_SRC/"
 done
 
+if [[ "$CUDA" = "1" ]]; then
+    GGML_CUDA="$GGML/src/ggml-cuda"
+    if [[ -d "$GGML_CUDA" ]]; then
+        echo "[+] copying TQ4P CUDA kernels into $GGML_CUDA/"
+        for f in tqp-quantize.cu tqp-prepare-query.cu tqp-vec-dot.cu \
+                 tqp-kernels.cuh tqp-constants-cuda.cuh; do
+            cp "$STAGE2_DIR/cuda/$f" "$GGML_CUDA/"
+        done
+        for f in tqp_constants_d128.h tqp_constants_d256.h \
+                 tqp_centroids_d128.h tqp_centroids_d256.h \
+                 ggml-tq-paper.h; do
+            cp "$STAGE2_DIR/c/$f" "$GGML_CUDA/"
+        done
+        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_CUDA_ARCHITECTURES=89\;120"
+    else
+        echo "[!] $GGML_CUDA not found; skipping CUDA kernel copy"
+    fi
+fi
+
 echo "[+] applying TQ4P hooks"
 bash "$APPLY_HOOKS" "$GGML"
 
