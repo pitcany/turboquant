@@ -169,3 +169,33 @@ the CUDA implementation by switching the ctypes dlopen target. Adds:
 output and inner-product agreement within fp32 accumulation noise
 (<1e-4). If the CUDA path drifts from the CPU reference, the test fails
 and the deviation is visible at the block level.
+
+## Perf polish (item 5) — NOT APPLICABLE
+
+Profiled on RTX 4090 (sm_89), CUDA 12.9, d=128 WHT path. Full ncu HW
+counters unavailable (RmProfilingAdminOnly=1), so analysis is based on
+static instruction counts and CUDA-event wall-clock timing.
+
+Cost breakdown of `tqp_quantize_kernel_d128<WHT>`:
+
+| Phase | FMAs/thread | % of total | Notes |
+|---|---|---|---|
+| S·residual GEMV | 128 | 87.7% | 128 `__ldg` from device global per thread |
+| FWHT (2x) | 7 each | 9.6% | 7 butterfly iters, 2-way bank conflict at h=32,64 |
+| Norm reductions (2x) | 128 each (tid==0) | 1.4% | Serial on thread 0, all others idle |
+| Bucketize + ballot | ~1 | 1.4% | Negligible |
+
+The S·residual GEMV dominates at ~88% of total work. The two serial
+norm reductions (||x|| and ||residual||) add ~256 serial FMAs on thread 0
+while 127 threads idle — but this is 1.4% of the total instruction budget
+and invisible next to the 16,384-FMA GEMV. The FWHT butterfly hits 2-way
+shared-memory bank conflicts at h>=32 (XOR stride aliases to the same
+32-bank column), adding ~4 extra transactions per thread vs ~128 global
+loads in the GEMV — also noise.
+
+Warp-shuffle reduction for the norms and a skewed butterfly for the FWHT
+would both be correct optimizations in isolation, but their combined
+speedup is bounded by Amdahl's law to < 11% of kernel time — and the
+kernel itself is not on the critical path of a typical inference loop
+(quantize runs once per K-cache write; vec_dot runs once per query×key
+pair and is ~1000x cheaper per block).
