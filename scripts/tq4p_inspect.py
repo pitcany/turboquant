@@ -129,17 +129,9 @@ def inspect_gguf(path: Path) -> dict:
         # Read tensor metadata to find the first TQ4P tensor.
         # Tensor info: name(string) + n_dims(uint32) + dims(uint64 * n_dims)
         #            + type(uint32) + offset(uint64)
-        # We need to know the GGML type IDs. Since they're assigned
-        # dynamically, we look for type names in the KV metadata.
-        # But types are numeric in the tensor info. We'll scan for
-        # tensors with type IDs that have the right block sizes.
-
-        # Collect all type_traits info if present. Otherwise we'll try
-        # to match by block size after finding the data.
-        tq4p_type_ids = set()
-        for key, val in kv.items():
-            if "tq4p" in str(val).lower():
-                pass  # Not directly useful for type ID matching
+        # We don't use the type ID directly — GGML assigns it dynamically
+        # and TQ4P is a fork-specific addition, so we infer TQ4P tensors
+        # by block-size heuristics over the data instead.
 
         tensor_infos = []
         for _ in range(n_tensors):
@@ -156,8 +148,12 @@ def inspect_gguf(path: Path) -> dict:
             })
 
         # Data starts at aligned offset after header.
-        # GGUF v2/v3: data is aligned to ALIGNMENT (default 32) after header.
-        ALIGNMENT = 32
+        # GGUF v2/v3: data is aligned to `general.alignment` (default 32)
+        # after header. Files may override via the KV pair of the same name.
+        alignment_kv = kv.get("general.alignment")
+        ALIGNMENT = int(alignment_kv) if alignment_kv is not None else 32
+        if ALIGNMENT <= 0:
+            ALIGNMENT = 32
         header_end = f.tell()
         data_start = (header_end + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
@@ -185,13 +181,16 @@ def inspect_gguf(path: Path) -> dict:
             usable = len(data) // block_size
             if usable == 0:
                 return None
-            histogram: Dict[int, int] = {}
+            # Always populate both rotation keys so consumers can index
+            # histogram[0] / histogram[1] directly without KeyError when
+            # all blocks happen to share a rotation.
+            histogram: Dict[int, int] = {0: 0, 1: 0}
             for b in range(usable):
                 lb = data[b * block_size + 4]
                 if lb & 0x60:  # reserved bits must be 0 in stored blocks
                     return None
                 r = (lb >> 7) & 1
-                histogram[r] = histogram.get(r, 0) + 1
+                histogram[r] += 1
             return histogram
 
         for ti in tensor_infos:
