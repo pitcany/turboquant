@@ -359,51 +359,43 @@ PY
     fi
 fi
 
-# ---------- 7. ggml-cuda.cu: SET_ROWS TQ4P dispatch + supports_op --------
-# The new ollama uses SET_ROWS (not CPY) for KV cache writes. Without this
-# hook, the CUDA backend reports that it can't run SET_ROWS on TQ4P tensors,
-# and llama_init_from_model aborts.
+# ---------- 7. ggml-cuda.cu: SET_ROWS + MUL_MAT supports_op + SET_ROWS dispatch
 #
-# Two edits:
-#   a) supports_op: add TQ4P_D128/D256 to the SET_ROWS type list
-#   b) dispatch: intercept TQ4P in ggml_cuda_op_set_rows before the
-#      template dispatch, calling tqp-set-rows.cu kernels
+# Newer ollama uses SET_ROWS (not CPY) for KV cache writes. Also, without a
+# MUL_MAT supports_op entry for TQ4P types the attention Q×K^T falls back
+# to CPU (the "74 graph splits" issue).
+#
+# Three edits, each guarded on its own dependencies:
+#   a) MUL_MAT supports_op: add TQ4P to the a->type switch. Only requires
+#      the MUL_MAT dispatch (hook 5), which in turn needs tqp-vec-dot.cu.
+#   b) SET_ROWS supports_op: add TQ4P to the SET_ROWS type list. Requires
+#      set-rows.cu (ollama must support SET_ROWS) and tqp-set-rows.cu
+#      (our kernel impl). Skip independently if either is missing.
+#   c) SET_ROWS dispatch in set-rows.cu (same guard as (b)).
+#
+# Splitting (a) from (b) matters because older ollama trees lack set-rows.cu
+# but still have MUL_MAT. Bundling all three under the SET_ROWS guard
+# (as the first version of this hook did) would leave MUL_MAT unpatched
+# on those trees, silently forcing CPU fallback for attention.
 
+MARKER_MUL_MAT='TQ4P MUL_MAT on GPU'
 MARKER_SET_ROWS='TQ4P_D128 SET_ROWS'
 SET_ROWS_FILE="$GGML/src/ggml-cuda/set-rows.cu"
 TQP_SET_ROWS_IMPL="$GGML/src/ggml-cuda/tqp-set-rows.cu"
+TQP_VEC_DOT_IMPL="$GGML/src/ggml-cuda/tqp-vec-dot.cu"
 
-# Hooks 5 and 6 guard `supports_op` / dispatch patches on the impl file
-# existing, to prevent reporting a TQ4P op as supported without the
-# kernel present (→ runtime crash). Mirror that for SET_ROWS: both 7(a)
-# and 7(b) require set-rows.cu AND tqp-set-rows.cu to be present.
-
-# (a) supports_op in ggml-cuda.cu
-if [[ -f "$CUDA_CU" && -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
-    if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
-        echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
+# (a) MUL_MAT supports_op in ggml-cuda.cu — only depends on tqp-vec-dot.cu.
+if [[ -f "$CUDA_CU" && -f "$TQP_VEC_DOT_IMPL" ]]; then
+    if grep -qF "$MARKER_MUL_MAT" "$CUDA_CU"; then
+        echo "[=] ggml-cuda.cu MUL_MAT supports_op already patched"
     else
-        echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
+        echo "[+] patching ggml-cuda.cu MUL_MAT supports_op for TQ4P"
         python3 - "$CUDA_CU" <<'PY'
 import sys, pathlib
 
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
 
-# --- SET_ROWS supports_op: add TQ4P types. Anchor on IQ4_NL. ---
-anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
-if anchor not in t:
-    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
-    sys.exit(1)
-replacement = (
-    'op->type == GGML_TYPE_IQ4_NL ||\n'
-    '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
-    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
-)
-t = t.replace(anchor, replacement, 1)
-
-# --- MUL_MAT supports_op: add TQ4P types to the a->type switch. ---
-# Without this, attention Q×K^T falls back to CPU (74 graph splits).
 # Anchor on BF16 which is the last type before "return true; default:".
 mulmat_anchor = '                    case GGML_TYPE_BF16:\n                        return true;\n                    default:\n                        return false;'
 if mulmat_anchor not in t:
@@ -420,12 +412,41 @@ mulmat_new = (
 t = t.replace(mulmat_anchor, mulmat_new, 1)
 
 p.write_text(t)
-print(f"[+] patched: {p}")
+print(f"[+] patched MUL_MAT supports_op: {p}")
 PY
     fi
 fi
 
-# (b) dispatch in set-rows.cu
+# (b) SET_ROWS supports_op in ggml-cuda.cu — needs set-rows.cu + tqp-set-rows.cu.
+if [[ -f "$CUDA_CU" && -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
+        echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
+    else
+        echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
+        python3 - "$CUDA_CU" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
+if anchor not in t:
+    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
+    sys.exit(1)
+replacement = (
+    'op->type == GGML_TYPE_IQ4_NL ||\n'
+    '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
+    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
+)
+t = t.replace(anchor, replacement, 1)
+
+p.write_text(t)
+print(f"[+] patched SET_ROWS supports_op: {p}")
+PY
+    fi
+fi
+
+# (c) dispatch in set-rows.cu — same guard as (b).
 if [[ -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
     if grep -qF "$MARKER_SET_ROWS" "$SET_ROWS_FILE"; then
         echo "[=] set-rows.cu TQ4P dispatch already patched"
