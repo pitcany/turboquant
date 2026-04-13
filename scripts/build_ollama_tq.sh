@@ -171,8 +171,10 @@ echo "[+] cmake: building CPU shared libs"
 cmake --build --preset 'CPU' -- -j"$NPROC" 2>&1 | tail -3
 
 if [[ "$CUDA" = "1" ]]; then
-    # Detect CUDA major version for the right preset.
-    CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+' | head -1)
+    # Detect CUDA major version for the right preset. Under `set -euo
+    # pipefail`, grep returning exit 1 on no-match would abort the script
+    # and skip the `:-12` fallback below, so trap its exit with `|| true`.
+    CUDA_VER=$(nvcc --version 2>/dev/null | { grep -oP 'release \K[0-9]+' || true; } | head -1)
     CUDA_PRESET="CUDA ${CUDA_VER:-12}"
     CUDA_ARCHS="${CUDA_ARCHS:-89;120}"
 
@@ -188,8 +190,12 @@ fi
 echo "[+] installing shared libs"
 LIB_OUT="$OLLAMA_DIR/build/lib/ollama"
 if [[ -d "$LIB_OUT" ]]; then
-    # CPU libs go next to binary
-    for f in "$LIB_OUT"/libggml-base.so* "$LIB_OUT"/libggml-cpu*.so; do
+    # CPU libs go next to binary. Trailing `*` after `.so` catches
+    # versioned variants (`libggml-cpu.so.1`, etc.) — ollama's cmake can
+    # emit SONAME'd shared libraries, and `cp -a` would otherwise copy
+    # the unversioned symlink without its target, leaving a dangling
+    # link that the dynamic linker silently fails to load.
+    for f in "$LIB_OUT"/libggml-base.so* "$LIB_OUT"/libggml-cpu*.so*; do
         [[ -f "$f" ]] && cp -a "$f" "$OLLAMA_DIR/"
     done
     # CUDA lib goes into cuda_v{N}/ subdir for runner discovery

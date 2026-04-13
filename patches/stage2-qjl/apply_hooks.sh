@@ -364,9 +364,15 @@ fi
 
 MARKER_SET_ROWS='TQ4P_D128 SET_ROWS'
 SET_ROWS_FILE="$GGML/src/ggml-cuda/set-rows.cu"
+TQP_SET_ROWS_IMPL="$GGML/src/ggml-cuda/tqp-set-rows.cu"
+
+# Hooks 5 and 6 guard `supports_op` / dispatch patches on the impl file
+# existing, to prevent reporting a TQ4P op as supported without the
+# kernel present (→ runtime crash). Mirror that for SET_ROWS: both 7(a)
+# and 7(b) require set-rows.cu AND tqp-set-rows.cu to be present.
 
 # (a) supports_op in ggml-cuda.cu
-if [[ -f "$CUDA_CU" ]]; then
+if [[ -f "$CUDA_CU" && -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
     if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
         echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
     else
@@ -413,7 +419,7 @@ PY
 fi
 
 # (b) dispatch in set-rows.cu
-if [[ -f "$SET_ROWS_FILE" ]]; then
+if [[ -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
     if grep -qF "$MARKER_SET_ROWS" "$SET_ROWS_FILE"; then
         echo "[=] set-rows.cu TQ4P dispatch already patched"
     else
