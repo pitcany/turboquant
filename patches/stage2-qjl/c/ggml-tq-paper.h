@@ -130,6 +130,42 @@ void ggml_vec_dot_tq4p_d256_f32(int n, float * s, size_t bs,
                                  const void * vx, size_t bx,
                                  const void * vy, size_t by, int nrc);
 
+// ----- Q8_K-compatible query block -----
+//
+// Matches the upstream ggml block_q8_K layout (ggml-common.h).
+// Used as the query-side type when vec_dot_type = GGML_TYPE_Q8_K.
+// The fork's quantize_row_q8_K produces these; we only dequantize here.
+
+#define QK_Q8K 256
+
+#pragma pack(push, 1)
+typedef struct {
+    float   d;                   // scale (delta)
+    int8_t  qs[QK_Q8K];         // quantized values
+    int16_t bsums[QK_Q8K / 16]; // sum of quants in groups of 16 (unused here)
+} block_q8k_compat;
+#pragma pack(pop)
+
+_Static_assert(sizeof(block_q8k_compat) == 292, "block_q8k_compat size");
+
+// ----- Q8_K query dispatch wrappers -----
+//
+// Same ggml vec_dot signature as the fp32 wrappers above, but vy points to
+// block_q8k_compat blocks instead of fp32 values. The implementation
+// dequantizes Q8_K to fp32 one block at a time, then applies the same
+// Π rotation + QJL estimator. n must be a multiple of 256 (= lcm(D, QK_Q8K)).
+//
+// Register as the second dispatch entry per type:
+//   .vec_dot      = ggml_vec_dot_tq4p_d128_q8k
+//   .vec_dot_type = GGML_TYPE_Q8_K
+
+void ggml_vec_dot_tq4p_d128_q8k(int n, float * s, size_t bs,
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
+void ggml_vec_dot_tq4p_d256_q8k(int n, float * s, size_t bs,
+                                 const void * vx, size_t bx,
+                                 const void * vy, size_t by, int nrc);
+
 // Maximum number of supported layers for per-layer Π/S matrices.
 #define TQP_MAX_LAYERS 32
 

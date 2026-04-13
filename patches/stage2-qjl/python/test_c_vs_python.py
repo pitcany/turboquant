@@ -144,6 +144,27 @@ lib.ggml_vec_dot_tq4p_d128_f32.argtypes = [
 lib.ggml_vec_dot_tq4p_d256_f32.restype = None
 lib.ggml_vec_dot_tq4p_d256_f32.argtypes = lib.ggml_vec_dot_tq4p_d128_f32.argtypes
 
+# Q8_K query path — same ggml vec_dot signature, vy points to Q8_K blocks.
+lib.ggml_vec_dot_tq4p_d128_q8k.restype = None
+lib.ggml_vec_dot_tq4p_d128_q8k.argtypes = lib.ggml_vec_dot_tq4p_d128_f32.argtypes
+
+lib.ggml_vec_dot_tq4p_d256_q8k.restype = None
+lib.ggml_vec_dot_tq4p_d256_q8k.argtypes = lib.ggml_vec_dot_tq4p_d128_f32.argtypes
+
+
+# Q8_K block struct (matches ggml-common.h / block_q8k_compat in ggml-tq-paper.h).
+QK_Q8K = 256
+
+class block_q8k_compat(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("d",     ctypes.c_float),
+        ("qs",    ctypes.c_int8 * QK_Q8K),
+        ("bsums", ctypes.c_int16 * (QK_Q8K // 16)),
+    ]
+
+assert ctypes.sizeof(block_q8k_compat) == 292
+
 
 # ---------- Fixtures ----------
 
@@ -329,3 +350,122 @@ def test_c_matches_turboquant_paper_oracle(d, constants, vectors, layer_idx):
             f"vec {i} idx mismatch at layer {layer_idx}"
         assert torch.equal(c_signs_bits, oracle_signs_bits), \
             f"vec {i} signs mismatch at layer {layer_idx}"
+
+
+# ---------- Q8_K query path helpers ----------
+
+def _quantize_fp32_to_q8k(fp32_values):
+    """Quantize a flat fp32 array (length multiple of 256) to Q8_K blocks.
+
+    Mimics ggml's quantize_row_q8_K: per-block absmax scale,
+    round-to-nearest int8. Returns a list of block_q8k_compat ctypes structs.
+    """
+    import numpy as np
+    arr = np.asarray(fp32_values, dtype=np.float32)
+    assert arr.size % QK_Q8K == 0
+    nb = arr.size // QK_Q8K
+    blocks = []
+    for b in range(nb):
+        chunk = arr[b * QK_Q8K : (b + 1) * QK_Q8K]
+        amax = float(np.abs(chunk).max())
+        d = amax / 127.0 if amax > 0 else 1.0
+        inv_d = 1.0 / d
+        blk = block_q8k_compat()
+        blk.d = d
+        for i in range(QK_Q8K):
+            v = round(chunk[i] * inv_d)
+            v = max(-128, min(127, v))
+            blk.qs[i] = v
+        # bsums (not used by our vec_dot, but fill for correctness)
+        for g in range(QK_Q8K // 16):
+            blk.bsums[g] = sum(blk.qs[g * 16 + j] for j in range(16))
+        blocks.append(blk)
+    return blocks
+
+
+def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx):
+    """Q8_K query path must match fp32 path within Q8_K quantization noise.
+
+    We construct the same attention scenario (5 keys, 5 queries) and verify
+    the Q8_K dispatch wrapper produces results close to the fp32 wrapper.
+    The tolerance is wider because Q8_K quantization of the query introduces
+    ~0.4% relative error, but absolute scores should stay within 0.05.
+    """
+    import numpy as np
+
+    # n must be a multiple of 256 for the Q8_K path.
+    # Use enough keys so total elements = lcm(d, 256).
+    n_keys = QK_Q8K // d  # 2 for d=128, 1 for d=256
+    keys = vectors[:n_keys]
+    queries = vectors[n_keys : n_keys + 5]
+
+    key_bytes = b"".join(
+        ref.quantize_block(k, constants, layer_idx=layer_idx) for k in keys
+    )
+    n = d * n_keys
+    assert n % QK_Q8K == 0
+    KeyBuf = (ctypes.c_uint8 * len(key_bytes)).from_buffer_copy(key_bytes)
+
+    blk_size = 69 if d == 128 else 133
+
+    max_abs_diff = 0.0
+    for q in queries:
+        q_np = q.float().numpy()
+
+        # Build fp32 query buffer (replicate query per key block, same as fp32 test)
+        q_flat = (ctypes.c_float * n)()
+        for ki in range(n_keys):
+            for j in range(d):
+                q_flat[ki * d + j] = float(q_np[j])
+
+        # fp32 reference
+        out_f32 = ctypes.c_float(0.0)
+        if d == 128:
+            lib.ggml_vec_dot_tq4p_d128_f32(
+                n, ctypes.byref(out_f32), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+                1,
+            )
+        else:
+            lib.ggml_vec_dot_tq4p_d256_f32(
+                n, ctypes.byref(out_f32), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+                ctypes.cast(q_flat, ctypes.c_void_p), ctypes.sizeof(ctypes.c_float),
+                1,
+            )
+
+        # Quantize query to Q8_K blocks
+        q8k_blocks = _quantize_fp32_to_q8k(list(q_flat))
+        Q8kArr = block_q8k_compat * len(q8k_blocks)
+        q8k_buf = Q8kArr(*q8k_blocks)
+
+        # Q8_K query path
+        out_q8k = ctypes.c_float(0.0)
+        if d == 128:
+            lib.ggml_vec_dot_tq4p_d128_q8k(
+                n, ctypes.byref(out_q8k), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+                ctypes.cast(q8k_buf, ctypes.c_void_p),
+                ctypes.sizeof(block_q8k_compat),
+                1,
+            )
+        else:
+            lib.ggml_vec_dot_tq4p_d256_q8k(
+                n, ctypes.byref(out_q8k), ctypes.sizeof(ctypes.c_float),
+                ctypes.cast(KeyBuf, ctypes.c_void_p), blk_size,
+                ctypes.cast(q8k_buf, ctypes.c_void_p),
+                ctypes.sizeof(block_q8k_compat),
+                1,
+            )
+
+        diff = abs(out_q8k.value - out_f32.value)
+        max_abs_diff = max(max_abs_diff, diff)
+
+    # Q8_K introduces ~0.4% relative quantization error on the query.
+    # For unit-normalized vectors with scores near ±1, 0.05 abs tolerance
+    # is generous but appropriate.
+    assert max_abs_diff < 0.05, (
+        f"Q8_K vs fp32 max diff {max_abs_diff:.4f} exceeds tolerance "
+        f"(d={d}, layer={layer_idx})"
+    )

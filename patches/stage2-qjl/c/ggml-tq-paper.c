@@ -362,3 +362,54 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUND
 
 TQP_DEFINE_VEC_DOT(128)
 TQP_DEFINE_VEC_DOT(256)
+
+// ---------- Q8_K query dequantize ----------
+//
+// Converts one Q8_K block (256 int8 values + scale) to fp32.
+// This is the only extra work vs. the fp32 path; after dequantization the
+// same Π rotation and QJL estimator run on the resulting fp32 query.
+
+static inline void tqp_dequant_q8k(const block_q8k_compat * blk, float * out) {
+    const float d = blk->d;
+    for (int i = 0; i < QK_Q8K; ++i) {
+        out[i] = d * (float)blk->qs[i];
+    }
+}
+
+// ---------- Q8_K query dispatch wrappers ----------
+//
+// Same loop structure as the fp32 wrappers, but vy points to Q8_K blocks.
+// We dequantize one Q8_K block (256 elts) at a time and feed the resulting
+// fp32 values into the per-TQ4P-block inner product.
+//
+// n must be a multiple of QK_Q8K (256).  For D=128 each Q8_K block feeds
+// 2 TQ4P blocks; for D=256 it feeds exactly 1.
+
+#define TQP_DEFINE_VEC_DOT_Q8K(D)                                                                 \
+    void ggml_vec_dot_tq4p_d##D##_q8k(int n, float * s, size_t bs,                                \
+                                       const void * vx, size_t bx,                                 \
+                                       const void * vy, size_t by, int nrc) {                      \
+        assert(nrc == 1);                                                                          \
+        assert(n % QK_Q8K == 0);                                                                   \
+        (void)bs; (void)bx; (void)by;                                                              \
+        const block_tq4p_d##D * blk = (const block_tq4p_d##D *)vx;                                \
+        const block_q8k_compat * q8k = (const block_q8k_compat *)vy;                              \
+        const int64_t nb_q8k = n / QK_Q8K;                                                        \
+                                                                                                   \
+        float acc = 0.0f;                                                                          \
+        float q_buf[QK_Q8K];                                                                       \
+        int64_t tqp_b = 0;                                                                        \
+        for (int64_t qb = 0; qb < nb_q8k; ++qb) {                                                 \
+            tqp_dequant_q8k(&q8k[qb], q_buf);                                                     \
+            for (int sub = 0; sub < QK_Q8K / D; ++sub, ++tqp_b) {                                 \
+                const float * q = q_buf + sub * D;                                                 \
+                float Sq[D];                                                                       \
+                ggml_tqp_prepare_query_d##D(q, Sq, blk[tqp_b].layer_idx);                         \
+                acc += ggml_tqp_vec_dot_block_d##D(q, Sq, &blk[tqp_b]);                           \
+            }                                                                                      \
+        }                                                                                          \
+        *s = acc;                                                                                  \
+    }
+
+TQP_DEFINE_VEC_DOT_Q8K(128)
+TQP_DEFINE_VEC_DOT_Q8K(256)
