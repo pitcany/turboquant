@@ -26,6 +26,10 @@
 #include "tqp_constants_d128.h"
 #include "tqp_constants_d256.h"
 
+static inline uint8_t tqp_layer_idx(uint8_t layer_idx) {
+    return (uint8_t)(layer_idx % TQP_MAX_LAYERS);
+}
+
 // ---------- fp16 conversion ----------
 //
 // When integrating into the fork, replace these with ggml_fp32_to_fp16 /
@@ -292,9 +296,9 @@ static float tqp_vec_dot_block(
     void ggml_quantize_row_tq4p_d##D(const float * x, block_tq4p_d##D * y,                    \
                                      int64_t k, uint8_t layer_idx) {                           \
         assert(k % D == 0);                                                                   \
-        assert(layer_idx < TQP_MAX_LAYERS);                                                   \
-        const float * pi = PI_ARR[layer_idx];                                                 \
-        const float * s  = S_ARR[layer_idx];                                                  \
+        const uint8_t layer_idx_norm = tqp_layer_idx(layer_idx);                              \
+        const float * pi = PI_ARR[layer_idx_norm];                                            \
+        const float * s  = S_ARR[layer_idx_norm];                                             \
         const int64_t nb = k / D;                                                             \
         for (int64_t b = 0; b < nb; ++b) {                                                    \
             float res_d, orig_norm;                                                           \
@@ -303,7 +307,7 @@ static float tqp_vec_dot_block(
                                &res_d, &orig_norm);                                           \
             y[b].orig_norm = tqp_fp32_to_fp16(orig_norm);                                     \
             y[b].res_d     = tqp_fp32_to_fp16(res_d);                                         \
-            y[b].layer_idx = layer_idx;                                                       \
+            y[b].layer_idx = layer_idx_norm;                                                  \
         }                                                                                     \
     }                                                                                         \
                                                                                               \
@@ -311,22 +315,21 @@ static float tqp_vec_dot_block(
         assert(k % D == 0);                                                                   \
         const int64_t nb = k / D;                                                             \
         for (int64_t b = 0; b < nb; ++b) {                                                    \
-            assert(x[b].layer_idx < TQP_MAX_LAYERS);                                         \
-            const float * pi = PI_ARR[x[b].layer_idx];                                       \
+            const uint8_t layer_idx_norm = tqp_layer_idx(x[b].layer_idx);                     \
+            const float * pi = PI_ARR[layer_idx_norm];                                        \
             float orig_norm = tqp_fp16_to_fp32(x[b].orig_norm);                               \
             tqp_dequantize_block(D, pi, CENTROIDS, orig_norm, x[b].qs, y + b * D);            \
         }                                                                                     \
     }                                                                                         \
                                                                                               \
     void ggml_tqp_prepare_query_d##D(const float * q, float * Sq, uint8_t layer_idx) {        \
-        assert(layer_idx < TQP_MAX_LAYERS);                                                   \
-        tqp_prepare_query(D, S_ARR[layer_idx], q, Sq);                                        \
+        tqp_prepare_query(D, S_ARR[tqp_layer_idx(layer_idx)], q, Sq);                         \
     }                                                                                         \
                                                                                               \
     float ggml_tqp_vec_dot_block_d##D(const float * q, const float * Sq,                      \
                                        const block_tq4p_d##D * blk) {                         \
-        assert(blk->layer_idx < TQP_MAX_LAYERS);                                             \
-        return tqp_vec_dot_block(D, PI_ARR[blk->layer_idx], CENTROIDS, q, Sq,                 \
+        const uint8_t layer_idx_norm = tqp_layer_idx(blk->layer_idx);                         \
+        return tqp_vec_dot_block(D, PI_ARR[layer_idx_norm], CENTROIDS, q, Sq,                 \
                                  blk->qs, blk->qjl_signs,                                    \
                                  tqp_fp16_to_fp32(blk->orig_norm),                            \
                                  tqp_fp16_to_fp32(blk->res_d));                               \
