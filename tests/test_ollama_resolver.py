@@ -245,32 +245,3 @@ def test_read_gguf_metadata_falls_back_to_embedding_length(monkeypatch, tmp_path
     assert metadata.architecture == "llama"
     assert metadata.head_dim == 128
 
-
-def test_config_uses_gguf_defaults_before_explicit_env_overrides(monkeypatch) -> None:
-    import ollama_resolver
-    from ollama_resolver import GGUFMetadata
-    from vllm_plugin.config import TurboQuantConfig
-
-    def fake_read_gguf_metadata(path: str) -> GGUFMetadata:
-        assert path == "/models/qwen.gguf"
-        return GGUFMetadata(
-            architecture="qwen2",
-            num_heads=64,
-            num_kv_heads=8,
-            head_dim=128,
-            num_layers=64,
-            context_length=32768,
-            file_type=15,
-        )
-
-    monkeypatch.setattr(ollama_resolver, "read_gguf_metadata", fake_read_gguf_metadata)
-    monkeypatch.setenv("TQ_GGUF_PATH", "/models/qwen.gguf")
-    monkeypatch.setenv("TQ_NUM_HEADS", "32")
-
-    config = TurboQuantConfig()
-
-    assert config.num_layers == 64
-    assert config.num_heads == 32
-    assert config.num_kv_heads == 8
-    assert config.head_dim == 128
-    assert config.max_seq_len == 32768

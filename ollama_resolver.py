@@ -76,7 +76,7 @@ def read_gguf_metadata(path: str | os.PathLike[str]) -> GGUFMetadata:
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "The 'gguf' package is required to read GGUF metadata. "
-            "Install it in the vLLM environment, for example: pip install gguf"
+            "Install it with: pip install gguf"
         ) from exc
 
     reader = gguf.GGUFReader(path)
