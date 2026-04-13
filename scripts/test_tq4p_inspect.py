@@ -8,7 +8,6 @@ the KV and the per-block rotation histogram correctly.
 from __future__ import annotations
 
 import struct
-import tempfile
 from pathlib import Path
 
 import pytest
