@@ -115,48 +115,50 @@ __global__ static void tqp_prepare_query_batch_kernel_d256(
         q, Sq, q_rot, ne11, ne12, s11, s12, s13, s, &c_tqp_sigma_d256[layer_idx][0]);
 }
 
-extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, cudaStream_t stream) {
+extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, uint8_t layer_idx, cudaStream_t stream) {
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
-    const int layer_idx = 0;
+    const int layer = (int)(layer_idx % TQP_MAX_LAYERS);
     tqp_prepare_query_kernel_d128<<<1, QK_TQ4P_D128, 0, stream>>>(
-        q, Sq, q_rot, d_tqp_s_d128, layer_idx);
+        q, Sq, q_rot, d_tqp_s_d128, layer);
 }
 
-extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, cudaStream_t stream) {
+extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, uint8_t layer_idx, cudaStream_t stream) {
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
-    const int layer_idx = 0;
+    const int layer = (int)(layer_idx % TQP_MAX_LAYERS);
     tqp_prepare_query_kernel_d256<<<1, QK_TQ4P_D256, 0, stream>>>(
-        q, Sq, q_rot, d_tqp_s_d256, layer_idx);
+        q, Sq, q_rot, d_tqp_s_d256, layer);
 }
 
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
         const float * q, float * Sq, float * q_rot,
         int64_t ne11, int64_t ne12, int64_t ne13,
         int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_idx,
         cudaStream_t stream) {
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
-    const int layer_idx = 0;
+    const int layer = (int)(layer_idx % TQP_MAX_LAYERS);
     tqp_prepare_query_batch_kernel_d128<<<dim3((unsigned int)ne11, (unsigned int)ne12, (unsigned int)ne13), QK_TQ4P_D128, 0, stream>>>(
-        q, Sq, q_rot, ne11, ne12, s11, s12, s13, d_tqp_s_d128, layer_idx);
+        q, Sq, q_rot, ne11, ne12, s11, s12, s13, d_tqp_s_d128, layer);
 }
 
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d256(
         const float * q, float * Sq, float * q_rot,
         int64_t ne11, int64_t ne12, int64_t ne13,
         int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_idx,
         cudaStream_t stream) {
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
-    const int layer_idx = 0;
+    const int layer = (int)(layer_idx % TQP_MAX_LAYERS);
     tqp_prepare_query_batch_kernel_d256<<<dim3((unsigned int)ne11, (unsigned int)ne12, (unsigned int)ne13), QK_TQ4P_D256, 0, stream>>>(
-        q, Sq, q_rot, ne11, ne12, s11, s12, s13, d_tqp_s_d256, layer_idx);
+        q, Sq, q_rot, ne11, ne12, s11, s12, s13, d_tqp_s_d256, layer);
 }
 
 static int tqp_cuda_prepare_query_host(
@@ -164,7 +166,8 @@ static int tqp_cuda_prepare_query_host(
         const float * q_host,
         float * Sq_host,
         float * q_rot_host,
-        void (*device_fn)(const float *, float *, float *, cudaStream_t)) {
+        uint8_t layer_idx,
+        void (*device_fn)(const float *, float *, float *, uint8_t, cudaStream_t)) {
     float * q_dev = nullptr;
     float * Sq_dev = nullptr;
     float * q_rot_dev = nullptr;
@@ -186,7 +189,7 @@ static int tqp_cuda_prepare_query_host(
 
     err = cudaMemcpy(q_dev, q_host, bytes, cudaMemcpyHostToDevice);
     if (err == cudaSuccess) {
-        device_fn(q_dev, Sq_dev, q_rot_dev, 0);
+        device_fn(q_dev, Sq_dev, q_rot_dev, layer_idx, 0);
         err = cudaGetLastError();
     }
     if (err == cudaSuccess) {
@@ -205,12 +208,12 @@ static int tqp_cuda_prepare_query_host(
     return (int)err;
 }
 
-extern "C" int tqp_cuda_prepare_query_d128(const float * q_host, float * Sq_host, float * q_rot_host) {
+extern "C" int tqp_cuda_prepare_query_d128(const float * q_host, float * Sq_host, float * q_rot_host, uint8_t layer_idx) {
     return tqp_cuda_prepare_query_host(
-        QK_TQ4P_D128, q_host, Sq_host, q_rot_host, ggml_cuda_tqp_prepare_query_d128);
+        QK_TQ4P_D128, q_host, Sq_host, q_rot_host, layer_idx, ggml_cuda_tqp_prepare_query_d128);
 }
 
-extern "C" int tqp_cuda_prepare_query_d256(const float * q_host, float * Sq_host, float * q_rot_host) {
+extern "C" int tqp_cuda_prepare_query_d256(const float * q_host, float * Sq_host, float * q_rot_host, uint8_t layer_idx) {
     return tqp_cuda_prepare_query_host(
-        QK_TQ4P_D256, q_host, Sq_host, q_rot_host, ggml_cuda_tqp_prepare_query_d256);
+        QK_TQ4P_D256, q_host, Sq_host, q_rot_host, layer_idx, ggml_cuda_tqp_prepare_query_d256);
 }

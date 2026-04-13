@@ -7,9 +7,19 @@
 #define QK_TQ4P_D128 128
 #define QK_TQ4P_D256 256
 
+// Block layout matches the CPU path (patches/stage2-qjl/c/ggml-tq-paper.h):
+//   offset 0..1  orig_norm (fp16)
+//   offset 2..3  res_d     (fp16)
+//   offset 4     layer_idx (uint8) — selects per-layer σ and S
+//   offset 5..   qs        (3-bit bitplane-packed indices)
+//   then         qjl_signs (1-bit per coord)
+// pragma pack(1) so the odd total sizes (69, 133) match CPU; without it
+// the trailing uint16_t on the outer struct would force 2-byte alignment.
+#pragma pack(push, 1)
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;
     uint8_t  qs[48];
     uint8_t  qjl_signs[16];
 } block_tq4p_d128;
@@ -17,12 +27,14 @@ typedef struct {
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;
     uint8_t  qs[96];
     uint8_t  qjl_signs[32];
 } block_tq4p_d256;
+#pragma pack(pop)
 
-static_assert(sizeof(block_tq4p_d128) == 68, "block_tq4p_d128 size");
-static_assert(sizeof(block_tq4p_d256) == 132, "block_tq4p_d256 size");
+static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
+static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 
 static constexpr float TQP_SQRT_PI_OVER_2 = 1.2533141373155001f;
 

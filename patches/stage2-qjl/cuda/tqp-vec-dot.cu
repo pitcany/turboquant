@@ -2,20 +2,23 @@
 
 #include <cuda_runtime.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, cudaStream_t stream);
-extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, uint8_t layer_idx, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, uint8_t layer_idx, cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
         const float * q, float * Sq, float * q_rot,
         int64_t ne11, int64_t ne12, int64_t ne13,
         int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_idx,
         cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d256(
         const float * q, float * Sq, float * q_rot,
         int64_t ne11, int64_t ne12, int64_t ne13,
         int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_idx,
         cudaStream_t stream);
 
 template<int D, typename Block>
@@ -177,11 +180,15 @@ static int tqp_cuda_vec_dot_row_host(
         const Block * blocks_host,
         float * out_host,
         int64_t n_blocks,
-        void (*prepare_fn)(const float *, float *, float *, cudaStream_t),
+        void (*prepare_fn)(const float *, float *, float *, uint8_t, cudaStream_t),
         void (*vec_dot_fn)(const void *, const float *, const float *, float *, int64_t, cudaStream_t)) {
     if (n_blocks <= 0) {
         return 1;
     }
+
+    // All blocks in a single launch are assumed to share a layer (per the
+    // ggml per-layer tensor convention). Read it from the first host block.
+    const uint8_t layer_idx = blocks_host[0].layer_idx;
 
     float * q_dev = nullptr;
     float * Sq_dev = nullptr;
@@ -209,7 +216,7 @@ static int tqp_cuda_vec_dot_row_host(
     err = cudaMemcpy(blocks_dev, blocks_host, block_bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) goto done;
 
-    prepare_fn(q_dev, Sq_dev, q_rot_dev, 0);
+    prepare_fn(q_dev, Sq_dev, q_rot_dev, layer_idx, 0);
     err = cudaGetLastError();
     if (err != cudaSuccess) goto done;
 
@@ -307,10 +314,22 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     const int64_t q_s12 = nb12 / (int64_t)sizeof(float);
     const int64_t q_s13 = nb13 / (int64_t)sizeof(float);
 
+    // K-cache tensors are homogeneously one layer's worth of blocks; read
+    // the layer_idx from the first block via a 1-byte synchronous d2h copy
+    // and reuse it across all prepare_query and vec_dot launches in this op.
+    uint8_t layer_idx = 0;
+    {
+        const uint8_t * first_block = (const uint8_t *)src0->data;
+        const size_t layer_byte_offset = offsetof(block_tq4p_d128, layer_idx);
+        CUDA_CHECK(cudaMemcpyAsync(&layer_idx, first_block + layer_byte_offset, 1,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     if (d == QK_TQ4P_D128) {
-        ggml_cuda_tqp_prepare_query_batch_d128(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, stream);
+        ggml_cuda_tqp_prepare_query_batch_d128(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_idx, stream);
     } else {
-        ggml_cuda_tqp_prepare_query_batch_d256(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, stream);
+        ggml_cuda_tqp_prepare_query_batch_d256(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_idx, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 
