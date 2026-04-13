@@ -225,10 +225,15 @@ Shared libs installed next to binary:
 $(ls "$OLLAMA_DIR"/*.so* "$OLLAMA_DIR"/cuda_v*/*.so 2>/dev/null | sed 's|.*/||;s/^/  /')
 
 Run with:
-    OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=0 $OLLAMA_DIR/ollama serve
 
 For Qwen 3.5 (head_dim=256):
-    OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=0 $OLLAMA_DIR/ollama serve
+
+Note: flash attention must be disabled with TQ4P. The fattn kernels have
+hardcoded type combinations that don't include TQ4P — enabling it forces
+every attention layer to fall back to CPU. The MUL_MAT path handles TQ4P
+at full GPU speed.
 
 The TQ4P sources live at patches/stage2-qjl/c/ in this repo and are copied
 into $GGML_SRC on every run. Edit them in the repo, then rerun with --rebuild.
