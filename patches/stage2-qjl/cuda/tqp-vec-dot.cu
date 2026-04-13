@@ -314,9 +314,15 @@ static int tqp_cuda_vec_dot_q8k_host(
 
     const uint8_t layer_byte = blocks_host[0].layer_idx;
     // Q8_K has 256 elements per block. For d=128, d fits in 1/2 Q8K block;
-    // for d=256, d fits in 1 Q8K block. In either case, total fp32 = d.
+    // for d=256, d fits in 1 Q8K block. We still need to allocate a full
+    // n_q8k_blocks * QK_Q8K fp32 scratch because the dequantize kernel
+    // launches with QK_Q8K (=256) threads per block and each writes its
+    // slot — if we only sized for d floats, threads d..QK_Q8K-1 would run
+    // past the buffer end. Only the first d entries are consumed by
+    // prepare_query; the tail is harmlessly unused.
     const int64_t n_q8k_blocks = ((int64_t)d + QK_Q8K - 1) / QK_Q8K;
     const size_t q8k_bytes = (size_t)n_q8k_blocks * sizeof(block_q8k_cuda);
+    const size_t q_fp32_bytes = (size_t)n_q8k_blocks * QK_Q8K * sizeof(float);
 
     float * q_fp32_dev = nullptr;
     block_q8k_cuda * q8k_dev = nullptr;
@@ -331,7 +337,7 @@ static int tqp_cuda_vec_dot_q8k_host(
 
     cudaError_t err = cudaMalloc((void **)&q8k_dev, q8k_bytes);
     if (err != cudaSuccess) return (int)err;
-    err = cudaMalloc((void **)&q_fp32_dev, q_bytes);
+    err = cudaMalloc((void **)&q_fp32_dev, q_fp32_bytes);
     if (err != cudaSuccess) goto done;
     err = cudaMalloc((void **)&Sq_dev, q_bytes);
     if (err != cudaSuccess) goto done;
