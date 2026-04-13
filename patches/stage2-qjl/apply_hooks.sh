@@ -42,6 +42,11 @@ else
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
+# Strip any pre-existing TQ4P entries (idempotent re-patching).
+t = re.sub(r'\s*//.*TurboQuant paper-faithful.*\n', '', t)
+t = re.sub(r'\s*//.*See src/ggml-tq-paper\.h.*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQ4P_D128\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQ4P_D256\s*=\s*\d+,\s*\n', '', t)
 m = re.search(r"\s*GGML_TYPE_COUNT\s*=\s*(\d+),", t)
 if not m:
     sys.exit("ggml.h: no GGML_TYPE_COUNT line found")
