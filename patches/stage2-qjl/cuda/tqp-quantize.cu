@@ -185,7 +185,7 @@ __global__ static void tqp_quantize_kernel_d128(
         y[b].qjl_signs,
         &c_tqp_sigma_d128[layer][0],
         pi + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
-        s,
+        s  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
         c_tqp_centroids_d128,
         c_tqp_boundaries_d128);
 }
@@ -214,7 +214,7 @@ __global__ static void tqp_quantize_kernel_d256(
         y[b].qjl_signs,
         &c_tqp_sigma_d256[layer][0],
         pi + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
-        s,
+        s  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
         c_tqp_centroids_d256,
         c_tqp_boundaries_d256);
 }

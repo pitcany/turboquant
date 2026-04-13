@@ -22,7 +22,6 @@ target_include_directories(ggml_tq_paper_cuda PRIVATE
 )
 
 set_target_properties(ggml_tq_paper_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME ggml_tq_paper_cuda
 )
