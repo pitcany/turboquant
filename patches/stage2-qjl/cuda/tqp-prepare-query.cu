@@ -143,10 +143,14 @@ extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, fl
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const int layer = (int)(TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS);
     const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
-    const float * pi_layer = d_tqp_pi_d128 + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
-    const float * s_layer  = d_tqp_s_d128  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
+    const float * pi_layer = tqp_state->pi_d128 + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
+    const float * s_layer  = tqp_state->s_d128  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
     if (rot == TQP_ROT_WHT) {
         tqp_prepare_query_kernel_d128<TQP_ROT_WHT><<<1, QK_TQ4P_D128, 0, stream>>>(
             q, Sq, q_rot, s_layer, pi_layer, layer);
@@ -160,10 +164,14 @@ extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, fl
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const int layer = (int)(TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS);
     const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
-    const float * pi_layer = d_tqp_pi_d256 + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
-    const float * s_layer  = d_tqp_s_d256  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
+    const float * pi_layer = tqp_state->pi_d256 + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
+    const float * s_layer  = tqp_state->s_d256  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
     if (rot == TQP_ROT_WHT) {
         tqp_prepare_query_kernel_d256<TQP_ROT_WHT><<<1, QK_TQ4P_D256, 0, stream>>>(
             q, Sq, q_rot, s_layer, pi_layer, layer);
@@ -182,10 +190,14 @@ extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const int layer = (int)(TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS);
     const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
-    const float * pi_layer = d_tqp_pi_d128 + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
-    const float * s_layer  = d_tqp_s_d128  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
+    const float * pi_layer = tqp_state->pi_d128 + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
+    const float * s_layer  = tqp_state->s_d128  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128;
     const dim3 grid((unsigned int)ne11, (unsigned int)ne12, (unsigned int)ne13);
     if (rot == TQP_ROT_WHT) {
         tqp_prepare_query_batch_kernel_d128<TQP_ROT_WHT><<<grid, QK_TQ4P_D128, 0, stream>>>(
@@ -205,10 +217,14 @@ extern "C" void ggml_cuda_tqp_prepare_query_batch_d256(
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const int layer = (int)(TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS);
     const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
-    const float * pi_layer = d_tqp_pi_d256 + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
-    const float * s_layer  = d_tqp_s_d256  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
+    const float * pi_layer = tqp_state->pi_d256 + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
+    const float * s_layer  = tqp_state->s_d256  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256;
     const dim3 grid((unsigned int)ne11, (unsigned int)ne12, (unsigned int)ne13);
     if (rot == TQP_ROT_WHT) {
         tqp_prepare_query_batch_kernel_d256<TQP_ROT_WHT><<<grid, QK_TQ4P_D256, 0, stream>>>(

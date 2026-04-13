@@ -54,7 +54,8 @@ def test_single_vector_batch_shapes_work() -> None:
     assert reconstructed.shape == (1, 32)
     assert indices.shape == (1, 32)
     assert compressed["mse_indices"].shape == (1, 32)
-    assert estimated_ip.shape == (1,)
+    # 2D y × 2D x produces 2D (N, M) result, not squeezed to 1D.
+    assert estimated_ip.shape == (1, 1)
 
 
 def test_empty_cache_attention_scores_returns_empty_tensor() -> None:

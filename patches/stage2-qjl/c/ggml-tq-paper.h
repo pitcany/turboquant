@@ -157,10 +157,12 @@ _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 
 // ----- BF16 / FP16 types -----
 //
-// When integrating into ggml, replace with ggml_bf16_t / ggml_fp16_t.
-// Both are storage-only uint16_t; we convert to fp32 at load time.
+// When included inside ggml, ggml.h already defines ggml_bf16_t (struct)
+// and ggml_fp16_t. Only provide fallback typedefs for standalone builds.
+#ifndef GGML_FILE_MAGIC
 typedef uint16_t ggml_bf16_t;
 typedef uint16_t ggml_fp16_t;
+#endif
 
 // ----- Quantize / dequantize -----
 

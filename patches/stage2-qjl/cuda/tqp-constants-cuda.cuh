@@ -20,6 +20,8 @@
 #include <cuda_runtime.h>
 
 #include <stddef.h>
+#include <array>
+#include <mutex>
 
 static __constant__ float c_tqp_centroids_d128[8];
 static __constant__ float c_tqp_boundaries_d128[7];
@@ -30,34 +32,62 @@ static __constant__ float c_tqp_boundaries_d256[7];
 static __constant__ float c_tqp_sigma_d128[TQP_MAX_LAYERS][QK_TQ4P_D128];
 static __constant__ float c_tqp_sigma_d256[TQP_MAX_LAYERS][QK_TQ4P_D256];
 
-// Per-layer Haar rotation Π_i for TQP_ROT_HAAR (32 × d² fp32).
-// Too large for __constant__: 2 MB (d=128) / 8 MB (d=256). Device global.
-inline float * d_tqp_pi_d128 = nullptr;
-inline float * d_tqp_pi_d256 = nullptr;
+struct TqpDeviceState {
+    float * pi_d128 = nullptr;
+    float * s_d128 = nullptr;
+    float * pi_d256 = nullptr;
+    float * s_d256 = nullptr;
+    bool init_d128 = false;
+    bool init_d256 = false;
+};
 
-// Gaussian QJL matrices S_i: 32 × d² × 4 B = 2 MB / 8 MB. Device global.
-inline float * d_tqp_s_d128  = nullptr;
-inline float * d_tqp_s_d256  = nullptr;
+inline constexpr int TQP_MAX_CUDA_DEVICES = 8;
+inline std::array<TqpDeviceState, TQP_MAX_CUDA_DEVICES> g_tqp_devices{};
+inline std::mutex g_tqp_init_mutex;
 
-inline bool g_tqp_cuda_init_d128 = false;
-inline bool g_tqp_cuda_init_d256 = false;
-static bool g_tqp_cuda_constants_init_d128 = false;
-static bool g_tqp_cuda_constants_init_d256 = false;
+static std::array<bool, TQP_MAX_CUDA_DEVICES> g_tqp_cuda_constants_init_d128{};
+static std::array<bool, TQP_MAX_CUDA_DEVICES> g_tqp_cuda_constants_init_d256{};
+
+static inline cudaError_t tqp_cuda_current_device(int * device_id) {
+    const cudaError_t err = cudaGetDevice(device_id);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (*device_id < 0 || *device_id >= TQP_MAX_CUDA_DEVICES) {
+        return cudaErrorInvalidDevice;
+    }
+    return cudaSuccess;
+}
+
+static inline TqpDeviceState * tqp_cuda_current_device_state() {
+    int device_id = 0;
+    if (tqp_cuda_current_device(&device_id) != cudaSuccess) {
+        return nullptr;
+    }
+    return &g_tqp_devices[(size_t)device_id];
+}
 
 static inline cudaError_t tqp_cuda_init(int head_dim) {
-    cudaError_t err = cudaSuccess;
+    int device_id = 0;
+    cudaError_t err = tqp_cuda_current_device(&device_id);
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tqp_init_mutex);
+    TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
 
     if (head_dim == QK_TQ4P_D128) {
-        if (!g_tqp_cuda_constants_init_d128) {
+        if (!g_tqp_cuda_constants_init_d128[(size_t)device_id]) {
             err = cudaMemcpyToSymbol(c_tqp_centroids_d128, TQP_CENTROIDS_D128, sizeof(TQP_CENTROIDS_D128));
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_boundaries_d128, TQP_BOUNDARIES_D128, sizeof(TQP_BOUNDARIES_D128));
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_sigma_d128, TQP_SIGMA_D128, sizeof(TQP_SIGMA_D128));
             if (err != cudaSuccess) return err;
-            g_tqp_cuda_constants_init_d128 = true;
+            g_tqp_cuda_constants_init_d128[(size_t)device_id] = true;
         }
-        if (!g_tqp_cuda_init_d128) {
+        if (!state.init_d128) {
             float * pi = nullptr;
             float * s  = nullptr;
             err = cudaMalloc((void **)&pi, sizeof(TQP_PI_D128));
@@ -68,24 +98,24 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
             if (err != cudaSuccess) { cudaFree(s); cudaFree(pi); return err; }
             err = cudaMemcpy(s, TQP_S_D128, sizeof(TQP_S_D128), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) { cudaFree(s); cudaFree(pi); return err; }
-            d_tqp_pi_d128 = pi;
-            d_tqp_s_d128  = s;
-            g_tqp_cuda_init_d128 = true;
+            state.pi_d128 = pi;
+            state.s_d128  = s;
+            state.init_d128 = true;
         }
         return cudaSuccess;
     }
 
     if (head_dim == QK_TQ4P_D256) {
-        if (!g_tqp_cuda_constants_init_d256) {
+        if (!g_tqp_cuda_constants_init_d256[(size_t)device_id]) {
             err = cudaMemcpyToSymbol(c_tqp_centroids_d256, TQP_CENTROIDS_D256, sizeof(TQP_CENTROIDS_D256));
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_boundaries_d256, TQP_BOUNDARIES_D256, sizeof(TQP_BOUNDARIES_D256));
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_sigma_d256, TQP_SIGMA_D256, sizeof(TQP_SIGMA_D256));
             if (err != cudaSuccess) return err;
-            g_tqp_cuda_constants_init_d256 = true;
+            g_tqp_cuda_constants_init_d256[(size_t)device_id] = true;
         }
-        if (!g_tqp_cuda_init_d256) {
+        if (!state.init_d256) {
             float * pi = nullptr;
             float * s  = nullptr;
             err = cudaMalloc((void **)&pi, sizeof(TQP_PI_D256));
@@ -96,28 +126,62 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
             if (err != cudaSuccess) { cudaFree(s); cudaFree(pi); return err; }
             err = cudaMemcpy(s, TQP_S_D256, sizeof(TQP_S_D256), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) { cudaFree(s); cudaFree(pi); return err; }
-            d_tqp_pi_d256 = pi;
-            d_tqp_s_d256  = s;
-            g_tqp_cuda_init_d256 = true;
+            state.pi_d256 = pi;
+            state.s_d256  = s;
+            state.init_d256 = true;
         }
         return cudaSuccess;
     }
 
-    return cudaSuccess;
+    return cudaErrorInvalidValue;
 }
 
 static inline void tqp_cuda_cleanup() {
-    if (d_tqp_pi_d128) cudaFree(d_tqp_pi_d128);
-    if (d_tqp_s_d128)  cudaFree(d_tqp_s_d128);
-    if (d_tqp_pi_d256) cudaFree(d_tqp_pi_d256);
-    if (d_tqp_s_d256)  cudaFree(d_tqp_s_d256);
+    int device_id = 0;
+    if (tqp_cuda_current_device(&device_id) != cudaSuccess) {
+        return;
+    }
 
-    d_tqp_pi_d128 = nullptr;
-    d_tqp_s_d128  = nullptr;
-    d_tqp_pi_d256 = nullptr;
-    d_tqp_s_d256  = nullptr;
-    g_tqp_cuda_init_d128 = false;
-    g_tqp_cuda_init_d256 = false;
-    g_tqp_cuda_constants_init_d128 = false;
-    g_tqp_cuda_constants_init_d256 = false;
+    std::lock_guard<std::mutex> lock(g_tqp_init_mutex);
+    TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
+
+    if (state.pi_d128) cudaFree(state.pi_d128);
+    if (state.s_d128)  cudaFree(state.s_d128);
+    if (state.pi_d256) cudaFree(state.pi_d256);
+    if (state.s_d256)  cudaFree(state.s_d256);
+
+    state = TqpDeviceState{};
+    g_tqp_cuda_constants_init_d128[(size_t)device_id] = false;
+    g_tqp_cuda_constants_init_d256[(size_t)device_id] = false;
+}
+
+static inline void tqp_cuda_cleanup_all() {
+    int original_device = 0;
+    const cudaError_t original_err = cudaGetDevice(&original_device);
+
+    std::lock_guard<std::mutex> lock(g_tqp_init_mutex);
+    for (int device_id = 0; device_id < TQP_MAX_CUDA_DEVICES; ++device_id) {
+        TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
+        if (!state.init_d128 && !state.init_d256
+                && !g_tqp_cuda_constants_init_d128[(size_t)device_id]
+                && !g_tqp_cuda_constants_init_d256[(size_t)device_id]) {
+            continue;
+        }
+
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            continue;
+        }
+        if (state.pi_d128) cudaFree(state.pi_d128);
+        if (state.s_d128)  cudaFree(state.s_d128);
+        if (state.pi_d256) cudaFree(state.pi_d256);
+        if (state.s_d256)  cudaFree(state.s_d256);
+
+        state = TqpDeviceState{};
+        g_tqp_cuda_constants_init_d128[(size_t)device_id] = false;
+        g_tqp_cuda_constants_init_d256[(size_t)device_id] = false;
+    }
+
+    if (original_err == cudaSuccess) {
+        cudaSetDevice(original_device);
+    }
 }

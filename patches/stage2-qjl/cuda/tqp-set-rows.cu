@@ -108,6 +108,8 @@ extern "C" void ggml_cuda_set_rows_tq4p_d128(
         cudaStream_t stream) {
 
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) return;
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) return;
 
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
@@ -117,7 +119,7 @@ extern "C" void ggml_cuda_set_rows_tq4p_d128(
         k_set_rows_tq4p_d128<ROT_VAL, IDX_T> \
             <<<(unsigned int)n_rows, QK_TQ4P_D128, 0, stream>>>( \
                 src0_d, (const IDX_T *)src1_d, (block_tq4p_d128 *)dst_d, \
-                byte_stored, layer, d_tqp_pi_d128, d_tqp_s_d128, \
+                byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, \
                 n_rows, src0_stride_row, dst_stride_row)
 
     if (rot == TQP_ROT_WHT) {
@@ -137,6 +139,8 @@ extern "C" void ggml_cuda_set_rows_tq4p_d256(
         cudaStream_t stream) {
 
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) return;
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) return;
 
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
@@ -146,7 +150,7 @@ extern "C" void ggml_cuda_set_rows_tq4p_d256(
         k_set_rows_tq4p_d256<ROT_VAL, IDX_T> \
             <<<(unsigned int)n_rows, QK_TQ4P_D256, 0, stream>>>( \
                 src0_d, (const IDX_T *)src1_d, (block_tq4p_d256 *)dst_d, \
-                byte_stored, layer, d_tqp_pi_d256, d_tqp_s_d256, \
+                byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, \
                 n_rows, src0_stride_row, dst_stride_row)
 
     if (rot == TQP_ROT_WHT) {

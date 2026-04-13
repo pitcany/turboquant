@@ -113,10 +113,14 @@ static void tqp_dequantize_row_cuda(const void * x, dst_t * y, int64_t k, cudaSt
     if (tqp_cuda_init(D) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
 
     const int64_t n_blocks = k / D;
     tqp_dequantize_row_kernel<D, Block><<<(unsigned int)n_blocks, D, 0, stream>>>(
-        (const Block *)x, y, n_blocks, d_tqp_pi_d128, d_tqp_pi_d256);
+        (const Block *)x, y, n_blocks, tqp_state->pi_d128, tqp_state->pi_d256);
 }
 
 template<int D, typename Block>
@@ -137,10 +141,14 @@ static void tqp_dequantize_row_nc_cuda(
     if (tqp_cuda_init(D) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
 
     const dim3 grid((unsigned int)(ne00 / D), (unsigned int)ne01, (unsigned int)(ne02 * ne03));
     tqp_dequantize_row_nc_kernel<D, Block><<<grid, D, 0, stream>>>(
-        (const Block *)x, y, ne00, ne01, ne02, s01, s02, s03, d_tqp_pi_d128, d_tqp_pi_d256);
+        (const Block *)x, y, ne00, ne01, ne02, s01, s02, s03, tqp_state->pi_d128, tqp_state->pi_d256);
 }
 
 extern "C" void dequantize_row_tq4p_d128_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {

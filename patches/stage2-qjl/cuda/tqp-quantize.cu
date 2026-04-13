@@ -87,16 +87,20 @@ extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
     const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D128;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d128<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer, d_tqp_pi_d128, d_tqp_s_d128, n_blocks);
+            x, (block_tq4p_d128 *)y, byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, n_blocks);
     } else {
         tqp_quantize_kernel_d128<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer, d_tqp_pi_d128, d_tqp_s_d128, n_blocks);
+            x, (block_tq4p_d128 *)y, byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, n_blocks);
     }
 }
 
@@ -107,16 +111,20 @@ extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
     const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D256;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d256<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer, d_tqp_pi_d256, d_tqp_s_d256, n_blocks);
+            x, (block_tq4p_d256 *)y, byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, n_blocks);
     } else {
         tqp_quantize_kernel_d256<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer, d_tqp_pi_d256, d_tqp_s_d256, n_blocks);
+            x, (block_tq4p_d256 *)y, byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, n_blocks);
     }
 }
 
