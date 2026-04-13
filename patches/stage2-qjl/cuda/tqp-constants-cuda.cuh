@@ -23,8 +23,8 @@ inline float * d_tqp_s_d256  = nullptr;
 
 inline bool g_tqp_cuda_init_d128 = false;
 inline bool g_tqp_cuda_init_d256 = false;
-inline bool g_tqp_cuda_constants_init_d128 = false;
-inline bool g_tqp_cuda_constants_init_d256 = false;
+static bool g_tqp_cuda_constants_init_d128 = false;
+static bool g_tqp_cuda_constants_init_d256 = false;
 
 static inline cudaError_t tqp_cuda_init(int head_dim) {
     cudaError_t err = cudaSuccess;
