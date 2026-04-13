@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Dict
 
 
-# GGUF magic and header layout (v3).
+# GGUF magic and header layout.
+# Supports GGUF v2 and v3 (same layout for the fields we read).
 GGUF_MAGIC = 0x46554747  # "GGUF" in LE
-GGUF_VERSION = 3
+GGUF_MIN_VERSION = 2
 
 # GGUF value types.
 GGUF_TYPE_UINT8   = 0
@@ -38,11 +39,6 @@ GGUF_TYPE_ARRAY   = 9
 GGUF_TYPE_UINT64  = 10
 GGUF_TYPE_INT64   = 11
 GGUF_TYPE_FLOAT64 = 12
-
-# GGML type IDs for TQ4P (must match what apply_hooks.sh assigns).
-# These are dynamic; we detect them from tensor metadata.
-GGML_TYPE_NAME_TQ4P_D128 = "tq4p_d128"
-GGML_TYPE_NAME_TQ4P_D256 = "tq4p_d256"
 
 # Block sizes.
 BLOCK_SIZE_D128 = 69   # bytes per 128 elements
@@ -111,7 +107,7 @@ def inspect_gguf(path: Path) -> dict:
         if magic != GGUF_MAGIC:
             raise ValueError(f"Not a GGUF file (magic: {magic:#x})")
         version = struct.unpack("<I", f.read(4))[0]
-        if version < 2:
+        if version < GGUF_MIN_VERSION:
             raise ValueError(f"Unsupported GGUF version: {version}")
         (n_tensors,) = struct.unpack("<Q", f.read(8))
         (n_kv,) = struct.unpack("<Q", f.read(8))
