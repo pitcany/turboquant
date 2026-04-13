@@ -105,8 +105,22 @@ _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 // `layer_byte` packs the per-layer index (low 5 bits) and rotation mode
 // (bit 7); use TQP_LAYER_BYTE(layer, rotation) to build it. A plain
 // `uint8_t layer_idx` in [0, 31] is treated as TQP_ROT_WHT (bit 7 = 0).
+// ----- BF16 / FP16 types -----
+//
+// When integrating into ggml, replace with ggml_bf16_t / ggml_fp16_t.
+// Both are storage-only uint16_t; we convert to fp32 at load time.
+typedef uint16_t ggml_bf16_t;
+typedef uint16_t ggml_fp16_t;
+
 void ggml_quantize_row_tq4p_d128(const float * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
 void ggml_quantize_row_tq4p_d256(const float * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
+
+// BF16 / FP16 input variants. Convert to fp32 at load; internal pipeline
+// (Lloyd-Max, rotations, QJL) stays fp32.
+void ggml_quantize_row_tq4p_d128_bf16(const ggml_bf16_t * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
+void ggml_quantize_row_tq4p_d256_bf16(const ggml_bf16_t * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
+void ggml_quantize_row_tq4p_d128_f16 (const ggml_fp16_t * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
+void ggml_quantize_row_tq4p_d256_f16 (const ggml_fp16_t * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
 
 // 3-arg wrappers for ggml_from_float_t compatibility. Default to layer 0 +
 // TQP_ROT_WHT. The CUDA cpy dispatch uses the full 4-arg variant with
