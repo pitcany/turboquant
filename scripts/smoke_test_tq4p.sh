@@ -169,7 +169,7 @@ echo "[+] running inference via /api/generate..."
 set +e
 RESPONSE=$(curl -sf --max-time 120 \
     "http://localhost:${PORT}/api/generate" \
-    -d "{\"model\":\"$MODEL\",\"prompt\":\"Say hello in one sentence.\",\"stream\":false}" \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"Say hello in one sentence.\",\"stream\":false,\"options\":{\"num_ctx\":2048,\"num_predict\":64}}" \
     2>/dev/null)
 INFERENCE_RC=$?
 set -e

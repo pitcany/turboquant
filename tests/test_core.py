@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+from compressors import TurboQuantCompressorMSE, TurboQuantCompressorV2
 from lloyd_max import LloydMaxCodebook
 from turboquant import TurboQuantKVCache, TurboQuantMSE, TurboQuantProd
 
@@ -73,6 +74,58 @@ def test_mse_only_inner_products_are_more_biased_than_prod() -> None:
     assert prod_bias < mse_bias
 
 
+def test_inner_product_matrix_shape() -> None:
+    dim, bits = 128, 3
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(401)
+    quantizer = TurboQuantProd(dim, bits, seed=42, device="cpu")
+    keys = torch.randn(10, dim, generator=generator)
+    queries = torch.randn(5, dim, generator=generator)
+    keys = keys / torch.norm(keys, dim=-1, keepdim=True).clamp_min(1e-8)
+    queries = queries / torch.norm(queries, dim=-1, keepdim=True).clamp_min(1e-8)
+
+    estimated = quantizer.inner_product(queries, quantizer.quantize(keys))
+
+    assert estimated.shape == (5, 10)
+
+
+def test_inner_product_matrix_matches_loop() -> None:
+    dim, bits = 128, 3
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(402)
+    quantizer = TurboQuantProd(dim, bits, seed=42, device="cpu")
+    keys = torch.randn(10, dim, generator=generator)
+    queries = torch.randn(5, dim, generator=generator)
+    keys = keys / torch.norm(keys, dim=-1, keepdim=True).clamp_min(1e-8)
+    queries = queries / torch.norm(queries, dim=-1, keepdim=True).clamp_min(1e-8)
+    compressed = quantizer.quantize(keys)
+
+    estimated = quantizer.inner_product(queries, compressed)
+    expected = torch.stack([
+        quantizer.inner_product(query.unsqueeze(0), compressed)
+        for query in queries
+    ])
+
+    assert torch.allclose(estimated, expected)
+
+
+def test_inner_product_matrix_unbiased() -> None:
+    dim, bits = 128, 3
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(403)
+    quantizer = TurboQuantProd(dim, bits, seed=42, device="cpu")
+    keys = torch.randn(40, dim, generator=generator)
+    queries = torch.randn(25, dim, generator=generator)
+    keys = keys / torch.norm(keys, dim=-1, keepdim=True).clamp_min(1e-8)
+    queries = queries / torch.norm(queries, dim=-1, keepdim=True).clamp_min(1e-8)
+
+    estimated = quantizer.inner_product(queries, quantizer.quantize(keys))
+    true_ip = torch.matmul(queries, keys.T)
+    bias = (estimated - true_ip).mean().item()
+
+    assert abs(bias) < 0.01
+
+
 def test_bucketize_matches_nearest_centroid_assignment() -> None:
     codebook = LloydMaxCodebook(d=128, bits=3)
     generator = torch.Generator(device="cpu")
@@ -134,3 +187,106 @@ def test_kv_cache_normalizes_before_quantization_and_restores_scale() -> None:
     assert usage["key_bits"] == key_bits
     assert usage["value_bits"] == value_bits
     assert usage["total_bits"] == key_bits + value_bits
+
+
+def test_compressor_v2_defaults_to_fp32_storage() -> None:
+    batch, heads, seq_len, dim = 1, 2, 8, 128
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(501)
+    compressor = TurboQuantCompressorV2(dim, bits=3, seed=42, device="cpu")
+    keys = torch.randn(batch, heads, seq_len, dim, generator=generator)
+
+    compressed = compressor.compress(keys)
+
+    assert compressed["k_mse"].dtype == torch.float32
+    assert compressed["residual_norm"].dtype == torch.float32
+
+
+def test_compressor_v2_default_storage_matches_fp32_recompute() -> None:
+    batch, heads, seq_len, dim = 1, 2, 8, 128
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(504)
+    compressor = TurboQuantCompressorV2(dim, bits=3, seed=42, device="cpu")
+    keys = torch.randn(batch, heads, seq_len, dim, generator=generator)
+
+    compressed = compressor.compress(keys)
+    flat = keys.reshape(-1, dim).float()
+    vec_norms = torch.norm(flat, dim=-1).clamp_min(1e-8)
+    flat_unit = flat / vec_norms.unsqueeze(-1)
+    raw_compressed = compressor.quantizer.quantize(flat_unit)
+    expected_k_mse = (
+        compressor.quantizer.dequantize(raw_compressed)
+        * vec_norms.unsqueeze(-1)
+    ).reshape(batch, heads, seq_len, dim)
+    expected_residual_norm = (
+        raw_compressed["residual_norm"] * vec_norms
+    ).reshape(batch, heads, seq_len)
+
+    assert torch.allclose(compressed["k_mse"], expected_k_mse, atol=0, rtol=0)
+    assert torch.allclose(compressed["residual_norm"], expected_residual_norm, atol=0, rtol=0)
+
+
+def test_compressor_v2_can_store_fp16_for_legacy_size() -> None:
+    batch, heads, seq_len, dim = 1, 2, 8, 128
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(502)
+    compressor = TurboQuantCompressorV2(
+        dim,
+        bits=3,
+        seed=42,
+        device="cpu",
+        storage_dtype=torch.float16,
+    )
+    keys = torch.randn(batch, heads, seq_len, dim, generator=generator)
+
+    compressed = compressor.compress(keys)
+
+    assert compressed["k_mse"].dtype == torch.float16
+    assert compressed["residual_norm"].dtype == torch.float16
+
+
+def test_compressor_v2_attention_scores_are_consistent_across_storage_dtypes() -> None:
+    batch, heads, seq_len, dim = 1, 2, 8, 128
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(505)
+    keys = torch.randn(batch, heads, seq_len, dim, generator=generator)
+    queries = torch.randn(batch, heads, 3, dim, generator=generator)
+    fp32_compressor = TurboQuantCompressorV2(dim, bits=3, seed=42, device="cpu")
+    fp16_compressor = TurboQuantCompressorV2(
+        dim,
+        bits=3,
+        seed=42,
+        device="cpu",
+        storage_dtype=torch.float16,
+    )
+
+    fp32_scores = fp32_compressor.asymmetric_attention_scores(
+        queries,
+        fp32_compressor.compress(keys),
+    )
+    fp16_scores = fp16_compressor.asymmetric_attention_scores(
+        queries,
+        fp16_compressor.compress(keys),
+    )
+
+    assert torch.allclose(fp16_scores, fp32_scores, atol=1e-2, rtol=1e-3)
+
+
+def test_compressor_mse_defaults_to_fp32_storage() -> None:
+    batch, heads, seq_len, dim = 1, 2, 8, 128
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(503)
+    compressor = TurboQuantCompressorMSE(dim, bits=3, seed=42, device="cpu")
+    values = torch.randn(batch, heads, seq_len, dim, generator=generator)
+
+    compressed = compressor.compress(values)
+
+    assert compressed["vec_norms"].dtype == torch.float32
+
+
+def test_compressor_rejects_invalid_storage_dtype() -> None:
+    with pytest.raises(ValueError, match="storage_dtype"):
+        TurboQuantCompressorV2(128, bits=3, seed=42, storage_dtype=torch.int8)
+
+    with pytest.raises(ValueError, match="storage_dtype"):
+        TurboQuantCompressorMSE(128, bits=3, seed=42, storage_dtype=torch.int8)

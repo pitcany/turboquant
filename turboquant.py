@@ -175,20 +175,41 @@ class TurboQuantProd(nn.Module):
         Returns:
             Estimated inner products (batch,)
         """
+        m = self.qjl_dim
+        correction_scale = math.sqrt(math.pi / 2) / m
+
         # Term 1: inner product with MSE reconstruction
         x_mse = self.mse.dequantize(compressed["mse_indices"])
-        term1 = (y * x_mse).sum(dim=-1)
+        y_nd = y.unsqueeze(0) if y.ndim == 1 else y
+        x_mse_nd = x_mse.unsqueeze(0) if x_mse.ndim == 1 else x_mse
+        qjl_signs = compressed["qjl_signs"]
+        qjl_signs_nd = qjl_signs.unsqueeze(0) if qjl_signs.ndim == 1 else qjl_signs
+        residual_norm = compressed["residual_norm"]
+        residual_norm_nd = residual_norm.reshape(1) if residual_norm.ndim == 0 else residual_norm
+
+        n_queries = y_nd.shape[0]
+        n_keys = x_mse_nd.shape[0]
+        use_matmul = n_queries != n_keys and n_queries != 1 and n_keys != 1
+
+        if use_matmul:
+            term1 = torch.matmul(y_nd, x_mse_nd.T)
+            y_projected = torch.matmul(y_nd, self.S.T)
+            qjl_ip = torch.matmul(y_projected, qjl_signs_nd.T)
+            term2 = residual_norm_nd.unsqueeze(0) * correction_scale * qjl_ip
+            return term1 + term2
+
+        term1 = (y_nd * x_mse_nd).sum(dim=-1)
 
         # Term 2: QJL correction
         # Project query with same S matrix (but don't quantize query)
-        y_projected = y @ self.S.T  # (batch, qjl_dim)
-        qjl_ip = (y_projected * compressed["qjl_signs"]).sum(dim=-1)
+        y_projected = y_nd @ self.S.T  # (batch, qjl_dim)
+        qjl_ip = (y_projected * qjl_signs_nd).sum(dim=-1)
+        term2 = residual_norm_nd * correction_scale * qjl_ip
 
-        m = self.qjl_dim
-        correction_scale = math.sqrt(math.pi / 2) / m
-        term2 = compressed["residual_norm"] * correction_scale * qjl_ip
-
-        return term1 + term2
+        result = term1 + term2
+        if y.ndim == 1 and x_mse.ndim == 1:
+            return result.squeeze(0)
+        return result
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Quantize input vectors."""

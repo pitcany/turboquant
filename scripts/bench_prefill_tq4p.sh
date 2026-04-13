@@ -128,10 +128,12 @@ run_inference() {
     local prompt="$2"
 
     # Build JSON payload safely via python to handle escaping.
+    # Explicitly set num_ctx to avoid the VRAM-based default (262144) which
+    # can crash the tq4p CUDA kernel.  4096 is plenty for our ~2K-token prompt.
     python3 -c "
 import json, sys
 payload = {'model': sys.argv[1], 'prompt': sys.argv[2],
-           'stream': False, 'options': {'num_predict': 1}}
+           'stream': False, 'options': {'num_predict': 1, 'num_ctx': 4096}}
 json.dump(payload, open(sys.argv[3], 'w'))
 " "$model" "$prompt" "$PROMPT_JSON_FILE" 2>/dev/null || return 1
 
@@ -190,7 +192,8 @@ echo
 
 # ── Benchmark loop ─────────────────────────────────────────────────────
 
-declare -a TQ4P_TIMES F16_TIMES
+TQ4P_TIMES=()
+F16_TIMES=()
 
 for kv_type in tq4p_d128 f16; do
     LOG="/tmp/ollama-bench-${kv_type}.log"
@@ -198,13 +201,27 @@ for kv_type in tq4p_d128 f16; do
     echo "━━━ KV cache type: $kv_type ━━━"
     start_ollama "$kv_type" "$LOG" || exit 1
 
-    # Warmup: load the model once so subsequent runs measure steady-state.
+    # Warmup: load the model and ensure it can serve inference.
     echo -n "[.] warmup "
-    run_inference "$MODEL" "warmup" >/dev/null 2>&1 || true
-    echo "done"
+    warmup_ok=0
+    for attempt in $(seq 1 5); do
+        if run_inference "$MODEL" "warmup" >/dev/null 2>&1; then
+            warmup_ok=1
+            break
+        fi
+        echo -n "."
+        sleep 2
+    done
+    if [[ "$warmup_ok" -eq 0 ]]; then
+        echo " FAILED (model may not have loaded)"
+    else
+        echo "done"
+    fi
 
     for i in $(seq 1 "$RUNS"); do
-        result=$(run_inference "$MODEL" "$PROMPT" 2>/dev/null || true)
+        # Append a unique suffix to bust Ollama's KV cache between runs.
+        run_prompt="${PROMPT} [run ${kv_type} ${i}]"
+        result=$(run_inference "$MODEL" "$run_prompt" 2>/dev/null || true)
         if [[ -z "$result" ]]; then
             echo "  run $i: FAILED" >&2
             continue
@@ -248,8 +265,8 @@ fi
 python3 -c "
 import sys
 
-tq4p = [${TQ4P_TIMES[*]// /,}]
-f16  = [${F16_TIMES[*]// /,}]
+tq4p = [$(IFS=,; echo "${TQ4P_TIMES[*]}")]
+f16  = [$(IFS=,; echo "${F16_TIMES[*]}")]
 
 tq4p_avg = sum(tq4p) / len(tq4p)
 f16_avg  = sum(f16) / len(f16)

@@ -15,6 +15,18 @@ import torch
 from turboquant import TurboQuantMSE, TurboQuantProd
 
 _NORM_EPS = 1e-8
+_FLOAT_STORAGE_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
+
+
+def _validate_storage_dtype(storage_dtype: torch.dtype) -> torch.dtype:
+    if storage_dtype not in _FLOAT_STORAGE_DTYPES:
+        raise ValueError("storage_dtype must be a floating point torch dtype")
+    return storage_dtype
 
 
 class TurboQuantCompressorV2:
@@ -23,11 +35,19 @@ class TurboQuantCompressorV2:
     product computation without full decompression.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        bits: int,
+        seed: int,
+        device: str = "cpu",
+        storage_dtype: torch.dtype = torch.float32,
+    ) -> None:
         self.head_dim = head_dim
         self.bits = bits
         self.mse_bits = max(bits - 1, 1)
         self.device = device
+        self.storage_dtype = _validate_storage_dtype(storage_dtype)
 
         self.quantizer = TurboQuantProd(head_dim, bits, seed=seed, device=device)
         self.Pi = self.quantizer.mse.Pi
@@ -51,9 +71,9 @@ class TurboQuantCompressorV2:
         residual_norm = compressed["residual_norm"] * vec_norms
 
         return {
-            "k_mse": k_mse.to(torch.float16).reshape(batch, heads, seq_len, dim),
+            "k_mse": k_mse.to(self.storage_dtype).reshape(batch, heads, seq_len, dim),
             "qjl_signs": compressed["qjl_signs"].reshape(batch, heads, seq_len, self.quantizer.qjl_dim),
-            "residual_norm": residual_norm.to(torch.float16).reshape(batch, heads, seq_len),
+            "residual_norm": residual_norm.to(self.storage_dtype).reshape(batch, heads, seq_len),
             "shape": (batch, heads, seq_len, dim),
         }
 
@@ -86,10 +106,18 @@ class TurboQuantCompressorV2:
 class TurboQuantCompressorMSE:
     """MSE-only compressor for values or MSE-only key ablations."""
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        bits: int,
+        seed: int,
+        device: str = "cpu",
+        storage_dtype: torch.dtype = torch.float32,
+    ) -> None:
         self.head_dim = head_dim
         self.bits = bits
         self.device = device
+        self.storage_dtype = _validate_storage_dtype(storage_dtype)
 
         self.quantizer = TurboQuantMSE(head_dim, bits, seed=seed, device=device)
         self.Pi = self.quantizer.Pi
@@ -105,7 +133,7 @@ class TurboQuantCompressorMSE:
 
         return {
             "indices": indices,
-            "vec_norms": vec_norms.to(torch.float16),
+            "vec_norms": vec_norms.to(self.storage_dtype),
             "shape": (batch, heads, seq_len, dim),
         }
 

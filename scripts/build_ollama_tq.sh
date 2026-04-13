@@ -112,8 +112,8 @@ echo "[+] regenerating TQ4P constants (Π, S, Lloyd-Max)"
 GGML_SRC="$GGML/src"
 echo "[+] copying TQ4P sources into $GGML_SRC/"
 for f in ggml-tq-paper.h ggml-tq-paper.c \
-         tqp_centroids_d128.h tqp_centroids_d256.h \
-         tqp_constants_d128.h tqp_constants_d256.h; do
+         tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+         tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
     cp "$STAGE2_DIR/c/$f" "$GGML_SRC/"
 done
 
