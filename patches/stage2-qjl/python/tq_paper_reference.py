@@ -1,14 +1,21 @@
 """
-Byte-exact Python mirror of the C TurboQuant paper implementation.
+Byte-exact Python mirror of the C TurboQuant(-ish) implementation.
 
-This file operates on the same byte layouts, same per-layer Π_i, same S_i, and
-same Lloyd-Max centroids as the C code in ../c/ggml-tq-paper.c, so it serves as
-the oracle for byte-exact equality tests (see test_tq_paper.py).
+This file operates on the same byte layouts, same per-layer σ_i, Π_i, S_i,
+and Lloyd-Max centroids as the C code in ../c/ggml-tq-paper.c, so it serves
+as the oracle for byte-exact equality tests (see test_c_vs_python.py).
+
+Rotation mode is user-selectable per block:
+    TQP_ROT_WHT  (0): Π_i = (1/√d) · H · diag(σ_i) — RHT, O(d log d).
+    TQP_ROT_HAAR (1): Π_i is a dense d×d Haar random orthogonal — paper-exact.
+
+Selection is packed in the high bit of the block's layer_idx byte:
+    layer_byte = (rotation << 7) | (layer_idx & 0x1f)
 
 Per-layer constants:
-    Π_i: seed = 42 + layer_idx   (i in [0, 31])
-    S_i: seed = 43 + layer_idx
-    Matches turboquant.py::TurboQuantProd(seed=42+layer_idx)
+    σ_i:   seed = 42 + layer_idx   (Rademacher sign vector for RHT)
+    Π_i:   seed = 42 + layer_idx   (Haar rotation — matches turboquant.py)
+    S_i:   seed = 43 + layer_idx
 
 Byte layout TQ4P_D128 (69 bytes / 128 elements = 4.3125 bpw):
     offset  size  field
@@ -46,29 +53,102 @@ _SQRT_PI_OVER_2 = math.sqrt(math.pi / 2.0)
 
 MAX_LAYERS = 32
 
+# Rotation modes, packed in the high bit of the layer byte.
+TQP_ROT_WHT  = 0
+TQP_ROT_HAAR = 1
+
+
+def layer_byte(layer_idx: int, rotation: int) -> int:
+    """Pack (layer_idx, rotation) into the header byte. Matches the C macro
+    TQP_LAYER_BYTE in ggml-tq-paper.h."""
+    assert 0 <= layer_idx < 32
+    assert rotation in (TQP_ROT_WHT, TQP_ROT_HAAR)
+    return ((rotation & 1) << 7) | (layer_idx & 0x1f)
+
+
+def extract_layer(byte: int) -> int:
+    return byte & 0x1f
+
+
+def extract_rotation(byte: int) -> int:
+    return (byte >> 7) & 1
+
 
 @dataclass(frozen=True)
 class TQPConstants:
     d: int
-    pi: torch.Tensor          # (MAX_LAYERS, d, d) fp32
-    s: torch.Tensor           # (MAX_LAYERS, d, d) fp32
+    sigma: torch.Tensor       # (MAX_LAYERS, d) ±1 fp32 — RHT sign vector
+    pi: torch.Tensor          # (MAX_LAYERS, d, d) fp32 — Haar rotation
+    s: torch.Tensor           # (MAX_LAYERS, d, d) fp32 — QJL matrix
     centroids: torch.Tensor   # (8,)   fp32
     boundaries: torch.Tensor  # (7,)   fp32
 
 
 def load_constants(d: int) -> TQPConstants:
     state = torch.load(_CONSTANTS_PT, weights_only=True)
+    sigma = state[f"sigma_d{d}"].float()
     pi = state[f"pi_d{d}"].float()
     s = state[f"s_d{d}"].float()
+    assert sigma.shape == (MAX_LAYERS, d), f"Expected sigma shape ({MAX_LAYERS}, {d}), got {sigma.shape}"
     assert pi.shape == (MAX_LAYERS, d, d), f"Expected pi shape ({MAX_LAYERS}, {d}, {d}), got {pi.shape}"
     assert s.shape == (MAX_LAYERS, d, d), f"Expected s shape ({MAX_LAYERS}, {d}, {d}), got {s.shape}"
     return TQPConstants(
         d=d,
+        sigma=sigma,
         pi=pi,
         s=s,
         centroids=state[f"centroids_d{d}"].float(),
         boundaries=state[f"boundaries_d{d}"].float(),
     )
+
+
+# ---------- Randomized Hadamard Transform ----------
+
+def _wht_inplace(x: torch.Tensor) -> torch.Tensor:
+    """In-place fast Walsh-Hadamard transform (natural ordering), unnormalized.
+    Divide by sqrt(d) afterwards for the orthogonal version.
+    """
+    d = x.numel()
+    assert (d & (d - 1)) == 0, "d must be a power of 2"
+    h = 1
+    while h < d:
+        for i in range(0, d, h << 1):
+            a = x[i : i + h].clone()
+            b = x[i + h : i + 2 * h].clone()
+            x[i : i + h]         = a + b
+            x[i + h : i + 2 * h] = a - b
+        h <<= 1
+    return x
+
+
+def rht_apply(sigma: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """y = Π · v = (1/sqrt(d)) · H · diag(σ) · v."""
+    d = v.numel()
+    y = (sigma * v).clone()
+    _wht_inplace(y)
+    return y / math.sqrt(d)
+
+
+def rht_apply_t(sigma: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """y = Πᵀ · v = (1/sqrt(d)) · diag(σ) · H · v (H is symmetric)."""
+    d = v.numel()
+    y = v.clone()
+    _wht_inplace(y)
+    return sigma * y / math.sqrt(d)
+
+
+def rot_apply(rotation: int, sigma: torch.Tensor, pi: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Apply Π · v for the requested rotation mode."""
+    if rotation == TQP_ROT_HAAR:
+        return pi @ v
+    return rht_apply(sigma, v)
+
+
+def rot_apply_t(rotation: int, sigma: torch.Tensor, pi: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Apply Πᵀ · v for the requested rotation mode."""
+    if rotation == TQP_ROT_HAAR:
+        return pi.T @ v
+    return rht_apply_t(sigma, v)
 
 
 def block_size(d: int) -> int:
@@ -145,45 +225,45 @@ def _signs_offset(d: int) -> int:
 
 # ---------- quantize / dequantize / inner_product ----------
 
-def quantize_block(x: torch.Tensor, c: TQPConstants, layer_idx: int = 0) -> bytes:
+def quantize_block(x: torch.Tensor, c: TQPConstants,
+                   layer_idx: int = 0, rotation: int = TQP_ROT_WHT) -> bytes:
     """
     x: (d,) fp32. Returns block_size(d) bytes matching the C layout.
 
-    layer_idx selects which per-layer Pi and S to use (0..31).
+    layer_idx in [0, 31] picks σ_i / Π_i / S_i. rotation in {TQP_ROT_WHT,
+    TQP_ROT_HAAR} selects which rotation to apply. Both are recorded in
+    the block's layer_idx byte.
     """
     d = c.d
     assert x.shape == (d,)
     assert 0 <= layer_idx < MAX_LAYERS
+    assert rotation in (TQP_ROT_WHT, TQP_ROT_HAAR)
     x = x.float()
 
-    pi = c.pi[layer_idx]  # (d, d)
-    s = c.s[layer_idx]    # (d, d)
+    sigma = c.sigma[layer_idx]   # (d,)
+    pi = c.pi[layer_idx]         # (d, d)
+    s = c.s[layer_idx]           # (d, d)
 
     orig_norm = x.norm().clamp_min(1e-8).item()
     x_unit = x / orig_norm
 
-    x_rot = pi @ x_unit                                       # Stage 1 rotation
-    indices = torch.bucketize(x_rot, c.boundaries)            # (d,) in [0, 8)
-    x_hat_rot = c.centroids[indices]                           # rotated reconstruction
-    x_hat_unit = pi.T @ x_hat_rot                              # un-rotated reconstruction
-    residual = x_unit - x_hat_unit                             # original-space residual
+    x_rot = rot_apply(rotation, sigma, pi, x_unit)             # Stage 1 rotation
+    indices = torch.bucketize(x_rot, c.boundaries)             # (d,) in [0, 8)
+    x_hat_rot = c.centroids[indices]                            # rotated reconstruction
+    x_hat_unit = rot_apply_t(rotation, sigma, pi, x_hat_rot)    # un-rotated reconstruction
+    residual = x_unit - x_hat_unit                              # original-space residual
     res_d = residual.norm().item()
 
-    proj = s @ residual                                        # QJL in original space
+    proj = s @ residual                                         # QJL in original space
     signs = torch.where(proj < 0, torch.tensor(-1.0), torch.tensor(1.0))
 
     buf = bytearray(block_size(d))
-    # orig_norm (fp16)
     buf[0:2] = struct.pack('<e', _fp16_round(orig_norm))
-    # res_d (fp16)
     buf[2:4] = struct.pack('<e', _fp16_round(res_d))
-    # layer_idx (uint8)
-    buf[4] = layer_idx
-    # indices (3-bit bitplane)
+    buf[4] = layer_byte(layer_idx, rotation)
     qs_off = _qs_offset()
     qs_bytes = _pack_indices_bitplane(indices)
     buf[qs_off : qs_off + len(qs_bytes)] = qs_bytes
-    # qjl signs (1 bit each)
     signs_off = _signs_offset(d)
     buf[signs_off : signs_off + d // 8] = _pack_signs(signs)
     return bytes(buf)
@@ -192,34 +272,40 @@ def quantize_block(x: torch.Tensor, c: TQPConstants, layer_idx: int = 0) -> byte
 def dequantize_block(blk: bytes, c: TQPConstants) -> torch.Tensor:
     """Returns (d,) fp32 reconstruction (Stage-1 only, QJL ignored for dequant).
 
-    Reads layer_idx from block header to select per-layer Pi.
+    Reads both layer_idx and rotation from the block's packed header byte.
     """
     d = c.d
     orig_norm = struct.unpack('<e', blk[0:2])[0]
-    layer_idx = blk[4]
+    layer_byte_val = blk[4]
+    layer_idx = extract_layer(layer_byte_val)
+    rotation = extract_rotation(layer_byte_val)
     assert 0 <= layer_idx < MAX_LAYERS
+    sigma = c.sigma[layer_idx]
     pi = c.pi[layer_idx]
 
     qs_off = _qs_offset()
     qs = blk[qs_off : qs_off + (d * 3) // 8]
     indices = _unpack_indices_bitplane(qs, d)
     x_hat_rot = c.centroids[indices]
-    x_hat_unit = pi.T @ x_hat_rot
+    x_hat_unit = rot_apply_t(rotation, sigma, pi, x_hat_rot)
     return orig_norm * x_hat_unit
 
 
 def inner_product(q: torch.Tensor, blk: bytes, c: TQPConstants) -> float:
     """Estimate <q, x> given unrotated query q and quantized block.
 
-    Reads layer_idx from block header to select per-layer Pi and S.
+    Reads both layer_idx and rotation from the block's packed header byte.
     """
     d = c.d
     q = q.float()
     orig_norm = float(struct.unpack('<e', blk[0:2])[0])
     res_d     = float(struct.unpack('<e', blk[2:4])[0])
-    layer_idx = blk[4]
+    layer_byte_val = blk[4]
+    layer_idx = extract_layer(layer_byte_val)
+    rotation = extract_rotation(layer_byte_val)
     assert 0 <= layer_idx < MAX_LAYERS
 
+    sigma = c.sigma[layer_idx]
     pi = c.pi[layer_idx]
     s = c.s[layer_idx]
 
@@ -230,8 +316,8 @@ def inner_product(q: torch.Tensor, blk: bytes, c: TQPConstants) -> float:
     signs_off = _signs_offset(d)
     signs = _unpack_signs(blk[signs_off : signs_off + d // 8], d)
 
-    # Stage 1: <q, orig_norm . Pi^T . centroids[idx]> = orig_norm . <Pi.q, centroids[idx]>
-    q_rot = pi @ q
+    # Stage 1: <q, orig_norm . Πᵀ . centroids[idx]> = orig_norm . <Π.q, centroids[idx]>
+    q_rot = rot_apply(rotation, sigma, pi, q)
     term1 = orig_norm * (q_rot * c.centroids[indices]).sum().item()
 
     # Stage 2: QJL in original space

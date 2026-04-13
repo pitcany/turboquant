@@ -3,6 +3,16 @@
 Scope: port `ggml-tq-paper.c` to CUDA for sm_89 (RTX 4090) and sm_120
 (RTX 5090). CPU path stays as the validation oracle and fallback.
 
+> **Branch note (`claude/swap-haar-to-wht-cuda`)**: this document was
+> originally written for the paper-faithful Haar rotation Π stored as a
+> dense 32·d²-float matrix per head-dim. The CPU path has since been
+> swapped to a Randomized Hadamard Transform — see
+> `ggml-tq-paper.c` and the WHT-variant summary in
+> `../BYTE_LAYOUT.md`. The CUDA kernels have now also been ported to the
+> same WHT variant (see the updated "Kernel 1" and "Kernel 2" sections
+> below); sections describing the d×d Π matmul and its constant-memory
+> budget are preserved as historical context for diff-review clarity.
+
 ## Files to add
 
 ```
@@ -17,58 +27,80 @@ Plus wiring:
 - `cuda/ggml-cuda.cu` dispatch table entries for `GGML_TYPE_TQ4P_D128/D256`.
 - `ggml/src/CMakeLists.txt` CUDA target picks up the new `.cu` files.
 
-## Constants in `__constant__` memory
+## Constants in `__constant__` memory (WHT variant)
+
+After the RHT swap, the per-layer rotation data drops from a d×d matrix to
+a d-sized ±1 sign vector, so all 32 layers fit comfortably in the 64 KB
+constant cache (Ada) for both d=128 and d=256. The S matrix is still too
+large for `__constant__` and lives in device global memory.
+
+| Symbol | Size (d=128) | Size (d=256) | Cache |
+|---|---|---|---|
+| `c_tqp_sigma_d{D}[32][D]` | 16 KB | 32 KB | `__constant__`, fits 64K cache |
+| `d_tqp_s_d{D}` (32 × d² floats) | 2 MB | 8 MB | device global + L2 |
+| `c_tqp_centroids_d{D}` | 32 B | 32 B | `__constant__`, trivial |
+| `c_tqp_boundaries_d{D}` | 28 B | 28 B | `__constant__`, trivial |
+
+### Pre-WHT layout (historical)
 
 | Symbol | Size (d=128) | Size (d=256) | Fits const cache? |
 |---|---|---|---|
 | `tqp_pi_d{D}` | 32 KB | 128 KB | d=128 yes (Ada 64K/Blackwell 128K); d=256 spills to L2 |
 | `tqp_s_d{D}` | 32 KB | 128 KB | same |
-| `tqp_centroids_d{D}` | 32 B | 32 B | trivial |
-| `tqp_boundaries_d{D}` | 28 B | 28 B | trivial |
 
-d=256 spilling for Ada is tolerable — access pattern is broadcast-heavy and
-L2 is well-cached. Predicted ~15% throughput loss vs. d=128; still a big
-win over fp16 KV cache.
+d=256 spilling for Ada was tolerable — access pattern is broadcast-heavy and
+L2 is well-cached. Predicted ~15% throughput loss vs. d=128 at the time.
+Under the RHT, this spill disappears entirely on the rotation side.
 
-## Kernel 1: `tqp_quantize_kernel_d{D}`
+## Kernel 1: `tqp_quantize_kernel_d{D}` (WHT variant)
 
-**Grid:** one CTA per block to quantize. 128 or 256 threads per CTA (one
-per coord).
+**Grid:** one CTA per block to quantize. `D` threads per CTA (one per coord).
 
 **Steps per CTA:**
-1. Load 128/256 input floats into shared memory.
-2. Compute `orig_norm` via warp-level sum reduction.
-3. Divide by `orig_norm` into shared memory (`x_unit`).
-4. Compute `x_rot = Π · x_unit`: each thread does one output coord,
-   reading `Π[i, :]` broadcasted from constant cache.
-5. `idx[i] = bucketize(x_rot[i], boundaries)`: each thread computes own idx.
-6. Reconstruct `x_hat_unit = Πᵀ · centroids[idx]`: each thread computes one
-   output coord, `Σ_j Π[j, i] · centroids[idx[j]]` — reads `idx[]` and
-   `Π[:, i]` strided, one fused multiply-add per j.
-7. `residual[i] = x_unit[i] - x_hat_unit[i]`, tree-reduce `‖residual‖`.
-8. `proj = S · residual`: same shape as step 4, constant cache broadcast.
-9. Warp-ballot for sign packing; warp 0 writes 4 `uint32_t`s (or 8 for
-   d=256) of `qjl_signs`.
-10. Warp 0 writes `orig_norm`, `res_d` (fp16).
-11. Bitplane-pack indices via warp shuffles: for each of 3 bit-planes,
-    `__ballot_sync` collects 8 bits per 32-thread group.
+1. Load `D` input floats into shared memory.
+2. Compute `orig_norm` via a serial reduction in thread 0 (fine for this
+   small `D`; a warp-level reduction would also work).
+3. `x_unit[tid] = x[tid] / orig_norm`, kept in *both* shared memory and a
+   per-thread register (the register survives the destructive WHTs).
+4. Forward RHT: `smem[tid] = σ[tid] · x_unit[tid]`, then in-place FWHT on
+   `smem` (`log₂(D)` butterfly steps, `log₂(D)` `__syncthreads`), then
+   `x_rot[tid] = smem[tid] / √D`.
+5. `idx[tid] = bucketize(x_rot[tid], boundaries)`.
+6. Inverse RHT: `smem[tid] = centroids[idx[tid]]`, in-place FWHT, then
+   `x_hat_unit[tid] = σ[tid] · smem[tid] / √D`.
+7. `residual[tid] = x_unit_reg - x_hat_unit`, written back to `smem`;
+   `‖residual‖` reduced in thread 0.
+8. `proj[tid] = S[tid, :] · residual`: d-wide FMA loop, S read from
+   device memory via `__ldg`.
+9. Warp-ballot for sign packing; lane 0 of each warp writes four
+   `uint32_t`s (or eight for d=256) of `qjl_signs`.
+10. Thread 0 writes `orig_norm`, `res_d` (fp16).
+11. Bitplane-pack indices via `__ballot_sync` on the low/mid/high bits of
+    `idx` — one warp contributes three bytes per 8 coords.
 
-**Register pressure:** mostly `float` accumulators; `int8` idx and
-`float` centroid values. ≤ 48 regs per thread at d=128 — high occupancy
-(64 warps/SM on Blackwell, 48 on Ada).
+**Register pressure:** one extra `float` (the persistent `x_unit_reg` +
+the per-thread `σ[tid]` slot) vs. the pre-WHT kernel. Both are spills of
+values that used to sit in constant cache; occupancy is effectively
+unchanged.
 
-## Kernel 2: `tqp_prepare_query_kernel_d{D}`
+**Flop count:** `O(D log D)` for the two WHTs (a big win over `O(D²)`
+GEMV). The `S · residual` matmul is still `O(D²)` and dominates.
 
-**Grid:** one CTA per (layer × query token). 128/256 threads.
+## Kernel 2: `tqp_prepare_query_kernel_d{D}` (WHT variant)
+
+**Grid:** one CTA per (layer × query token). `D` threads.
 
 **Steps:**
-1. Load `q` into shared memory.
-2. Each thread computes `Sq[i] = Σ_j S[i, j] · q[j]`, `i = threadIdx.x`.
-3. Write to a per-layer `Sq` buffer in global memory, indexed by layer ×
-   token. Max d×sizeof(float) bytes per entry = 1 KB at d=256.
+1. Load `q` into shared memory; each thread also holds its own `q[tid]`
+   in a register.
+2. `Sq[tid] = Σ_j S[tid, j] · q[j]` — unchanged from pre-WHT path.
+3. After the S matmul finishes, reuse `q_smem` for the RHT:
+   `q_smem[tid] = σ[tid] · q[tid]`, in-place FWHT, then
+   `q_rot[tid] = q_smem[tid] / √D`.
+4. Write `Sq` and `q_rot` to their per-(layer × token) global buffers.
 
-Called once per token per layer. Total bytes added to KV cache: 1 KB/token
-at d=256, irrelevant next to the 132 B/head × N_heads of quant data.
+Called once per token per layer. `q_rot` is the same size as `Sq`
+(`D × sizeof(float)` per token), well under 1 KB at d=256.
 
 ## Kernel 3: `tqp_vec_dot_kernel_d{D}`
 
@@ -94,17 +126,22 @@ at N > 100.
 
 ## Performance targets
 
-Measured on `TQ3_0` (the fork's existing type) as baseline:
+Measured on `TQ3_0` (the fork's existing type) as baseline. Pre-WHT
+numbers (from the original plan) kept for diff context; WHT numbers are
+rough estimates pending on-hardware measurement.
 
 | Config | 4090 decode | 5090 decode |
 |---|---|---|
 | TQ3_0 (baseline) | 100% | 100% |
-| TQ4P_D128 (this plan) | ~85% | ~90% |
-| TQ4P_D256 (this plan) | ~70% | ~80% |
+| TQ4P_D128, pre-WHT (Haar Π matmul) | ~85% | ~90% |
+| TQ4P_D256, pre-WHT (Haar Π matmul) | ~70% | ~80% |
+| TQ4P_D128, WHT (this commit) | ≥ pre-WHT; bounded below by S matmul | same |
+| TQ4P_D256, WHT (this commit) | notably faster than pre-WHT at d=256 (no Π const-cache spill) | same |
 
-The 4090/5090 gap widens at d=256 because Blackwell's 128 KB constant
-cache fits both `Π` and `S` at d=256 (128+128 KB); Ada's 64 KB cache
-spills to L2.
+The rotation side is now `O(D log D)` instead of `O(D²)`, but the overall
+kernel is bounded below by the remaining `S · residual` / `S · q`
+matmuls, which are unchanged. Expect a solid win at d=256 where Π used
+to spill the Ada constant cache; modest win at d=128.
 
 ## Build integration
 

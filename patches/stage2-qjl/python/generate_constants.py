@@ -1,17 +1,26 @@
 """
-Generate TurboQuant paper-faithful constants for the llama.cpp C port.
+Generate TurboQuant(-ish) constants for the llama.cpp C port.
 
 For each supported head_dim d, emits:
     tqp_centroids_d{d}.h      — 8 Lloyd-Max centroids + 7 boundaries (fp32)
-    tqp_constants_d{d}.h      — Per-layer Π and S matrices (32 layers × d×d)
+    tqp_constants_d{d}.h      — Per-layer sign vector σ (32 × d) for the
+                                 RHT rotation, Π matrix (32 × d × d) for
+                                 the Haar rotation, and Gaussian QJL
+                                 matrix S (32 × d × d).
 
 Also writes a torch state dict (tqp_constants.pt) used by the Python reference
 and byte-exact equality tests so they use the *same* bits as the C headers.
 
-Seeds match turboquant.py convention, per-layer:
-    Π_i: seed = 42 + i   (layer index i in [0, 31])
-    S_i: seed = 43 + i   (which is Π_seed + 1, matching TurboQuantProd)
-    centroids: deterministic Lloyd-Max solver (no seed needed, shared across layers)
+Both rotations are emitted because the runtime picks per-block: a bit in
+each block's `layer_idx` header byte selects TQP_ROT_WHT vs TQP_ROT_HAAR.
+Users who only ever use one rotation still pay the generation / storage
+cost for both, but it's small (a few MB per head_dim in the .h files).
+
+Seeds, per-layer (matching turboquant.py::TurboQuantProd(seed=42+i)):
+    σ_i: seed = 42 + i          (Rademacher sign vector for WHT)
+    Π_i: seed = 42 + i          (Haar orthogonal rotation)
+    S_i: seed = 43 + i          (Gaussian QJL matrix)
+    centroids: deterministic Lloyd-Max solver (shared across layers).
 
 Run:
     python3 generate_constants.py --out-c ../c --out-pt ../c
@@ -38,8 +47,17 @@ from turboquant import generate_qjl_matrix, generate_rotation_matrix
 SUPPORTED_DIMS = (128, 256)
 BITS = 3                # Stage 1 Lloyd-Max bits for TQ4P_0
 MAX_LAYERS = 32
-ROT_SEED_BASE = 42      # Π_i seed = ROT_SEED_BASE + i
+ROT_SEED_BASE = 42      # σ_i seed = ROT_SEED_BASE + i
 QJL_SEED_BASE = 43      # S_i seed = QJL_SEED_BASE + i
+
+
+def generate_sign_vector(d: int, seed: int) -> torch.Tensor:
+    """Per-layer Rademacher sign vector σ ∈ {±1}^d for the Randomized
+    Hadamard Transform: Π = (1/√d) · H · diag(σ)."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    bits = torch.randint(0, 2, (d,), generator=gen)
+    return (2.0 * bits.to(torch.float32) - 1.0)
 
 
 def emit_float_array(name: str, values: torch.Tensor) -> str:
@@ -54,7 +72,7 @@ def emit_float_array(name: str, values: torch.Tensor) -> str:
     return "\n".join(lines)
 
 
-def emit_float_3d_array(name: str, layers: list[torch.Tensor], d: int) -> str:
+def emit_float_3d_array(name: str, layers: list[torch.Tensor], d: int, seed_base: int) -> str:
     """Emit a 3D float array [MAX_LAYERS][d*d] as a C static const initializer."""
     n_layers = len(layers)
     inner_size = d * d
@@ -62,11 +80,28 @@ def emit_float_3d_array(name: str, layers: list[torch.Tensor], d: int) -> str:
     for li, mat in enumerate(layers):
         flat = mat.flatten().tolist()
         assert len(flat) == inner_size
-        lines.append(f"    // layer {li} (seed={ROT_SEED_BASE + li if 'PI' in name else QJL_SEED_BASE + li})")
+        lines.append(f"    // layer {li} (seed={seed_base + li})")
         lines.append("    {")
         for i in range(0, inner_size, 8):
             chunk = flat[i : i + 8]
             lines.append("        " + ", ".join(f"{v:+.9e}f" for v in chunk) + ",")
+        lines.append("    },")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def emit_sign_2d_array(name: str, layers: list[torch.Tensor], d: int, seed_base: int) -> str:
+    """Emit a 2D ±1 float array [MAX_LAYERS][d] as a C static const initializer."""
+    n_layers = len(layers)
+    lines = [f"static const float {name}[{n_layers}][{d}] = {{"]
+    for li, sig in enumerate(layers):
+        flat = sig.flatten().tolist()
+        assert len(flat) == d
+        lines.append(f"    // layer {li} (seed={seed_base + li})")
+        lines.append("    {")
+        for i in range(0, d, 16):
+            chunk = flat[i : i + 16]
+            lines.append("        " + ", ".join(f"{int(v):+d}.0f" for v in chunk) + ",")
         lines.append("    },")
     lines.append("};")
     return "\n".join(lines)
@@ -97,35 +132,47 @@ def write_centroids_header(d: int, out_c: pathlib.Path) -> LloydMaxCodebook:
 
 def write_constants_header(
     d: int,
+    sigma_layers: list[torch.Tensor],
     pi_layers: list[torch.Tensor],
     s_layers: list[torch.Tensor],
     out_c: pathlib.Path,
 ) -> None:
-    """Per-layer Π and S matrices for head_dim=d, stored fp32 row-major.
+    """Per-layer σ (RHT), Π (Haar) and S (QJL) for head_dim=d.
 
-    Output: tqp_constants_d{d}.h with 3D arrays [MAX_LAYERS][d*d].
+    Output: tqp_constants_d{d}.h with TQP_SIGMA_D{D}[32][d] (±1 fp32),
+    TQP_PI_D{D}[32][d*d] (fp32, row-major) and TQP_S_D{D}[32][d*d].
     """
+    assert len(sigma_layers) == MAX_LAYERS
     assert len(pi_layers) == MAX_LAYERS
     assert len(s_layers) == MAX_LAYERS
-    for mat in pi_layers + s_layers:
+    for sig in sigma_layers:
+        assert sig.shape == (d,)
+    for mat in pi_layers:
+        assert mat.shape == (d, d)
+    for mat in s_layers:
         assert mat.shape == (d, d)
 
     path = out_c / f"tqp_constants_d{d}.h"
     content = [
-        f"// TQ4P per-layer rotation Π and QJL matrix S for head_dim={d}.",
-        f"// {MAX_LAYERS} layers, Π_i seed={ROT_SEED_BASE}+i, S_i seed={QJL_SEED_BASE}+i.",
-        f"// Stored fp32 row-major. Generated by generate_constants.py.",
+        f"// TQ4P per-layer σ (WHT), Π (Haar) and S (QJL) for head_dim={d}.",
+        f"// {MAX_LAYERS} layers, σ_i and Π_i seed={ROT_SEED_BASE}+i, S_i seed={QJL_SEED_BASE}+i.",
+        f"// Rotation used by a given block is selected by the high bit of",
+        f"// the block's layer_idx byte (TQP_ROT_WHT=0, TQP_ROT_HAAR=1).",
+        f"// Stored fp32. Generated by generate_constants.py.",
         "",
         f"#ifndef TQP_CONSTANTS_D{d}_H",
         f"#define TQP_CONSTANTS_D{d}_H",
         "",
         f"#define TQP_MAX_LAYERS {MAX_LAYERS}",
         "",
-        f"// Π[layer][d*d]: row-major. Rotated x = Π_layer · x_unit.",
-        emit_float_3d_array(f"TQP_PI_D{d}", pi_layers, d),
+        f"// σ[layer][d]: ±1 per coord. x_rot = (1/√d) · WHT(diag(σ_layer) · x).",
+        emit_sign_2d_array(f"TQP_SIGMA_D{d}", sigma_layers, d, ROT_SEED_BASE),
+        "",
+        f"// Π[layer][d*d]: row-major. Haar random orthogonal. x_rot = Π_layer · x.",
+        emit_float_3d_array(f"TQP_PI_D{d}", pi_layers, d, ROT_SEED_BASE),
         "",
         f"// S[layer][d*d]: row-major. QJL projection p = S_layer · residual.",
-        emit_float_3d_array(f"TQP_S_D{d}", s_layers, d),
+        emit_float_3d_array(f"TQP_S_D{d}", s_layers, d, QJL_SEED_BASE),
         "",
         f"#endif  // TQP_CONSTANTS_D{d}_H",
         "",
@@ -151,23 +198,27 @@ def main() -> None:
         state[f"centroids_d{d}"] = cb.centroids
         state[f"boundaries_d{d}"] = cb.boundaries
 
+        sigma_layers: list[torch.Tensor] = []
         pi_layers: list[torch.Tensor] = []
         s_layers: list[torch.Tensor] = []
 
         for layer_idx in range(MAX_LAYERS):
             rot_seed = ROT_SEED_BASE + layer_idx
             qjl_seed = QJL_SEED_BASE + layer_idx
+            sigma = generate_sign_vector(d, seed=rot_seed)
             pi = generate_rotation_matrix(d, seed=rot_seed)
             s = generate_qjl_matrix(d, m=d, seed=qjl_seed)
+            sigma_layers.append(sigma)
             pi_layers.append(pi)
             s_layers.append(s)
 
-        print(f"[+] d={d}: {MAX_LAYERS} per-layer Π (seeds {ROT_SEED_BASE}..{ROT_SEED_BASE + MAX_LAYERS - 1}), "
+        print(f"[+] d={d}: {MAX_LAYERS} per-layer σ + Π (seeds {ROT_SEED_BASE}..{ROT_SEED_BASE + MAX_LAYERS - 1}), "
               f"S (seeds {QJL_SEED_BASE}..{QJL_SEED_BASE + MAX_LAYERS - 1})")
 
-        write_constants_header(d, pi_layers, s_layers, args.out_c)
+        write_constants_header(d, sigma_layers, pi_layers, s_layers, args.out_c)
 
-        # Stack into (MAX_LAYERS, d, d) tensors for the .pt file
+        # Stack into (MAX_LAYERS, d) / (MAX_LAYERS, d, d) for the .pt file
+        state[f"sigma_d{d}"] = torch.stack(sigma_layers)
         state[f"pi_d{d}"] = torch.stack(pi_layers)
         state[f"s_d{d}"] = torch.stack(s_layers)
 

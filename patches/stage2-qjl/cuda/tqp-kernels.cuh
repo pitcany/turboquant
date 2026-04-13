@@ -7,9 +7,26 @@
 #define QK_TQ4P_D128 128
 #define QK_TQ4P_D256 256
 
+// Must match patches/stage2-qjl/c/ggml-tq-paper.h
+#define TQP_ROT_WHT  0u
+#define TQP_ROT_HAAR 1u
+#define TQP_LAYER_BYTE(layer, rot) ((uint8_t)((((uint32_t)(rot) & 1u) << 7) | ((uint32_t)(layer) & 0x1fu)))
+#define TQP_EXTRACT_LAYER(byte)    ((uint8_t)((byte) & 0x1fu))
+#define TQP_EXTRACT_ROT(byte)      ((uint8_t)(((byte) >> 7) & 1u))
+
+// Block layout matches the CPU path (patches/stage2-qjl/c/ggml-tq-paper.h):
+//   offset 0..1  orig_norm (fp16)
+//   offset 2..3  res_d     (fp16)
+//   offset 4     layer_idx (uint8) — selects per-layer σ and S
+//   offset 5..   qs        (3-bit bitplane-packed indices)
+//   then         qjl_signs (1-bit per coord)
+// pragma pack(1) so the odd total sizes (69, 133) match CPU; without it
+// the trailing uint16_t on the outer struct would force 2-byte alignment.
+#pragma pack(push, 1)
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;
     uint8_t  qs[48];
     uint8_t  qjl_signs[16];
 } block_tq4p_d128;
@@ -17,12 +34,14 @@ typedef struct {
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;
     uint8_t  qs[96];
     uint8_t  qjl_signs[32];
 } block_tq4p_d256;
+#pragma pack(pop)
 
-static_assert(sizeof(block_tq4p_d128) == 68, "block_tq4p_d128 size");
-static_assert(sizeof(block_tq4p_d256) == 132, "block_tq4p_d256 size");
+static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
+static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 
 static constexpr float TQP_SQRT_PI_OVER_2 = 1.2533141373155001f;
 
@@ -130,4 +149,25 @@ __device__ static inline uint8_t tqp_unpack_index_bitplane(const uint8_t * qs, i
 __device__ static inline float tqp_unpack_sign_pm1(const uint8_t * signs, int elem) {
     const uint8_t bit = (uint8_t)((signs[elem >> 3] >> (elem & 7)) & 1u);
     return bit ? -1.0f : 1.0f;
+}
+
+// In-place Fast Walsh-Hadamard Transform on `smem[0..D-1]`, unnormalized
+// (caller must multiply by 1/√d for the orthogonal version).
+//
+// Requires: blockDim.x == D, D is a power of 2, one thread per element.
+// Thread `tid` owns `smem[tid]` throughout. Each butterfly stage combines
+// pairs (i, i^h) with a ±1 sum; low-index thread writes (a+b), high-index
+// thread writes (b-a) where a=smem[tid] and b=smem[tid^h].
+template<int D>
+__device__ static inline void tqp_wht_shared(float * smem) {
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int h = 1; h < D; h <<= 1) {
+        __syncthreads();
+        const float a = smem[tid];
+        const float b = smem[tid ^ h];
+        __syncthreads();
+        smem[tid] = ((tid & h) == 0) ? (a + b) : (b - a);
+    }
+    __syncthreads();
 }

@@ -1,5 +1,15 @@
 # CUDA Follow-up for TQ4P — Implementation Plan
 
+> **⚠ Superseded by the WHT variant.** The kernels in this directory no
+> longer implement the paper-faithful Haar Π GEMV described below. They
+> implement the Randomized Hadamard Transform variant, matching the CPU
+> path in `../c/ggml-tq-paper.c`. See `PLAN.md` for the updated kernel
+> shapes (Kernel 1 and Kernel 2). This document is kept verbatim because
+> its kernel-numbering table, launch config matrix, build-integration
+> steps, and risk mitigations are still useful for the fork integration
+> work that hasn't landed yet; the algorithmic pieces about Π/S matmuls
+> should be read as *pre-WHT* historical design.
+
 ## Context
 
 Port the CPU reference TQ4P quantization (`ggml-tq-paper.c`) to CUDA for RTX 4090 (sm_89, Ada Lovelace) and RTX 5090 (sm_120, Blackwell). The CPU path stays as correctness oracle and fallback. TQ4P implements Zandieh et al.'s two-stage algorithm: Stage 1 = Haar rotation Π + 3-bit Lloyd-Max quantization; Stage 2 = Gaussian JL projection S + 1-bit sign packing. Total 4.25 bpw (d=128) / 4.13 bpw (d=256).
