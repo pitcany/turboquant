@@ -6,13 +6,12 @@
 //
 // This file is deliberately simple: no SIMD, no unrolling, no vectorization.
 // Correctness first; CUDA kernels come in a follow-up commit where perf
-// matters. On a single core this implementation is ~5-10× slower than the
+// matters. On a single core this implementation is ~5-10x slower than the
 // fork's existing TQ3_0 vec_dot.
 //
-// The rotation matrix Π and QJL projection matrix S are stored as fp32 in
-// the generated headers, which keeps byte-exact agreement with the Python
-// oracle. A later optimization may store them as fp16 to halve constant
-// memory footprint, at the cost of loosening the byte-exact test.
+// Per-layer rotation Π_i and QJL projection S_i are stored as fp32 in the
+// generated headers, indexed by layer_idx (seeds: Π_i=42+i, S_i=43+i).
+// This keeps byte-exact agreement with turboquant.py::TurboQuantProd(seed=42+i).
 
 #include "ggml-tq-paper.h"
 
@@ -84,7 +83,7 @@ static inline float tqp_fp16_to_fp32(uint16_t h) {
 
 // ---------- bit pack / unpack ----------
 
-// Pack 8 × 3-bit values into 3 bytes using the bitplane layout:
+// Pack 8 x 3-bit values into 3 bytes using the bitplane layout:
 //   byte[0].bit_i = (v_i >> 0) & 1
 //   byte[1].bit_i = (v_i >> 1) & 1
 //   byte[2].bit_i = (v_i >> 2) & 1
@@ -122,7 +121,7 @@ static inline void tqp_unpack_indices_bitplane(const uint8_t * in, uint8_t * idx
 // For bits=3 this is always 7 comparisons — short enough not to warrant
 // binary search. Matches torch.bucketize exactly: returns the number of
 // boundaries strictly less than x (i.e., the left-most bin whose left edge
-// is ≥ x).
+// is >= x).
 
 static inline uint8_t tqp_bucketize_d3(float x, const float * bounds) {
     uint8_t b = 0;
@@ -140,8 +139,8 @@ static inline uint8_t tqp_bucketize_d3(float x, const float * bounds) {
 
 static void tqp_quantize_block(
         int d,
-        const float * pi,         // (d × d) row-major
-        const float * s,          // (d × d) row-major
+        const float * pi,         // (d x d) row-major, per-layer
+        const float * s,          // (d x d) row-major, per-layer
         const float * centroids,  // (8,)
         const float * bounds,     // (7,)
         const float * x,          // (d,) input
@@ -150,7 +149,7 @@ static void tqp_quantize_block(
         float * res_d_out,        // scalar output
         float * orig_norm_out)    // scalar output
 {
-    // orig_norm = ‖x‖
+    // orig_norm = ||x||
     float sq = 0.0f;
     for (int i = 0; i < d; ++i) sq += x[i] * x[i];
     float orig_norm = sqrtf(sq);
@@ -161,7 +160,7 @@ static void tqp_quantize_block(
     float x_unit[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) x_unit[i] = x[i] * inv_norm;
 
-    // x_rot = Π · x_unit
+    // x_rot = Pi . x_unit
     float x_rot[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) {
         float acc = 0.0f;
@@ -174,13 +173,13 @@ static void tqp_quantize_block(
     uint8_t idx[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) idx[i] = tqp_bucketize_d3(x_rot[i], bounds);
 
-    // x_hat_unit = Π^T · centroids[idx]
+    // x_hat_unit = Pi^T . centroids[idx]
     float x_hat_unit[QK_TQ4P_D256];
     for (int j = 0; j < d; ++j) x_hat_unit[j] = 0.0f;
     for (int i = 0; i < d; ++i) {
         float c = centroids[idx[i]];
         const float * pi_row = pi + (size_t)i * d;
-        for (int j = 0; j < d; ++j) x_hat_unit[j] += pi_row[j] * c;   // Π^T · c = Σ_i Π[i][:] · c[i]
+        for (int j = 0; j < d; ++j) x_hat_unit[j] += pi_row[j] * c;   // Pi^T . c = sum_i Pi[i][:] . c[i]
     }
 
     // residual = x_unit - x_hat_unit
@@ -192,7 +191,7 @@ static void tqp_quantize_block(
     }
     float res_d = sqrtf(r_sq);
 
-    // QJL signs: proj = S · residual; sign bit = (proj < 0)
+    // QJL signs: proj = S . residual; sign bit = (proj < 0)
     uint8_t signs[QK_TQ4P_D256 / 8];
     memset(signs, 0, (size_t)(d / 8));
     for (int i = 0; i < d; ++i) {
@@ -220,7 +219,7 @@ static void tqp_dequantize_block(
     uint8_t idx[QK_TQ4P_D256];
     tqp_unpack_indices_bitplane(qs, idx, d / 8);
 
-    // x_hat_unit = Π^T · centroids[idx] (same as quantize path)
+    // x_hat_unit = Pi^T . centroids[idx] (same as quantize path)
     float x_hat_unit[QK_TQ4P_D256];
     for (int j = 0; j < d; ++j) x_hat_unit[j] = 0.0f;
     for (int i = 0; i < d; ++i) {
@@ -255,9 +254,7 @@ static float tqp_vec_dot_block(
         float orig_norm,
         float res_d)
 {
-    // Stage 1: term1 = orig_norm · Σ_i (Π·q)[i] · centroids[idx[i]]
-    //                = orig_norm · ⟨q, Π^T · centroids[idx]⟩
-    // We compute via q_rot = Π · q.
+    // Stage 1: term1 = orig_norm . sum_i (Pi.q)[i] . centroids[idx[i]]
     float q_rot[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) {
         float acc = 0.0f;
@@ -273,80 +270,94 @@ static float tqp_vec_dot_block(
     for (int i = 0; i < d; ++i) term1 += q_rot[i] * centroids[idx[i]];
     term1 *= orig_norm;
 
-    // Stage 2: term2 = orig_norm · res_d · √(π/2)/d · Σ_i Sq[i] · sign(residual projection)
-    //   sign bit: 1 → -1, 0 → +1
+    // Stage 2: term2 = orig_norm . res_d . sqrt(pi/2)/d . sum_i Sq[i] . sign(residual projection)
     float term2 = 0.0f;
     for (int i = 0; i < d; ++i) {
         float sign_val = (signs[i / 8] & (1u << (i % 8))) ? -1.0f : 1.0f;
         term2 += Sq[i] * sign_val;
     }
-    const float sqrt_pi_over_2 = 1.2533141373155001f;  // √(π/2)
+    const float sqrt_pi_over_2 = 1.2533141373155001f;  // sqrt(pi/2)
     term2 *= orig_norm * res_d * sqrt_pi_over_2 / (float)d;
 
     return term1 + term2;
 }
 
 // ---------- per-d public entry points ----------
+//
+// The macros index into the per-layer 3D constant arrays:
+//   PI_ARR[layer_idx]  = pointer to (d*d) floats for layer's Pi
+//   S_ARR[layer_idx]   = pointer to (d*d) floats for layer's S
 
-#define TQP_DEFINE_ROW_FUNCS(D, PI, S, CENTROIDS, BOUNDS)                                 \
-    void ggml_quantize_row_tq4p_d##D(const float * x, block_tq4p_d##D * y, int64_t k) {   \
-        assert(k % D == 0);                                                               \
-        const int64_t nb = k / D;                                                         \
-        for (int64_t b = 0; b < nb; ++b) {                                                \
-            float res_d, orig_norm;                                                       \
-            tqp_quantize_block(D, PI, S, CENTROIDS, BOUNDS,                               \
-                               x + b * D, y[b].qs, y[b].qjl_signs,                        \
-                               &res_d, &orig_norm);                                       \
-            y[b].orig_norm = tqp_fp32_to_fp16(orig_norm);                                 \
-            y[b].res_d     = tqp_fp32_to_fp16(res_d);                                     \
-        }                                                                                 \
-    }                                                                                     \
-                                                                                          \
-    void ggml_dequantize_row_tq4p_d##D(const block_tq4p_d##D * x, float * y, int64_t k) { \
-        assert(k % D == 0);                                                               \
-        const int64_t nb = k / D;                                                         \
-        for (int64_t b = 0; b < nb; ++b) {                                                \
-            float orig_norm = tqp_fp16_to_fp32(x[b].orig_norm);                           \
-            tqp_dequantize_block(D, PI, CENTROIDS, orig_norm, x[b].qs, y + b * D);        \
-        }                                                                                 \
-    }                                                                                     \
-                                                                                          \
-    void ggml_tqp_prepare_query_d##D(const float * q, float * Sq) {                       \
-        tqp_prepare_query(D, S, q, Sq);                                                   \
-    }                                                                                     \
-                                                                                          \
-    float ggml_tqp_vec_dot_block_d##D(const float * q, const float * Sq,                  \
-                                       const block_tq4p_d##D * blk) {                     \
-        return tqp_vec_dot_block(D, PI, CENTROIDS, q, Sq, blk->qs, blk->qjl_signs,        \
-                                 tqp_fp16_to_fp32(blk->orig_norm),                        \
-                                 tqp_fp16_to_fp32(blk->res_d));                           \
+#define TQP_DEFINE_ROW_FUNCS(D, PI_ARR, S_ARR, CENTROIDS, BOUNDS)                             \
+    void ggml_quantize_row_tq4p_d##D(const float * x, block_tq4p_d##D * y,                    \
+                                     int64_t k, uint8_t layer_idx) {                           \
+        assert(k % D == 0);                                                                   \
+        assert(layer_idx < TQP_MAX_LAYERS);                                                   \
+        const float * pi = PI_ARR[layer_idx];                                                 \
+        const float * s  = S_ARR[layer_idx];                                                  \
+        const int64_t nb = k / D;                                                             \
+        for (int64_t b = 0; b < nb; ++b) {                                                    \
+            float res_d, orig_norm;                                                           \
+            tqp_quantize_block(D, pi, s, CENTROIDS, BOUNDS,                                   \
+                               x + b * D, y[b].qs, y[b].qjl_signs,                            \
+                               &res_d, &orig_norm);                                           \
+            y[b].orig_norm = tqp_fp32_to_fp16(orig_norm);                                     \
+            y[b].res_d     = tqp_fp32_to_fp16(res_d);                                         \
+            y[b].layer_idx = layer_idx;                                                       \
+        }                                                                                     \
+    }                                                                                         \
+                                                                                              \
+    void ggml_dequantize_row_tq4p_d##D(const block_tq4p_d##D * x, float * y, int64_t k) {     \
+        assert(k % D == 0);                                                                   \
+        const int64_t nb = k / D;                                                             \
+        for (int64_t b = 0; b < nb; ++b) {                                                    \
+            assert(x[b].layer_idx < TQP_MAX_LAYERS);                                         \
+            const float * pi = PI_ARR[x[b].layer_idx];                                       \
+            float orig_norm = tqp_fp16_to_fp32(x[b].orig_norm);                               \
+            tqp_dequantize_block(D, pi, CENTROIDS, orig_norm, x[b].qs, y + b * D);            \
+        }                                                                                     \
+    }                                                                                         \
+                                                                                              \
+    void ggml_tqp_prepare_query_d##D(const float * q, float * Sq, uint8_t layer_idx) {        \
+        assert(layer_idx < TQP_MAX_LAYERS);                                                   \
+        tqp_prepare_query(D, S_ARR[layer_idx], q, Sq);                                        \
+    }                                                                                         \
+                                                                                              \
+    float ggml_tqp_vec_dot_block_d##D(const float * q, const float * Sq,                      \
+                                       const block_tq4p_d##D * blk) {                         \
+        assert(blk->layer_idx < TQP_MAX_LAYERS);                                             \
+        return tqp_vec_dot_block(D, PI_ARR[blk->layer_idx], CENTROIDS, q, Sq,                 \
+                                 blk->qs, blk->qjl_signs,                                    \
+                                 tqp_fp16_to_fp32(blk->orig_norm),                            \
+                                 tqp_fp16_to_fp32(blk->res_d));                               \
     }
 
 TQP_DEFINE_ROW_FUNCS(128, TQP_PI_D128, TQP_S_D128, TQP_CENTROIDS_D128, TQP_BOUNDARIES_D128)
 TQP_DEFINE_ROW_FUNCS(256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUNDARIES_D256)
 
 // ---------- ggml dispatch wrappers ----------
+//
+// The vec_dot wrappers read layer_idx from the first K-block's header.
+// In a well-formed attention pass, all blocks in a row share the same layer.
 
-#define TQP_DEFINE_VEC_DOT(D)                                                              \
-    void ggml_vec_dot_tq4p_d##D##_f32(int n, float * s, size_t bs,                         \
-                                      const void * vx, size_t bx,                          \
-                                      const void * vy, size_t by, int nrc) {               \
-        assert(nrc == 1);                                                                  \
-        assert(n % D == 0);                                                                \
-        (void)bs; (void)bx; (void)by;                                                      \
-        /* ggml convention: vx = quantized blocks (K side), vy = converted query           \
-         * in vec_dot_type (here GGML_TYPE_F32). */                                        \
-        const block_tq4p_d##D * blk = (const block_tq4p_d##D *)vx;                         \
-        const float * q             = (const float *)vy;                                   \
-        const int64_t nb = n / D;                                                          \
-                                                                                           \
-        float acc = 0.0f;                                                                  \
-        for (int64_t b = 0; b < nb; ++b) {                                                 \
-            float Sq[D];                                                                   \
-            ggml_tqp_prepare_query_d##D(q + b * D, Sq);                                    \
-            acc += ggml_tqp_vec_dot_block_d##D(q + b * D, Sq, &blk[b]);                    \
-        }                                                                                  \
-        *s = acc;                                                                          \
+#define TQP_DEFINE_VEC_DOT(D)                                                                  \
+    void ggml_vec_dot_tq4p_d##D##_f32(int n, float * s, size_t bs,                             \
+                                      const void * vx, size_t bx,                              \
+                                      const void * vy, size_t by, int nrc) {                   \
+        assert(nrc == 1);                                                                      \
+        assert(n % D == 0);                                                                    \
+        (void)bs; (void)bx; (void)by;                                                          \
+        const block_tq4p_d##D * blk = (const block_tq4p_d##D *)vx;                             \
+        const float * q             = (const float *)vy;                                       \
+        const int64_t nb = n / D;                                                              \
+                                                                                               \
+        float acc = 0.0f;                                                                      \
+        for (int64_t b = 0; b < nb; ++b) {                                                     \
+            float Sq[D];                                                                       \
+            ggml_tqp_prepare_query_d##D(q + b * D, Sq, blk[b].layer_idx);                      \
+            acc += ggml_tqp_vec_dot_block_d##D(q + b * D, Sq, &blk[b]);                        \
+        }                                                                                      \
+        *s = acc;                                                                              \
     }
 
 TQP_DEFINE_VEC_DOT(128)
