@@ -7,22 +7,28 @@
 #define QK_TQ4P_D128 128
 #define QK_TQ4P_D256 256
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;       // layer index [0, 31]; selects per-layer Π and S
     uint8_t  qs[48];
     uint8_t  qjl_signs[16];
 } block_tq4p_d128;
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint16_t orig_norm;
     uint16_t res_d;
+    uint8_t  layer_idx;       // layer index [0, 31]; selects per-layer Π and S
     uint8_t  qs[96];
     uint8_t  qjl_signs[32];
 } block_tq4p_d256;
 
-static_assert(sizeof(block_tq4p_d128) == 68, "block_tq4p_d128 size");
-static_assert(sizeof(block_tq4p_d256) == 132, "block_tq4p_d256 size");
+static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
+static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
+
+// Must match TQP_MAX_LAYERS in tqp_constants_d{128,256}.h.
+#define TQP_MAX_LAYERS 32
+#define TQP_LAYER_WRAP(li) ((uint8_t)((li) % TQP_MAX_LAYERS))
 
 static constexpr float TQP_SQRT_PI_OVER_2 = 1.2533141373155001f;
 

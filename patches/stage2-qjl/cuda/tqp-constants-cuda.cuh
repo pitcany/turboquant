@@ -21,6 +21,27 @@ inline float * d_tqp_s_d128  = nullptr;
 inline float * d_tqp_pi_d256 = nullptr;
 inline float * d_tqp_s_d256  = nullptr;
 
+// Per-layer device-pointer accessors. The full 3D array (32 × d × d) is
+// uploaded once in tqp_cuda_init; these return the base of the `layer_idx`-th
+// (d × d) slab. `layer_idx` is wrapped modulo TQP_MAX_LAYERS to mirror the
+// CPU's `tqp_layer_idx()` helper.
+__host__ __device__ static inline const float *
+tqp_pi_d128_for_layer(uint8_t layer_idx) {
+    return d_tqp_pi_d128 + (size_t)TQP_LAYER_WRAP(layer_idx) * QK_TQ4P_D128 * QK_TQ4P_D128;
+}
+__host__ __device__ static inline const float *
+tqp_s_d128_for_layer(uint8_t layer_idx) {
+    return d_tqp_s_d128 + (size_t)TQP_LAYER_WRAP(layer_idx) * QK_TQ4P_D128 * QK_TQ4P_D128;
+}
+__host__ __device__ static inline const float *
+tqp_pi_d256_for_layer(uint8_t layer_idx) {
+    return d_tqp_pi_d256 + (size_t)TQP_LAYER_WRAP(layer_idx) * QK_TQ4P_D256 * QK_TQ4P_D256;
+}
+__host__ __device__ static inline const float *
+tqp_s_d256_for_layer(uint8_t layer_idx) {
+    return d_tqp_s_d256 + (size_t)TQP_LAYER_WRAP(layer_idx) * QK_TQ4P_D256 * QK_TQ4P_D256;
+}
+
 inline bool g_tqp_cuda_init_d128 = false;
 inline bool g_tqp_cuda_init_d256 = false;
 static bool g_tqp_cuda_constants_init_d128 = false;
