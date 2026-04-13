@@ -129,11 +129,13 @@ load the same bits the C headers contain. `c/libggml_tq_paper.so` and
   (`apply_go_plumbing.sh`) + CUDA dispatch hook. `OLLAMA_KV_CACHE_TYPE=tq4p_d128`
   and `OLLAMA_KV_CACHE_TYPE=tq4p_d256` both resolve to the real GGML
   enum instead of falling back to f16.
-- **Per-layer σ and S** (CPU) — the block header carries a `layer_idx`
-  byte so the 32 pre-generated per-layer constants (seeds 42+i / 43+i)
-  are selected at quant and dot-product time. The CUDA kernels in this
-  branch currently still use layer 0 only; threading `layer_idx` through
-  the CUDA block struct is a follow-up.
+- **Per-layer σ and S** — the block header carries a `layer_idx` byte
+  so the 32 pre-generated per-layer constants (seeds 42+i / 43+i) are
+  selected at quant and dot-product time. Works on both CPU and CUDA
+  paths; the CUDA block struct is size-aligned with the CPU layout
+  (69/133 B) and the CUDA `ggml_cuda_op_tqp_vec_dot` wrapper auto-derives
+  `layer_idx` from the first K-block via a 1-byte d2h copy so
+  `apply_hooks.sh` hook 5 stays unchanged.
 - **`validate.py` has a TQ4P path** that drives the C library via
   ctypes for attention-score cosine-sim checks (see the `TQ4P (C)` mode
   in the module docstring).

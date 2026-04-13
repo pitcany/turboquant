@@ -8,11 +8,9 @@
 // in __constant__ memory (all 32 layers × d × 4 B ≤ 32 KB — fits cleanly
 // in the constant cache for both d=128 and d=256).
 //
-// Note: like the pre-WHT prototype, this CUDA path uses a single layer
-// index (layer 0) across all blocks. Per-layer dispatch in the kernels is
-// a separate follow-up that also needs the CPU-side per-block layer_idx
-// header to be threaded through the block struct here (the CUDA block
-// struct in tqp-kernels.cuh still matches the pre-per-layer CPU layout).
+// Per-layer σ_i and S_i are selected at launch time via the `layer_idx`
+// byte in the block header (matching the CPU path). The block struct in
+// tqp-kernels.cuh is size-aligned with the CPU header (69/133 B).
 
 #include "tqp-kernels.cuh"
 
