@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import pathlib
+import struct
 import sys
 
 import pytest
@@ -91,6 +92,18 @@ cpu.ggml_quantize_row_tq4p_d256.argtypes = [
     ctypes.c_int64,
     ctypes.c_uint8,  # layer_idx
 ]
+cpu.ggml_dequantize_row_tq4p_d128.restype = None
+cpu.ggml_dequantize_row_tq4p_d128.argtypes = [
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+cpu.ggml_dequantize_row_tq4p_d256.restype = None
+cpu.ggml_dequantize_row_tq4p_d256.argtypes = [
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
 cpu.ggml_tqp_prepare_query_d128.restype = None
 cpu.ggml_tqp_prepare_query_d128.argtypes = [
     ctypes.POINTER(ctypes.c_float),
@@ -123,6 +136,30 @@ cuda.tqp_cuda_quantize_row_d128.argtypes = [
 ]
 cuda.tqp_cuda_quantize_row_d256.restype = ctypes.c_int
 cuda.tqp_cuda_quantize_row_d256.argtypes = cuda.tqp_cuda_quantize_row_d128.argtypes
+cuda.tqp_cuda_dequantize_row_d128_f32.restype = ctypes.c_int
+cuda.tqp_cuda_dequantize_row_d128_f32.argtypes = [
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+cuda.tqp_cuda_dequantize_row_d256_f32.restype = ctypes.c_int
+cuda.tqp_cuda_dequantize_row_d256_f32.argtypes = [
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+cuda.tqp_cuda_dequantize_row_d128_f16.restype = ctypes.c_int
+cuda.tqp_cuda_dequantize_row_d128_f16.argtypes = [
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.c_int64,
+]
+cuda.tqp_cuda_dequantize_row_d256_f16.restype = ctypes.c_int
+cuda.tqp_cuda_dequantize_row_d256_f16.argtypes = [
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.c_int64,
+]
 cuda.tqp_cuda_prepare_query_d128.restype = ctypes.c_int
 cuda.tqp_cuda_prepare_query_d128.argtypes = [
     ctypes.POINTER(ctypes.c_float),
@@ -213,6 +250,38 @@ def _cuda_quantize(d: int, x_np, layer_idx: int, rotation: int):
     return blk
 
 
+def _cpu_dequantize(d: int, blk):
+    out = (ctypes.c_float * d)()
+    if d == 128:
+        cpu.ggml_dequantize_row_tq4p_d128(ctypes.byref(blk), out, d)
+    else:
+        cpu.ggml_dequantize_row_tq4p_d256(ctypes.byref(blk), out, d)
+    return torch.tensor(list(out))
+
+
+def _cuda_dequantize_f32(d: int, blk):
+    out = (ctypes.c_float * d)()
+    if d == 128:
+        err = cuda.tqp_cuda_dequantize_row_d128_f32(ctypes.byref(blk), out, d)
+    else:
+        err = cuda.tqp_cuda_dequantize_row_d256_f32(ctypes.byref(blk), out, d)
+    assert err == 0
+    return torch.tensor(list(out))
+
+
+def _cuda_dequantize_f16(d: int, blk):
+    out = (ctypes.c_uint16 * d)()
+    if d == 128:
+        err = cuda.tqp_cuda_dequantize_row_d128_f16(ctypes.byref(blk), out, d)
+    else:
+        err = cuda.tqp_cuda_dequantize_row_d256_f16(ctypes.byref(blk), out, d)
+    assert err == 0
+    return torch.tensor([
+        struct.unpack("<e", int(bits).to_bytes(2, "little"))[0]
+        for bits in out
+    ])
+
+
 def _block_bytes(blk) -> bytes:
     return bytes(memoryview(blk))
 
@@ -265,6 +334,34 @@ def test_cuda_per_layer_produces_different_bytes(d, vectors, rotation):
         f"qs/qjl_signs identical across layer_idx=0 and {TEST_LAYERS[-1]} "
         f"at d={d}, rot={ROTATION_IDS[rotation]}; CUDA is likely ignoring "
         f"layer_idx and using layer 0 constants for all blocks"
+    )
+
+
+def test_dequantize_agreement_f32(d, vectors, layer_idx, rotation):
+    max_abs = 0.0
+    for x in vectors[:10]:
+        blk = _cpu_quantize(d, x.float().numpy().copy(), layer_idx, rotation)
+        cpu_out = _cpu_dequantize(d, blk)
+        cuda_out = _cuda_dequantize_f32(d, blk)
+        max_abs = max(max_abs, (cuda_out - cpu_out).abs().max().item())
+
+    assert max_abs < 1e-5, (
+        f"CUDA vs CPU dequantize f32 max diff {max_abs:.2e} "
+        f"d={d} layer {layer_idx} rot={ROTATION_IDS[rotation]}"
+    )
+
+
+def test_dequantize_agreement_f16(d, vectors, layer_idx, rotation):
+    max_abs = 0.0
+    for x in vectors[:10]:
+        blk = _cpu_quantize(d, x.float().numpy().copy(), layer_idx, rotation)
+        cpu_out = _cpu_dequantize(d, blk).half().float()
+        cuda_out = _cuda_dequantize_f16(d, blk).float()
+        max_abs = max(max_abs, (cuda_out - cpu_out).abs().max().item())
+
+    assert max_abs == 0.0, (
+        f"CUDA dequantize f16 differs from fp16-rounded CPU output by {max_abs:.2e} "
+        f"d={d} layer {layer_idx} rot={ROTATION_IDS[rotation]}"
     )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the 5 TQ4P hook edits to a ggml source tree. Additive only.
+# Apply the TQ4P hook edits to a ggml source tree. Additive only.
 #
 # Usage: apply_hooks.sh <ggml-root>
 #
@@ -13,6 +13,9 @@
 #   3. src/ggml-cpu/ggml-cpu.c — 2 entries in type_traits_cpu + #include
 #   4. src/CMakeLists.txt      — add ggml-tq-paper.c to ggml-base sources
 #   5. src/ggml-cuda/ggml-cuda.cu — TQ4P CUDA vec_dot dispatch
+#   6. src/ggml-cuda/ggml-cuda.cu — F32 -> TQ4P CUDA quantize in CPY
+#   7. src/ggml-cuda/{ggml-cuda.cu,set-rows.cu} — TQ4P SET_ROWS dispatch
+#   8. src/ggml-cuda/{convert.cu,fattn.cu} — TQ4P flash-attention staging
 #
 # Anchors are value-based (reads GGML_TYPE_COUNT = N dynamically) so this
 # survives minor ggml drift. Idempotent via "tq4p" marker check.
@@ -30,6 +33,8 @@ GGML_C="$GGML/src/ggml.c"
 CPU_C="$GGML/src/ggml-cpu/ggml-cpu.c"
 CMAKE="$GGML/src/CMakeLists.txt"
 CUDA_CU="$GGML/src/ggml-cuda/ggml-cuda.cu"
+CONVERT_CU="$GGML/src/ggml-cuda/convert.cu"
+FATTN_CU="$GGML/src/ggml-cuda/fattn.cu"
 
 MARKER="tq4p"
 
@@ -359,7 +364,351 @@ PY
     fi
 fi
 
-# ---------- 7. GGUF metadata: tq4p.default_rotation KV (writer side) ---------
+# ---------- 7. ggml-cuda.cu: SET_ROWS + MUL_MAT supports_op + SET_ROWS dispatch
+#
+# Newer ollama uses SET_ROWS (not CPY) for KV cache writes. Also, without a
+# MUL_MAT supports_op entry for TQ4P types the attention Q×K^T falls back
+# to CPU (the "74 graph splits" issue).
+#
+# Three edits, each guarded on its own dependencies:
+#   a) MUL_MAT supports_op: add TQ4P to the a->type switch. Only requires
+#      the MUL_MAT dispatch (hook 5), which in turn needs tqp-vec-dot.cu.
+#   b) SET_ROWS supports_op: add TQ4P to the SET_ROWS type list. Requires
+#      set-rows.cu (ollama must support SET_ROWS) and tqp-set-rows.cu
+#      (our kernel impl). Skip independently if either is missing.
+#   c) SET_ROWS dispatch in set-rows.cu (same guard as (b)).
+#
+# Splitting (a) from (b) matters because older ollama trees lack set-rows.cu
+# but still have MUL_MAT. Bundling all three under the SET_ROWS guard
+# (as the first version of this hook did) would leave MUL_MAT unpatched
+# on those trees, silently forcing CPU fallback for attention.
+
+MARKER_MUL_MAT='TQ4P MUL_MAT on GPU'
+MARKER_SET_ROWS='TQ4P_D128 SET_ROWS'
+SET_ROWS_FILE="$GGML/src/ggml-cuda/set-rows.cu"
+TQP_SET_ROWS_IMPL="$GGML/src/ggml-cuda/tqp-set-rows.cu"
+TQP_VEC_DOT_IMPL="$GGML/src/ggml-cuda/tqp-vec-dot.cu"
+
+# (a) MUL_MAT supports_op in ggml-cuda.cu — only depends on tqp-vec-dot.cu.
+if [[ -f "$CUDA_CU" && -f "$TQP_VEC_DOT_IMPL" ]]; then
+    if grep -qF "$MARKER_MUL_MAT" "$CUDA_CU"; then
+        echo "[=] ggml-cuda.cu MUL_MAT supports_op already patched"
+    else
+        echo "[+] patching ggml-cuda.cu MUL_MAT supports_op for TQ4P"
+        python3 - "$CUDA_CU" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Anchor on BF16 which is the last type before "return true; default:".
+mulmat_anchor = '                    case GGML_TYPE_BF16:\n                        return true;\n                    default:\n                        return false;'
+if mulmat_anchor not in t:
+    print("ERROR: MUL_MAT supports_op anchor (BF16) not found", file=sys.stderr)
+    sys.exit(1)
+mulmat_new = (
+    '                    case GGML_TYPE_BF16:\n'
+    '                    case GGML_TYPE_TQ4P_D128: // Hook 7: TQ4P MUL_MAT on GPU\n'
+    '                    case GGML_TYPE_TQ4P_D256:\n'
+    '                        return true;\n'
+    '                    default:\n'
+    '                        return false;'
+)
+t = t.replace(mulmat_anchor, mulmat_new, 1)
+
+p.write_text(t)
+print(f"[+] patched MUL_MAT supports_op: {p}")
+PY
+    fi
+fi
+
+# (b) SET_ROWS supports_op in ggml-cuda.cu — needs set-rows.cu + tqp-set-rows.cu.
+if [[ -f "$CUDA_CU" && -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
+        echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
+    else
+        echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
+        python3 - "$CUDA_CU" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
+if anchor not in t:
+    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
+    sys.exit(1)
+replacement = (
+    'op->type == GGML_TYPE_IQ4_NL ||\n'
+    '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
+    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
+)
+t = t.replace(anchor, replacement, 1)
+
+p.write_text(t)
+print(f"[+] patched SET_ROWS supports_op: {p}")
+PY
+    fi
+fi
+
+# (c) dispatch in set-rows.cu — same guard as (b).
+if [[ -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$SET_ROWS_FILE"; then
+        echo "[=] set-rows.cu TQ4P dispatch already patched"
+    else
+        echo "[+] patching set-rows.cu TQ4P dispatch"
+        python3 - "$SET_ROWS_FILE" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add extern "C" declarations near the top (after includes).
+include_anchor = '#include "set-rows.cuh"\n'
+if include_anchor not in t:
+    print("ERROR: set-rows.cu include anchor not found", file=sys.stderr)
+    sys.exit(1)
+decl_block = (
+    '#include "set-rows.cuh"\n'
+    '\n'
+    '// TQ4P SET_ROWS — Hook 7. Defined in tqp-set-rows.cu.\n'
+    'extern "C" void ggml_cuda_set_rows_tq4p_d128(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tq4p_d256(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+)
+t = t.replace(include_anchor, decl_block, 1)
+
+# Intercept TQ4P before the existing I64/I32 dispatch.
+dispatch_anchor = (
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {'
+)
+if dispatch_anchor not in t:
+    print("ERROR: ggml_cuda_op_set_rows dispatch anchor not found in set-rows.cu", file=sys.stderr)
+    sys.exit(1)
+dispatch_new = (
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    // TQ4P_D128 SET_ROWS — Hook 7.\n'
+    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256) {\n'
+    '        const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
+    '        const float * src0_d = (const float *)src0->data;\n'
+    '        const bool idx_i64 = (src1->type == GGML_TYPE_I64);\n'
+    '        cudaStream_t stream = ctx.stream();\n'
+    '        const int64_t n_rows = src0->ne[1];\n'
+    '        const int64_t src0_stride = src0->nb[1] / sizeof(float);\n'
+    '        const int64_t dst_stride = dst->nb[1];\n'
+    '        if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '            ggml_cuda_set_rows_tq4p_d128(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else {\n'
+    '            ggml_cuda_set_rows_tq4p_d256(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        }\n'
+    '        return;\n'
+    '    }\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {'
+)
+t = t.replace(dispatch_anchor, dispatch_new, 1)
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
+# ---------- 8. ggml-cuda flash attention: TQ4P staging dequantize --------
+# Flash attention can consume f16 K/V data through launch_fattn's staging
+# buffer. Register TQ4P -> f16/f32 converters, and let the fattn selector map
+# TQ4P K/V tensors to the existing F16 kernel variants.
+
+TQP_DEQUANT_IMPL="$GGML/src/ggml-cuda/tqp-dequantize.cu"
+
+if [[ -f "$CONVERT_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
+    if grep -q "dequantize_row_tq4p_d128_cuda" "$CONVERT_CU" 2>/dev/null; then
+        echo "[=] convert.cu TQ4P dequantize dispatch already patched"
+    else
+        echo "[+] patching convert.cu TQ4P dequantize dispatch"
+        python3 - "$CONVERT_CU" <<'PY'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+include_anchor = '#include "dequantize.cuh"\n'
+if include_anchor not in t:
+    print('ERROR: convert.cu include anchor not found', file=sys.stderr)
+    sys.exit(1)
+
+decl = (
+    '#include "dequantize.cuh"\n'
+    '\n'
+    '// TQ4P flash-attention staging dequantizers - Hook 8.\n'
+    'extern "C" void dequantize_row_tq4p_d128_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d128_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tq4p_d256_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+)
+t = t.replace(include_anchor, decl, 1)
+
+fp16_anchor = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_F32:'
+)
+if fp16_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp16_cuda MXFP4 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp16_replacement = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_cuda;\n'
+    '        case GGML_TYPE_F32:'
+)
+t = t.replace(fp16_anchor, fp16_replacement, 1)
+
+fp32_anchor = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_F16:'
+)
+if fp32_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp32_cuda MXFP4 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp32_replacement = (
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_f32_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_f32_cuda;\n'
+    '        case GGML_TYPE_F16:'
+)
+t = t.replace(fp32_anchor, fp32_replacement, 1)
+
+fp16_nc_anchor = (
+    '        case GGML_TYPE_Q8_0:\n'
+    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_BF16:'
+)
+if fp16_nc_anchor not in t:
+    print('ERROR: convert.cu ggml_get_to_fp16_nc_cuda Q8_0 anchor not found', file=sys.stderr)
+    sys.exit(1)
+fp16_nc_replacement = (
+    '        case GGML_TYPE_Q8_0:\n'
+    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_nc_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_nc_cuda;\n'
+    '        case GGML_TYPE_BF16:'
+)
+t = t.replace(fp16_nc_anchor, fp16_nc_replacement, 1)
+
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
+if [[ -f "$FATTN_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
+    if grep -q "TQ4P flash-attention staging" "$FATTN_CU" 2>/dev/null; then
+        echo "[=] fattn.cu TQ4P staging already patched"
+    else
+        echo "[+] patching fattn.cu TQ4P flash-attention staging"
+        python3 - "$FATTN_CU" <<'PY'
+import pathlib
+import sys
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+old_macro = (
+    '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
+    '    {                                                                                                            \\\n'
+    '        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \\\n'
+    '        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \\\n'
+    '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n'
+)
+new_macro = (
+    '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
+    '    {                                                                                                            \\\n'
+    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_K_okay = K->type == (type_K)                                                            \\\n'
+    '            || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_K_tq4p && (type_K) == GGML_TYPE_F16); /* TQ4P flash-attention staging */                    \\\n'
+    '        const bool type_V_okay = V->type == (type_V)                                                            \\\n'
+    '            || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_V_tq4p && (type_V) == GGML_TYPE_F16);                                                       \\\n'
+    '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n'
+)
+if old_macro not in t:
+    print('ERROR: fattn.cu FATTN_VEC_CASE anchor not found', file=sys.stderr)
+    sys.exit(1)
+t = t.replace(old_macro, new_macro, 1)
+
+switch_anchor = (
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '            break;'
+)
+if switch_anchor not in t:
+    print('ERROR: fattn.cu K->type switch anchor not found', file=sys.stderr)
+    sys.exit(1)
+switch_replacement = (
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            break;'
+)
+t = t.replace(switch_anchor, switch_replacement, 1)
+
+# V->type switch: TQ4P is a KV-cache type, so the V tensor is also TQ4P.
+# Without this patch, the default case in the V->type switch fires and
+# GGML_ABORTs during flash attention.
+v_switch_anchor = (
+    '    switch (V->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '            break;'
+)
+if v_switch_anchor not in t:
+    print('ERROR: fattn.cu V->type switch anchor not found', file=sys.stderr)
+    sys.exit(1)
+v_switch_replacement = (
+    '    switch (V->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            break;'
+)
+t = t.replace(v_switch_anchor, v_switch_replacement, 1)
+
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+# ---------- 9. GGUF metadata: tq4p.default_rotation KV (writer side) ---------
 #
 # When llama-quantize (or equivalent) writes a GGUF file containing TQ4P
 # types, the quantize path should set the advisory KV pair
@@ -375,7 +724,7 @@ fi
 # llama-quantize.cpp / model.go, which varies between forks. The hook
 # body below is a template showing the KV write call.
 
-echo "[i] Hook 7: GGUF tq4p.default_rotation KV writer (template-only)"
+echo "[i] Hook 9: GGUF tq4p.default_rotation KV writer (template-only)"
 echo "    To wire into your quantize path, add after gguf_set_val_*:"
 echo '    gguf_set_val_str(ctx, "tq4p.default_rotation",'
 echo '                     (resolved_rot == TQP_ROT_HAAR) ? "haar" : "wht");'

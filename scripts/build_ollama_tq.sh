@@ -122,7 +122,8 @@ if [[ "$CUDA" = "1" ]]; then
     if [[ -d "$GGML_CUDA" ]]; then
         echo "[+] copying TQ4P CUDA kernels into $GGML_CUDA/"
         for f in tqp-quantize.cu tqp-prepare-query.cu tqp-vec-dot.cu \
-                 tqp-kernels.cuh tqp-constants-cuda.cuh; do
+                 tqp-dequantize.cu \
+                 tqp-set-rows.cu tqp-kernels.cuh tqp-constants-cuda.cuh; do
             cp "$STAGE2_DIR/cuda/$f" "$GGML_CUDA/"
         done
         for f in tqp_constants_d128.h tqp_constants_d256.h \
@@ -130,7 +131,6 @@ if [[ "$CUDA" = "1" ]]; then
                  ggml-tq-paper.h; do
             cp "$STAGE2_DIR/c/$f" "$GGML_CUDA/"
         done
-        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_CUDA_ARCHITECTURES=89\;120"
     else
         echo "[!] $GGML_CUDA not found; skipping CUDA kernel copy"
     fi
@@ -147,12 +147,70 @@ bash "$PATCH_ALLOWLIST" "$OLLAMA_DIR"
 
 bash "$APPLY_GO_PLUMBING" "$OLLAMA_DIR"
 
-# ---- Build -------------------------------------------------------------------
+# ---- Build shared libs via cmake ---------------------------------------------
+#
+# ollama discovers GPU backends at runtime by loading shared libraries from
+# a directory next to the binary. Without this step the binary is CPU-only:
+# GPU discovery finds 0 devices and inference falls back to CPU.
+#
+# cmake presets (defined in ollama's CMakePresets.json):
+#   CPU     → libggml-base.so, libggml-cpu-*.so
+#   CUDA 12 → cuda_v12/libggml-cuda.so  (requires nvcc)
 
 cd "$OLLAMA_DIR"
+
+# Vulkan requires glslc which is often not installed; skip it since we only
+# need CPU + CUDA.
+CMAKE_EXTRA="-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE"
+
+NPROC=$(nproc 2>/dev/null || echo 4)
+
+echo "[+] cmake: configuring CPU preset"
+cmake --preset 'CPU' $CMAKE_EXTRA 2>&1 | tail -3
+
+echo "[+] cmake: building CPU shared libs"
+cmake --build --preset 'CPU' -- -j"$NPROC" 2>&1 | tail -3
+
 if [[ "$CUDA" = "1" ]]; then
-    export CMAKE_ARGS="${CMAKE_ARGS:-} -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release"
+    # Detect CUDA major version for the right preset. Under `set -euo
+    # pipefail`, grep returning exit 1 on no-match would abort the script
+    # and skip the `:-12` fallback below, so trap its exit with `|| true`.
+    CUDA_VER=$(nvcc --version 2>/dev/null | { grep -oP 'release \K[0-9]+' || true; } | head -1)
+    CUDA_PRESET="CUDA ${CUDA_VER:-12}"
+    CUDA_ARCHS="${CUDA_ARCHS:-89;120}"
+
+    echo "[+] cmake: configuring $CUDA_PRESET preset (archs: $CUDA_ARCHS)"
+    cmake --preset "$CUDA_PRESET" $CMAKE_EXTRA \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" 2>&1 | tail -3
+
+    echo "[+] cmake: building CUDA shared libs"
+    cmake --build --preset "$CUDA_PRESET" -- -j"$NPROC" 2>&1 | tail -3
 fi
+
+# Copy built libs next to the binary so ollama's runner discovery finds them.
+echo "[+] installing shared libs"
+LIB_OUT="$OLLAMA_DIR/build/lib/ollama"
+if [[ -d "$LIB_OUT" ]]; then
+    # CPU libs go next to binary. Trailing `*` after `.so` catches
+    # versioned variants (`libggml-cpu.so.1`, etc.) — ollama's cmake can
+    # emit SONAME'd shared libraries, and `cp -a` would otherwise copy
+    # the unversioned symlink without its target, leaving a dangling
+    # link that the dynamic linker silently fails to load.
+    for f in "$LIB_OUT"/libggml-base.so* "$LIB_OUT"/libggml-cpu*.so*; do
+        [[ -f "$f" ]] && cp -a "$f" "$OLLAMA_DIR/"
+    done
+    # CUDA lib goes into cuda_v{N}/ subdir for runner discovery
+    if [[ -f "$LIB_OUT/libggml-cuda.so" ]]; then
+        CUDA_SUBDIR="cuda_v${CUDA_VER:-12}"
+        mkdir -p "$OLLAMA_DIR/$CUDA_SUBDIR"
+        cp -a "$LIB_OUT/libggml-cuda.so" "$OLLAMA_DIR/$CUDA_SUBDIR/"
+        echo "  → $CUDA_SUBDIR/libggml-cuda.so"
+    fi
+else
+    echo "[!] warning: cmake build dir $LIB_OUT not found"
+fi
+
+# ---- Build Go binary ---------------------------------------------------------
 
 echo "[+] go generate ./..."
 go generate ./...
@@ -164,11 +222,17 @@ cat <<DONE
 
 Built: $OLLAMA_DIR/ollama
 
+Shared libs installed next to binary:
+$(ls "$OLLAMA_DIR"/*.so* "$OLLAMA_DIR"/cuda_v*/*.so 2>/dev/null | sed 's|.*/||;s/^/  /')
+
 Run with:
     OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
 
 For Qwen 3.5 (head_dim=256):
     OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+
+TQ4P now registers CUDA dequantizers for ggml-cuda's flash-attention staging
+buffer, so flash attention can stay enabled for TQ4P KV cache runs.
 
 The TQ4P sources live at patches/stage2-qjl/c/ in this repo and are copied
 into $GGML_SRC on every run. Edit them in the repo, then rerun with --rebuild.

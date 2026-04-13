@@ -183,3 +183,141 @@ __device__ static inline void tqp_wht_shared(float * smem) {
     }
     __syncthreads();
 }
+
+// Full-vector TQ4P quantization (Stage-1 Lloyd-Max + Stage-2 QJL).
+//
+// One CTA per vector, D threads (one per element). Requires shared memory
+// for intermediate vector, indices, and scalar reductions.
+//
+// Used by both tqp-quantize.cu (contiguous quantize) and tqp-set-rows.cu
+// (index-scattered KV cache writes).
+template<int D, uint8_t ROT>
+__device__ static inline void tqp_quantize_block_device(
+        const float * __restrict__ x,
+        uint16_t * orig_norm_out,
+        uint16_t * res_d_out,
+        uint8_t * layer_idx_out,
+        uint8_t   layer_idx_val,
+        uint8_t * __restrict__ qs_out,
+        uint8_t * __restrict__ signs_out,
+        const float * __restrict__ sigma,
+        const float * __restrict__ pi,
+        const float * __restrict__ s,
+        const float * __restrict__ centroids,
+        const float * __restrict__ bounds) {
+    __shared__ float smem_vec[QK_TQ4P_D256];
+    __shared__ uint8_t smem_idx[QK_TQ4P_D256];
+    __shared__ float smem_scalars[2];
+
+    const int tid = threadIdx.x;
+    const float rsqrt_d = (ROT == TQP_ROT_WHT) ? rsqrtf((float)D) : 0.0f;
+    const float sigma_tid = (ROT == TQP_ROT_WHT) ? sigma[tid] : 0.0f;
+
+    smem_vec[tid] = x[tid];
+    __syncthreads();
+
+    if (tid == 0) {
+        float sq = 0.0f;
+#pragma unroll 1
+        for (int i = 0; i < D; ++i) {
+            sq = __fadd_rn(sq, __fmul_rn(smem_vec[i], smem_vec[i]));
+        }
+        float orig_norm = sqrtf(sq);
+        if (orig_norm < 1e-8f) {
+            orig_norm = 1e-8f;
+        }
+        smem_scalars[0] = orig_norm;
+        smem_scalars[1] = 1.0f / orig_norm;
+    }
+    __syncthreads();
+
+    // x_unit = x / ||x||, kept in a per-thread register for later residual.
+    const float x_unit_reg = __fmul_rn(smem_vec[tid], smem_scalars[1]);
+
+    float x_rot_tid;
+    if constexpr (ROT == TQP_ROT_WHT) {
+        // smem_vec[tid] = σ ⊙ x_unit, then in-place FWHT, then scale.
+        smem_vec[tid] = __fmul_rn(x_unit_reg, sigma_tid);
+        __syncthreads();
+        tqp_wht_shared<D>(smem_vec);
+        x_rot_tid = __fmul_rn(smem_vec[tid], rsqrt_d);
+    } else {
+        // Dense Haar GEMV: x_rot[tid] = Σ_j Π[tid, j] · x_unit[j].
+        smem_vec[tid] = x_unit_reg;
+        __syncthreads();
+        float acc = 0.0f;
+#pragma unroll 1
+        for (int j = 0; j < D; ++j) {
+            acc = __fadd_rn(acc, __fmul_rn(__ldg(&pi[tid * D + j]), smem_vec[j]));
+        }
+        x_rot_tid = acc;
+    }
+    smem_idx[tid] = tqp_bucketize_d3(x_rot_tid, bounds);
+    __syncthreads();
+
+    float x_hat_tid;
+    if constexpr (ROT == TQP_ROT_WHT) {
+        // x_hat_unit = (1/√d) · σ ⊙ WHT(centroids[idx]).
+        smem_vec[tid] = centroids[smem_idx[tid]];
+        __syncthreads();
+        tqp_wht_shared<D>(smem_vec);
+        x_hat_tid = __fmul_rn(smem_vec[tid], __fmul_rn(sigma_tid, rsqrt_d));
+    } else {
+        // Dense Haar GEMV (transposed): x_hat[tid] = Σ_i Π[i, tid] · c[idx[i]].
+        smem_vec[tid] = centroids[smem_idx[tid]];
+        __syncthreads();
+        float acc = 0.0f;
+#pragma unroll 1
+        for (int i = 0; i < D; ++i) {
+            acc = __fadd_rn(acc, __fmul_rn(__ldg(&pi[i * D + tid]), smem_vec[i]));
+        }
+        x_hat_tid = acc;
+    }
+
+    // residual = x_unit - x_hat_unit
+    __syncthreads();
+    smem_vec[tid] = __fadd_rn(x_unit_reg, -x_hat_tid);
+    __syncthreads();
+
+    if (tid == 0) {
+        float r_sq = 0.0f;
+#pragma unroll 1
+        for (int i = 0; i < D; ++i) {
+            r_sq = __fadd_rn(r_sq, __fmul_rn(smem_vec[i], smem_vec[i]));
+        }
+        smem_scalars[1] = sqrtf(r_sq);
+    }
+    __syncthreads();
+
+    float proj = 0.0f;
+#pragma unroll 1
+    for (int j = 0; j < D; ++j) {
+        proj = __fadd_rn(proj, __fmul_rn(__ldg(&s[tid * D + j]), smem_vec[j]));
+    }
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const uint8_t idx = smem_idx[tid];
+
+    const uint32_t ballot_lo  = __ballot_sync(0xffffffffu, (idx & 1u) != 0);
+    const uint32_t ballot_mid = __ballot_sync(0xffffffffu, (idx & 2u) != 0);
+    const uint32_t ballot_hi  = __ballot_sync(0xffffffffu, (idx & 4u) != 0);
+    const uint32_t sign_mask  = __ballot_sync(0xffffffffu, proj < 0.0f);
+
+    if (lane == 0) {
+#pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const int group = warp * 4 + sub;
+            qs_out[group * 3 + 0] = (uint8_t)((ballot_lo  >> (8 * sub)) & 0xffu);
+            qs_out[group * 3 + 1] = (uint8_t)((ballot_mid >> (8 * sub)) & 0xffu);
+            qs_out[group * 3 + 2] = (uint8_t)((ballot_hi  >> (8 * sub)) & 0xffu);
+            signs_out[group] = (uint8_t)((sign_mask >> (8 * sub)) & 0xffu);
+        }
+    }
+
+    if (tid == 0) {
+        *orig_norm_out = tqp_fp32_to_fp16_device(smem_scalars[0]);
+        *res_d_out = tqp_fp32_to_fp16_device(smem_scalars[1]);
+        *layer_idx_out = layer_idx_val;
+    }
+}
