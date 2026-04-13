@@ -352,4 +352,116 @@ PY
     fi
 fi
 
+# ---------- 7. ggml-cuda.cu: SET_ROWS TQ4P dispatch + supports_op --------
+# The new ollama uses SET_ROWS (not CPY) for KV cache writes. Without this
+# hook, the CUDA backend reports that it can't run SET_ROWS on TQ4P tensors,
+# and llama_init_from_model aborts.
+#
+# Two edits:
+#   a) supports_op: add TQ4P_D128/D256 to the SET_ROWS type list
+#   b) dispatch: intercept TQ4P in ggml_cuda_op_set_rows before the
+#      template dispatch, calling tqp-set-rows.cu kernels
+
+MARKER_SET_ROWS='TQ4P_D128 SET_ROWS'
+SET_ROWS_FILE="$GGML_ROOT/src/ggml-cuda/set-rows.cu"
+
+# (a) supports_op in ggml-cuda.cu
+if [[ -f "$CUDA_FILE" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$CUDA_FILE"; then
+        echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
+    else
+        echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
+        python3 - "$CUDA_FILE" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add TQ4P types to the SET_ROWS supports_op case. Anchor on IQ4_NL.
+anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
+if anchor not in t:
+    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
+    sys.exit(1)
+replacement = (
+    'op->type == GGML_TYPE_IQ4_NL ||\n'
+    '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
+    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
+)
+t = t.replace(anchor, replacement, 1)
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
+# (b) dispatch in set-rows.cu
+if [[ -f "$SET_ROWS_FILE" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$SET_ROWS_FILE"; then
+        echo "[=] set-rows.cu TQ4P dispatch already patched"
+    else
+        echo "[+] patching set-rows.cu TQ4P dispatch"
+        python3 - "$SET_ROWS_FILE" <<'PY'
+import sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add extern "C" declarations near the top (after includes).
+include_anchor = '#include "set-rows.cuh"\n'
+if include_anchor not in t:
+    print("ERROR: set-rows.cu include anchor not found", file=sys.stderr)
+    sys.exit(1)
+decl_block = (
+    '#include "set-rows.cuh"\n'
+    '\n'
+    '// TQ4P SET_ROWS — Hook 7. Defined in tqp-set-rows.cu.\n'
+    'extern "C" void ggml_cuda_set_rows_tq4p_d128(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tq4p_d256(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+)
+t = t.replace(include_anchor, decl_block, 1)
+
+# Intercept TQ4P before the existing I64/I32 dispatch.
+dispatch_anchor = (
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {'
+)
+if dispatch_anchor not in t:
+    print("ERROR: ggml_cuda_op_set_rows dispatch anchor not found in set-rows.cu", file=sys.stderr)
+    sys.exit(1)
+dispatch_new = (
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    // TQ4P_D128 SET_ROWS — Hook 7.\n'
+    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256) {\n'
+    '        const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
+    '        const float * src0_d = (const float *)src0->data;\n'
+    '        const bool idx_i64 = (src1->type == GGML_TYPE_I64);\n'
+    '        cudaStream_t stream = ctx.stream();\n'
+    '        const int64_t n_rows = src0->ne[1];\n'
+    '        const int64_t src0_stride = src0->nb[1] / sizeof(float);\n'
+    '        const int64_t dst_stride = dst->nb[1];\n'
+    '        if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '            ggml_cuda_set_rows_tq4p_d128(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else {\n'
+    '            ggml_cuda_set_rows_tq4p_d256(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        }\n'
+    '        return;\n'
+    '    }\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {'
+)
+t = t.replace(dispatch_anchor, dispatch_new, 1)
+p.write_text(t)
+print(f"[+] patched: {p}")
+PY
+    fi
+fi
+
 echo "All hooks applied."
