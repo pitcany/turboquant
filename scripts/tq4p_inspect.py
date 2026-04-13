@@ -17,6 +17,7 @@ from __future__ import annotations
 import struct
 import sys
 from pathlib import Path
+from typing import Dict
 
 
 # GGUF magic and header layout (v3).
@@ -161,133 +162,69 @@ def inspect_gguf(path: Path) -> dict:
         data_start = (header_end + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
         # Try to find a TQ4P tensor by checking block sizes.
-        # For each tensor, compute n_elements and expected data size.
+        #
+        # Heuristic rejection: for a real TQ4P-quantized tensor, every
+        # block's layer_byte at offset 4 must have bits 5 & 6 clear
+        # (reserved bits in the stored layout). For a tensor of a
+        # different dtype reinterpreted through our block size, ~3/4 of
+        # bytes fail this check, so requiring ALL blocks pass is a
+        # strong signature.
+        #
+        # Order matters: D128 is tried first because its 69 B block size
+        # consumes the tensor data end-to-end at the right granularity
+        # for actual TQ4P_D128 tensors. Trying D256 first on a D128
+        # tensor would read half-blocks at the wrong stride and get
+        # lucky-looking layer bytes from qjl_signs / qs regions. The
+        # histogram validation still catches real D256 tensors on
+        # fallback because a real D256 tensor reinterpreted at 69 B
+        # stride puts byte 4 into random positions of each D256 block
+        # almost always hitting a byte with bits 5 or 6 set.
+        def _collect_histogram(abs_offset: int, n_blocks: int, block_size: int):
+            f.seek(abs_offset)
+            data = f.read(n_blocks * block_size)
+            usable = len(data) // block_size
+            if usable == 0:
+                return None
+            histogram: Dict[int, int] = {}
+            for b in range(usable):
+                lb = data[b * block_size + 4]
+                if lb & 0x60:  # reserved bits must be 0 in stored blocks
+                    return None
+                r = (lb >> 7) & 1
+                histogram[r] = histogram.get(r, 0) + 1
+            return histogram
+
         for ti in tensor_infos:
             n_elements = 1
             for d in ti["dims"]:
                 n_elements *= d
+            abs_offset = data_start + ti["offset"]
 
-            # Check if this could be TQ4P_D128
+            matched = False
+            # Try D128 first.
             if n_elements % 128 == 0:
                 n_blocks = n_elements // 128
-                expected_size = n_blocks * BLOCK_SIZE_D128
-                # Read first few bytes to validate block structure
-                abs_offset = data_start + ti["offset"]
-                f.seek(abs_offset)
-                if n_blocks > 0:
-                    sample = f.read(min(expected_size, BLOCK_SIZE_D128))
-                    if len(sample) >= BLOCK_SIZE_D128:
-                        # Check if layer_byte at offset 4 looks valid
-                        layer_byte = sample[4]
-                        layer = layer_byte & 0x1f
-                        rot = (layer_byte >> 7) & 1
-                        if layer < 32:
-                            result["tensor_name"] = ti["name"]
-                            result["n_blocks"] = n_blocks
-                            # Read all blocks for histogram
-                            f.seek(abs_offset)
-                            data = f.read(n_blocks * BLOCK_SIZE_D128)
-                            for b in range(min(n_blocks, len(data) // BLOCK_SIZE_D128)):
-                                lb = data[b * BLOCK_SIZE_D128 + 4]
-                                r = (lb >> 7) & 1
-                                result["histogram"][r] = result["histogram"].get(r, 0) + 1
-                            break
+                histogram = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D128)
+                if histogram is not None:
+                    result["tensor_name"] = ti["name"]
+                    result["n_blocks"] = n_blocks
+                    result["histogram"] = histogram
+                    matched = True
 
-            # Check if this could be TQ4P_D256
-            if n_elements % 256 == 0:
+            # If D128 rejected, try D256.
+            if not matched and n_elements % 256 == 0:
                 n_blocks = n_elements // 256
-                expected_size = n_blocks * BLOCK_SIZE_D256
-                abs_offset = data_start + ti["offset"]
-                f.seek(abs_offset)
-                if n_blocks > 0:
-                    sample = f.read(min(expected_size, BLOCK_SIZE_D256))
-                    if len(sample) >= BLOCK_SIZE_D256:
-                        layer_byte = sample[4]
-                        layer = layer_byte & 0x1f
-                        if layer < 32:
-                            result["tensor_name"] = ti["name"]
-                            result["n_blocks"] = n_blocks
-                            f.seek(abs_offset)
-                            data = f.read(n_blocks * BLOCK_SIZE_D256)
-                            for b in range(min(n_blocks, len(data) // BLOCK_SIZE_D256)):
-                                lb = data[b * BLOCK_SIZE_D256 + 4]
-                                r = (lb >> 7) & 1
-                                result["histogram"][r] = result["histogram"].get(r, 0) + 1
-                            break
+                histogram = _collect_histogram(abs_offset, n_blocks, BLOCK_SIZE_D256)
+                if histogram is not None:
+                    result["tensor_name"] = ti["name"]
+                    result["n_blocks"] = n_blocks
+                    result["histogram"] = histogram
+                    matched = True
+
+            if matched:
+                break
 
     return result
-
-
-def write_gguf_kv_rotation(path: Path, rotation: str) -> None:
-    """Write the tq4p.default_rotation KV pair into an existing GGUF file.
-
-    This is a simplified writer that modifies the n_kv count and appends
-    the new KV pair at the end of the existing KV section. For production
-    use, the quantize tool should write this during initial file creation.
-
-    rotation: "wht" or "haar"
-    """
-    assert rotation in ("wht", "haar"), f"Invalid rotation: {rotation}"
-
-    with open(path, "r+b") as f:
-        magic = struct.unpack("<I", f.read(4))[0]
-        if magic != GGUF_MAGIC:
-            raise ValueError(f"Not a GGUF file (magic: {magic:#x})")
-        version = struct.unpack("<I", f.read(4))[0]
-        (n_tensors,) = struct.unpack("<Q", f.read(8))
-        (n_kv,) = struct.unpack("<Q", f.read(8))
-
-        # Skip existing KV pairs to find insertion point
-        for _ in range(n_kv):
-            _read_string(f)  # key
-            (vtype,) = struct.unpack("<I", f.read(4))
-            _read_value(f, vtype)
-
-        kv_end = f.tell()
-
-        # Skip tensor infos
-        for _ in range(n_tensors):
-            _read_string(f)  # name
-            (n_dims,) = struct.unpack("<I", f.read(4))
-            f.read(8 * n_dims)  # dims
-            f.read(4)  # type
-            f.read(8)  # offset
-
-        tensor_info_end = f.tell()
-
-        # Read remaining file (tensor data)
-        remaining = f.read()
-
-        # Build the new KV entry
-        key = "tq4p.default_rotation"
-        key_bytes = key.encode("utf-8")
-        val_bytes = rotation.encode("utf-8")
-        new_kv = struct.pack("<Q", len(key_bytes)) + key_bytes
-        new_kv += struct.pack("<I", GGUF_TYPE_STRING)
-        new_kv += struct.pack("<Q", len(val_bytes)) + val_bytes
-
-        # Rewrite: increment n_kv, insert KV, then rest of file
-        f.seek(16)  # past magic + version + n_tensors
-        f.write(struct.pack("<Q", n_kv + 1))
-
-        # Seek to kv_end, insert new KV, write tensor infos + data
-        f.seek(kv_end)
-        f.write(new_kv)
-
-        # Recalculate: tensor info offsets may need adjustment
-        # Actually, tensor offsets are relative to data start, not file start.
-        # Data start = aligned(header_end). Since we changed header_end,
-        # we need to adjust. For simplicity, re-read tensor infos and
-        # rewrite with adjusted offsets.
-
-        # The data start alignment means we may need padding. Let's
-        # rebuild the tail properly.
-        # Skip this complexity for now — for the inspection tool, the
-        # write_gguf_kv_rotation is only used in tests with synthetic files.
-
-        # For now, just note that this is a simplified implementation
-        # suitable for testing. Production use should write KV during
-        # initial file creation.
 
 
 def main():
