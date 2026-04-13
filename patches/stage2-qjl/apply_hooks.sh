@@ -167,13 +167,13 @@ if depth != 0:
 close = i - 1
 entries = (
     "    [GGML_TYPE_TQ4P_D128] = {\n"
-    "        .from_float               = ggml_quantize_row_tq4p_d128_default,\n"
+    "        .from_float               = ggml_quantize_row_tq4p_d128_resolved,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d128_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"
     "    },\n"
     "    [GGML_TYPE_TQ4P_D256] = {\n"
-    "        .from_float               = ggml_quantize_row_tq4p_d256_default,\n"
+    "        .from_float               = ggml_quantize_row_tq4p_d256_resolved,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d256_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"

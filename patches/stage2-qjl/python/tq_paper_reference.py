@@ -58,9 +58,25 @@ TQP_ROT_WHT  = 0
 TQP_ROT_HAAR = 1
 
 
+BIT6_EXPLICIT = 1 << 6
+
+
 def layer_byte(layer_idx: int, rotation: int) -> int:
-    """Pack (layer_idx, rotation) into the header byte. Matches the C macro
-    TQP_LAYER_BYTE in ggml-tq-paper.h."""
+    """Pack (layer_idx, rotation) into an *explicit* quantize-call byte.
+
+    Sets bit 6 so the rotation in bit 7 is used as-is, bypassing the
+    runtime rotation resolver.  Matches the C macro TQP_LAYER_BYTE.
+    """
+    assert 0 <= layer_idx < 32
+    assert rotation in (TQP_ROT_WHT, TQP_ROT_HAAR)
+    return BIT6_EXPLICIT | ((rotation & 1) << 7) | (layer_idx & 0x1f)
+
+
+def stored_byte(layer_idx: int, rotation: int) -> int:
+    """Pack (layer_idx, rotation) for block storage (bit 6 = 0).
+
+    Matches the C macro TQP_STORED_BYTE.
+    """
     assert 0 <= layer_idx < 32
     assert rotation in (TQP_ROT_WHT, TQP_ROT_HAAR)
     return ((rotation & 1) << 7) | (layer_idx & 0x1f)
@@ -72,6 +88,83 @@ def extract_layer(byte: int) -> int:
 
 def extract_rotation(byte: int) -> int:
     return (byte >> 7) & 1
+
+
+def extract_explicit(byte: int) -> int:
+    return (byte >> 6) & 1
+
+
+# ---------- Runtime rotation resolver ----------
+#
+# Python mirror of the C runtime rotation selector.  Uses module-level
+# globals (process default) and threading.local (thread default).  The
+# env var OLLAMA_TQP_ROTATION is read once at first resolve call.
+
+import os
+import threading
+
+_ROT_UNSET = 0xFF
+
+_process_rotation: int = _ROT_UNSET
+_env_read: bool = False
+_env_lock = threading.Lock()
+_thread_local = threading.local()
+
+
+def _ensure_env_read() -> None:
+    global _process_rotation, _env_read
+    if _env_read:
+        return
+    with _env_lock:
+        if _env_read:
+            return
+        val = os.environ.get("OLLAMA_TQP_ROTATION", "")
+        if val.lower().startswith("h"):
+            _process_rotation = TQP_ROT_HAAR
+        elif val.lower().startswith("w"):
+            _process_rotation = TQP_ROT_WHT
+        _env_read = True
+
+
+def set_default_rotation(rot: int) -> None:
+    """Set the process-wide default rotation (0, 1, or 0xff to clear)."""
+    global _process_rotation
+    _ensure_env_read()
+    _process_rotation = rot
+
+
+def set_thread_rotation(rot: int) -> None:
+    """Set per-thread rotation override (0, 1, or 0xff to clear)."""
+    _thread_local.rotation = rot
+
+
+def clear_thread_rotation() -> None:
+    """Clear the per-thread rotation override."""
+    _thread_local.rotation = _ROT_UNSET
+
+
+def resolve_rotation(lb: int) -> int:
+    """Apply the three-tier precedence chain to a layer_byte.
+
+    Returns a byte with bit 6 cleared and bit 7 set to the resolved
+    rotation.  Matches the C function tqp_resolve_rotation().
+    """
+    _ensure_env_read()
+
+    # Per-call explicit: bit 6 = 1
+    if lb & BIT6_EXPLICIT:
+        return lb & ~BIT6_EXPLICIT
+
+    # Cascade: thread-local > process default > compile-time WHT
+    thread_rot = getattr(_thread_local, "rotation", _ROT_UNSET)
+    if thread_rot != _ROT_UNSET:
+        rot = thread_rot & 1
+    elif _process_rotation != _ROT_UNSET:
+        rot = _process_rotation & 1
+    else:
+        rot = TQP_ROT_WHT
+
+    return ((rot & 1) << 7) | (lb & 0x1f)
 
 
 @dataclass(frozen=True)
@@ -260,7 +353,7 @@ def quantize_block(x: torch.Tensor, c: TQPConstants,
     buf = bytearray(block_size(d))
     buf[0:2] = struct.pack('<e', _fp16_round(orig_norm))
     buf[2:4] = struct.pack('<e', _fp16_round(res_d))
-    buf[4] = layer_byte(layer_idx, rotation)
+    buf[4] = stored_byte(layer_idx, rotation)
     qs_off = _qs_offset()
     qs_bytes = _pack_indices_bitplane(indices)
     buf[qs_off : qs_off + len(qs_bytes)] = qs_bytes

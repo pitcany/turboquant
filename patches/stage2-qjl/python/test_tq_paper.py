@@ -199,3 +199,107 @@ def test_haar_byte_exact_vs_turboquant(constants, layer_idx, unit_vectors):
         assert torch.equal(ref_idx, oracle_idx[i]), f"idx mismatch vec {i} layer {layer_idx}"
         assert torch.equal(ref_signs_bits, oracle_signs_bits[i]), \
             f"sign mismatch vec {i} layer {layer_idx}"
+
+
+# ---------- Runtime rotation resolver ----------
+
+import os
+
+ROTATION_SOURCES = ["explicit", "thread", "process", "compile_time"]
+
+
+@pytest.fixture(params=ROTATION_SOURCES)
+def rotation_source(request):
+    return request.param
+
+
+class TestRotationResolver:
+    """Verify the four-tier rotation resolution: explicit > thread > process > compile_time."""
+
+    def _resolve_with_source(self, source, target_rot, layer_idx):
+        """Set up the resolution state for a given source, return the resolved byte."""
+        # Clear all overrides first
+        ref.clear_thread_rotation()
+        ref.set_default_rotation(ref._ROT_UNSET)
+
+        if source == "explicit":
+            # bit 6 = 1, bit 7 = target_rot
+            lb = ref.layer_byte(layer_idx, target_rot)
+            return ref.resolve_rotation(lb)
+        elif source == "thread":
+            ref.set_thread_rotation(target_rot)
+            lb = ref.stored_byte(layer_idx, 0)  # bit 6 = 0, bit 7 irrelevant
+            return ref.resolve_rotation(lb)
+        elif source == "process":
+            ref.set_default_rotation(target_rot)
+            lb = ref.stored_byte(layer_idx, 0)
+            return ref.resolve_rotation(lb)
+        elif source == "compile_time":
+            # No overrides: should always be WHT regardless of bit 7
+            lb = ref.stored_byte(layer_idx, 0)
+            return ref.resolve_rotation(lb)
+        else:
+            raise ValueError(f"unknown source: {source}")
+
+    def test_resolved_rotation_matches_expectation(self, rotation_source):
+        """Each source should produce the expected rotation."""
+        layer = 5
+        for target_rot in [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]:
+            resolved = self._resolve_with_source(rotation_source, target_rot, layer)
+
+            expected_rot = target_rot
+            if rotation_source == "compile_time":
+                expected_rot = ref.TQP_ROT_WHT  # always WHT
+
+            assert ref.extract_rotation(resolved) == expected_rot, \
+                f"source={rotation_source} target={target_rot} resolved_rot={ref.extract_rotation(resolved)}"
+            assert ref.extract_layer(resolved) == layer
+            assert ref.extract_explicit(resolved) == 0  # bit 6 always cleared
+
+        # Clean up
+        ref.clear_thread_rotation()
+        ref.set_default_rotation(ref._ROT_UNSET)
+
+    def test_explicit_overrides_thread(self):
+        """Per-call explicit (bit 6) overrides thread-local."""
+        ref.set_thread_rotation(ref.TQP_ROT_HAAR)
+        lb = ref.layer_byte(3, ref.TQP_ROT_WHT)  # explicit WHT
+        resolved = ref.resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_WHT
+        ref.clear_thread_rotation()
+
+    def test_thread_overrides_process(self):
+        """Thread-local overrides process default."""
+        ref.set_default_rotation(ref.TQP_ROT_WHT)
+        ref.set_thread_rotation(ref.TQP_ROT_HAAR)
+        lb = ref.stored_byte(3, 0)  # bit 6 = 0
+        resolved = ref.resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_HAAR
+        ref.clear_thread_rotation()
+        ref.set_default_rotation(ref._ROT_UNSET)
+
+    def test_process_overrides_compile_time(self):
+        """Process default overrides compile-time WHT."""
+        ref.clear_thread_rotation()
+        ref.set_default_rotation(ref.TQP_ROT_HAAR)
+        lb = ref.stored_byte(3, 0)
+        resolved = ref.resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_HAAR
+        ref.set_default_rotation(ref._ROT_UNSET)
+
+    def test_compile_time_fallback_is_wht(self):
+        """With no overrides, compile-time default is WHT."""
+        ref.clear_thread_rotation()
+        ref.set_default_rotation(ref._ROT_UNSET)
+        lb = ref.stored_byte(3, ref.TQP_ROT_HAAR)  # bit 7 = HAAR, but bit 6 = 0
+        resolved = ref.resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_WHT
+
+    def test_resolved_block_byte_matches_quantize(self, constants):
+        """Block byte stored by quantize_block matches resolved rotation."""
+        x = torch.randn(constants.d)
+        for rot in [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]:
+            blk = ref.quantize_block(x, constants, layer_idx=5, rotation=rot)
+            assert ref.extract_rotation(blk[4]) == rot
+            assert ref.extract_layer(blk[4]) == 5
+            assert ref.extract_explicit(blk[4]) == 0  # stored byte has bit 6 = 0

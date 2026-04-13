@@ -5,7 +5,7 @@
 CFLAGS ?= -O2 -Wall -Wextra -fPIC
 
 libggml_tq_paper.so: ggml-tq-paper.c ggml-tq-paper.h tqp_constants.pt tqp_constants_d128.h tqp_constants_d256.h tqp_centroids_d128.h tqp_centroids_d256.h
-	$(CC) $(CFLAGS) -shared -o $@ ggml-tq-paper.c
+	$(CC) $(CFLAGS) -shared -o $@ ggml-tq-paper.c -lm -lpthread
 
 tqp_constants.pt tqp_constants_d128.h tqp_constants_d256.h tqp_centroids_d128.h tqp_centroids_d256.h:
 	cd ../python && python3 generate_constants.py
