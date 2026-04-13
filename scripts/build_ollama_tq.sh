@@ -125,7 +125,7 @@ if [[ "$CUDA" = "1" ]]; then
                  ggml-tq-paper.h; do
             cp "$STAGE2_DIR/c/$f" "$GGML_CUDA/"
         done
-        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_CUDA_ARCHITECTURES=89;120"
+        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_CUDA_ARCHITECTURES=89\;120"
     else
         echo "[!] $GGML_CUDA not found; skipping CUDA kernel copy"
     fi
