@@ -346,3 +346,145 @@ def test_dispatch_wrapper_matches_block_api(d, vectors, layer_idx, rotation):
     assert err == 0
     row_scores = list(out)
     assert max(abs(a - b) for a, b in zip(row_scores, block_scores)) < 1e-6
+
+
+# ---------- Q8_K query path ----------
+
+class block_q8k_compat(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("d",     ctypes.c_float),
+        ("qs",    ctypes.c_int8 * 256),
+        ("bsums", ctypes.c_int16 * 16),
+    ]
+
+assert ctypes.sizeof(block_q8k_compat) == 292
+
+# CPU Q8_K vec_dot bindings
+cpu.ggml_vec_dot_tq4p_d128_q8k.restype = None
+cpu.ggml_vec_dot_tq4p_d128_q8k.argtypes = [
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+]
+cpu.ggml_vec_dot_tq4p_d256_q8k.restype = None
+cpu.ggml_vec_dot_tq4p_d256_q8k.argtypes = cpu.ggml_vec_dot_tq4p_d128_q8k.argtypes
+
+# CUDA Q8_K vec_dot bindings
+cuda.tqp_cuda_vec_dot_q8k_d128.restype = ctypes.c_int
+cuda.tqp_cuda_vec_dot_q8k_d128.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+cuda.tqp_cuda_vec_dot_q8k_d256.restype = ctypes.c_int
+cuda.tqp_cuda_vec_dot_q8k_d256.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int64,
+]
+
+
+def _quantize_q8k(x_fp32):
+    """Quantize fp32 vector to Q8_K block(s)."""
+    x = x_fp32.flatten()
+    n_blocks = (len(x) + 255) // 256
+    blocks = (block_q8k_compat * n_blocks)()
+    for b in range(n_blocks):
+        chunk = x[b * 256 : (b + 1) * 256]
+        amax = max(abs(float(v)) for v in chunk)
+        d = amax / 127.0 if amax > 0 else 1.0
+        blocks[b].d = d
+        for i, v in enumerate(chunk):
+            blocks[b].qs[i] = max(-128, min(127, round(float(v) / d)))
+    return blocks
+
+
+def test_q8k_cuda_vs_cpu(d, vectors, layer_idx, rotation):
+    """Q8_K query path: CUDA dequantize-then-dot must agree with CPU Q8_K wrapper.
+
+    The CPU Q8_K path requires n to be a multiple of 256 (QK_Q8K). For d=128,
+    each Q8_K block covers 2 TQ4P blocks (256/128); for d=256, one Q8_K block
+    covers 1 TQ4P block. We build a multi-block dot and compare results.
+    """
+    n_tqp_per_q8k = 256 // d  # 2 for d=128, 1 for d=256
+    keys = vectors[:n_tqp_per_q8k * 5]  # enough for 5 Q8_K blocks
+    queries = vectors[25:30]
+    max_abs = 0.0
+
+    for q_set_idx in range(len(queries)):
+        # Build a query vector that spans one Q8_K block (256 fp32 values).
+        # For d=128: concatenate 2 query vectors; for d=256: use 1.
+        q_parts = [queries[(q_set_idx + i) % len(queries)].float().numpy().copy()
+                    for i in range(n_tqp_per_q8k)]
+        q_256 = torch.cat([torch.from_numpy(p) for p in q_parts]).numpy().copy()
+        q8k_blocks = _quantize_q8k(q_256)
+
+        # Build corresponding TQ4P key blocks.
+        key_parts = [keys[(q_set_idx * n_tqp_per_q8k + i) % len(keys)]
+                      for i in range(n_tqp_per_q8k)]
+        tq_blocks = []
+        for kp in key_parts:
+            k_np = kp.float().numpy().copy()
+            tq_blocks.append(_cpu_quantize(d, k_np, layer_idx, rotation))
+
+        # CPU Q8_K path: n = 256 (one Q8_K block)
+        cpu_result = ctypes.c_float(0.0)
+        if d == 128:
+            BlockArray = block_tq4p_d128 * n_tqp_per_q8k
+            blk_arr = BlockArray(*tq_blocks)
+            cpu.ggml_vec_dot_tq4p_d128_q8k(
+                256, ctypes.byref(cpu_result), 0,
+                ctypes.byref(blk_arr), 0,
+                ctypes.byref(q8k_blocks), 0,
+                1)
+        else:
+            BlockArray = block_tq4p_d256 * n_tqp_per_q8k
+            blk_arr = BlockArray(*tq_blocks)
+            cpu.ggml_vec_dot_tq4p_d256_q8k(
+                256, ctypes.byref(cpu_result), 0,
+                ctypes.byref(blk_arr), 0,
+                ctypes.byref(q8k_blocks), 0,
+                1)
+
+        # CUDA Q8_K path: dequantize Q8K to fp32, then per-block dot.
+        # The CUDA test wrapper processes blocks one at a time with
+        # the first d elements of the dequantized Q8K query.
+        cuda_acc = 0.0
+        for i in range(n_tqp_per_q8k):
+            sub_q_np = q_parts[i]
+            sub_q8k = _quantize_q8k(sub_q_np if d == 256 else
+                                     torch.cat([torch.from_numpy(sub_q_np),
+                                                torch.zeros(256 - d)]).numpy().copy())
+            if d == 128:
+                BA = block_tq4p_d128 * 1
+                ba = BA(tq_blocks[i])
+                out = (ctypes.c_float * 1)()
+                err = cuda.tqp_cuda_vec_dot_q8k_d128(
+                    ctypes.byref(sub_q8k), ba, out, 1)
+            else:
+                BA = block_tq4p_d256 * 1
+                ba = BA(tq_blocks[i])
+                out = (ctypes.c_float * 1)()
+                err = cuda.tqp_cuda_vec_dot_q8k_d256(
+                    ctypes.byref(sub_q8k), ba, out, 1)
+
+            assert err == 0, f"CUDA Q8_K vec_dot returned error {err}"
+            cuda_acc += out[0]
+
+        diff = abs(cpu_result.value - cuda_acc)
+        max_abs = max(max_abs, diff)
+
+    # Tolerance is wider than the fp32 path because Q8_K dequantization adds
+    # rounding on top of TQ4P quantization noise.
+    assert max_abs < 2e-3, (
+        f"Q8_K CUDA vs CPU vec_dot max diff {max_abs:.2e} "
+        f"d={d} layer {layer_idx} rot {ROTATION_IDS[rotation]}"
+    )
