@@ -7,6 +7,13 @@
 #define QK_TQ4P_D128 128
 #define QK_TQ4P_D256 256
 
+// Must match patches/stage2-qjl/c/ggml-tq-paper.h
+#define TQP_ROT_WHT  0u
+#define TQP_ROT_HAAR 1u
+#define TQP_LAYER_BYTE(layer, rot) ((uint8_t)((((uint32_t)(rot) & 1u) << 7) | ((uint32_t)(layer) & 0x1fu)))
+#define TQP_EXTRACT_LAYER(byte)    ((uint8_t)((byte) & 0x1fu))
+#define TQP_EXTRACT_ROT(byte)      ((uint8_t)(((byte) >> 7) & 1u))
+
 // Block layout matches the CPU path (patches/stage2-qjl/c/ggml-tq-paper.h):
 //   offset 0..1  orig_norm (fp16)
 //   offset 2..3  res_d     (fp16)

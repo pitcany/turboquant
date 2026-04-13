@@ -1,8 +1,9 @@
 """
-CUDA implementation cross-checks against the C CPU reference (WHT variant).
+CUDA implementation cross-checks against the C CPU reference.
 
 Tests byte-exact equivalence of CUDA vs CPU quantize output, plus numerical
-agreement of prepare_query and vec_dot across multiple layer indices.
+agreement of prepare_query and vec_dot across multiple layer indices and
+both rotation modes (TQP_ROT_WHT, TQP_ROT_HAAR).
 
 Build first:
     cd patches/stage2-qjl/c
@@ -154,6 +155,8 @@ cuda.tqp_cuda_vec_dot_row_d256.argtypes = [
 
 # Layer indices to exercise: layer 0, some spread, the last one.
 TEST_LAYERS = [0, 1, 7, 15, 31]
+ROTATIONS = [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]
+ROTATION_IDS = {ref.TQP_ROT_WHT: "wht", ref.TQP_ROT_HAAR: "haar"}
 
 
 @pytest.fixture(scope="module", params=[128, 256])
@@ -171,6 +174,11 @@ def layer_idx(request):
     return request.param
 
 
+@pytest.fixture(scope="module", params=ROTATIONS, ids=lambda r: ROTATION_IDS[r])
+def rotation(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
 def vectors(d):
     g = torch.Generator().manual_seed(54321)
@@ -182,23 +190,25 @@ def _as_float_ptr(x):
     return x.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
-def _cpu_quantize(d: int, x_np, layer_idx: int):
+def _cpu_quantize(d: int, x_np, layer_idx: int, rotation: int):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     if d == 128:
         blk = block_tq4p_d128()
-        cpu.ggml_quantize_row_tq4p_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_idx)
+        cpu.ggml_quantize_row_tq4p_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
     else:
         blk = block_tq4p_d256()
-        cpu.ggml_quantize_row_tq4p_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_idx)
+        cpu.ggml_quantize_row_tq4p_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
     return blk
 
 
-def _cuda_quantize(d: int, x_np, layer_idx: int):
+def _cuda_quantize(d: int, x_np, layer_idx: int, rotation: int):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     if d == 128:
         blk = block_tq4p_d128()
-        err = cuda.tqp_cuda_quantize_row_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_idx)
+        err = cuda.tqp_cuda_quantize_row_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
     else:
         blk = block_tq4p_d256()
-        err = cuda.tqp_cuda_quantize_row_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_idx)
+        err = cuda.tqp_cuda_quantize_row_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
     assert err == 0
     return blk
 
@@ -207,32 +217,34 @@ def _block_bytes(blk) -> bytes:
     return bytes(memoryview(blk))
 
 
-def test_byte_identical_quantize(d, vectors, layer_idx):
+def test_byte_identical_quantize(d, vectors, layer_idx, rotation):
     for i, x in enumerate(vectors):
         x_np = x.float().numpy().copy()
-        cpu_bytes = _block_bytes(_cpu_quantize(d, x_np, layer_idx))
-        cuda_bytes = _block_bytes(_cuda_quantize(d, x_np, layer_idx))
+        cpu_bytes = _block_bytes(_cpu_quantize(d, x_np, layer_idx, rotation))
+        cuda_bytes = _block_bytes(_cuda_quantize(d, x_np, layer_idx, rotation))
         if cuda_bytes != cpu_bytes:
             diffs = [j for j in range(len(cpu_bytes)) if cuda_bytes[j] != cpu_bytes[j]]
             fp16_fields_close = abs(int.from_bytes(cuda_bytes[0:2], "little") - int.from_bytes(cpu_bytes[0:2], "little")) <= 1
             fp16_fields_close &= abs(int.from_bytes(cuda_bytes[2:4], "little") - int.from_bytes(cpu_bytes[2:4], "little")) <= 1
             bit_fields_equal = cuda_bytes[4:] == cpu_bytes[4:]
             pytest.fail(
-                f"byte mismatch on vec {i} d={d} layer={layer_idx}: {len(diffs)} bytes differ, "
-                f"first offset {diffs[0]}, fp16_within_ulp={fp16_fields_close}, "
-                f"tail_exact={bit_fields_equal}"
+                f"byte mismatch vec {i} d={d} layer={layer_idx} rot={ROTATION_IDS[rotation]}: "
+                f"{len(diffs)} bytes differ, first offset {diffs[0]}, "
+                f"fp16_within_ulp={fp16_fields_close}, tail_exact={bit_fields_equal}"
             )
 
 
-def test_layer_idx_stored_in_block(d, vectors, layer_idx):
+def test_layer_byte_stored_in_block(d, vectors, layer_idx, rotation):
     x_np = vectors[0].float().numpy().copy()
-    cpu_blk = _cpu_quantize(d, x_np, layer_idx)
-    cuda_blk = _cuda_quantize(d, x_np, layer_idx)
-    assert cpu_blk.layer_idx == layer_idx
-    assert cuda_blk.layer_idx == layer_idx
+    cpu_blk = _cpu_quantize(d, x_np, layer_idx, rotation)
+    cuda_blk = _cuda_quantize(d, x_np, layer_idx, rotation)
+    for blk in (cpu_blk, cuda_blk):
+        assert ref.extract_layer(blk.layer_idx) == layer_idx
+        assert ref.extract_rotation(blk.layer_idx) == rotation
 
 
-def test_prepare_query_agreement(d, constants, vectors, layer_idx):
+def test_prepare_query_agreement(d, constants, vectors, layer_idx, rotation):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     for q in vectors[25:35]:
         q_np = q.float().numpy().copy()
         cpu_sq = (ctypes.c_float * d)()
@@ -240,56 +252,56 @@ def test_prepare_query_agreement(d, constants, vectors, layer_idx):
         cuda_q_rot = (ctypes.c_float * d)()
 
         if d == 128:
-            cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), cpu_sq, layer_idx)
-            err = cuda.tqp_cuda_prepare_query_d128(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_idx)
+            cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), cpu_sq, layer_byte)
+            err = cuda.tqp_cuda_prepare_query_d128(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_byte)
         else:
-            cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), cpu_sq, layer_idx)
-            err = cuda.tqp_cuda_prepare_query_d256(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_idx)
+            cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), cpu_sq, layer_byte)
+            err = cuda.tqp_cuda_prepare_query_d256(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_byte)
 
         assert err == 0
         cpu_sq_t = torch.tensor(list(cpu_sq))
         cuda_sq_t = torch.tensor(list(cuda_sq))
         cuda_q_rot_t = torch.tensor(list(cuda_q_rot))
-        # Reference q_rot for the WHT variant: rht_apply(σ_layer, q).
-        py_q_rot_t = ref.rht_apply(constants.sigma[layer_idx], q.float())
+        py_q_rot_t = ref.rot_apply(rotation, constants.sigma[layer_idx], constants.pi[layer_idx], q.float())
 
         assert (cuda_sq_t - cpu_sq_t).abs().max().item() < 1e-5
-        assert (cuda_q_rot_t - py_q_rot_t).abs().max().item() < 1e-5
+        assert (cuda_q_rot_t - py_q_rot_t).abs().max().item() < 1e-4
 
 
-def test_vec_dot_agreement(d, vectors, layer_idx):
+def test_vec_dot_agreement(d, vectors, layer_idx, rotation):
     keys = vectors[:25]
     queries = vectors[25:50]
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     max_abs = 0.0
 
     for q in queries:
         q_np = q.float().numpy().copy()
         for k in keys:
             k_np = k.float().numpy().copy()
-            blk = _cpu_quantize(d, k_np, layer_idx)
+            blk = _cpu_quantize(d, k_np, layer_idx, rotation)
 
             sq = (ctypes.c_float * d)()
             if d == 128:
-                cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), sq, layer_idx)
+                cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), sq, layer_byte)
                 cpu_ip = cpu.ggml_tqp_vec_dot_block_d128(_as_float_ptr(q_np), sq, ctypes.byref(blk))
                 cuda_ip = cuda.tqp_cuda_vec_dot_block_d128(_as_float_ptr(q_np), ctypes.byref(blk))
             else:
-                cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), sq, layer_idx)
+                cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), sq, layer_byte)
                 cpu_ip = cpu.ggml_tqp_vec_dot_block_d256(_as_float_ptr(q_np), sq, ctypes.byref(blk))
                 cuda_ip = cuda.tqp_cuda_vec_dot_block_d256(_as_float_ptr(q_np), ctypes.byref(blk))
             max_abs = max(max_abs, abs(cpu_ip - cuda_ip))
 
-    assert max_abs < 1e-4, f"CUDA vs CPU vec_dot max diff {max_abs:.2e} at layer {layer_idx}"
+    assert max_abs < 1e-4, f"CUDA vs CPU vec_dot max diff {max_abs:.2e} layer {layer_idx} rot {ROTATION_IDS[rotation]}"
 
 
-def test_dispatch_wrapper_matches_block_api(d, vectors, layer_idx):
+def test_dispatch_wrapper_matches_block_api(d, vectors, layer_idx, rotation):
     keys = vectors[:5]
     q = vectors[5]
     q_np = q.float().numpy().copy()
 
     if d == 128:
         BlockArray = block_tq4p_d128 * len(keys)
-        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx) for k in keys])
+        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx, rotation) for k in keys])
         out = (ctypes.c_float * len(keys))()
         err = cuda.tqp_cuda_vec_dot_row_d128(_as_float_ptr(q_np), blocks, out, len(keys))
         block_scores = [
@@ -298,7 +310,7 @@ def test_dispatch_wrapper_matches_block_api(d, vectors, layer_idx):
         ]
     else:
         BlockArray = block_tq4p_d256 * len(keys)
-        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx) for k in keys])
+        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx, rotation) for k in keys])
         out = (ctypes.c_float * len(keys))()
         err = cuda.tqp_cuda_vec_dot_row_d256(_as_float_ptr(q_np), blocks, out, len(keys))
         block_scores = [

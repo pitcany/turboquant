@@ -14,16 +14,17 @@ extern "C" int tqp_cuda_device_count() {
     return count;
 }
 
-// Quantize one d-vector into a tq4p block using the WHT variant:
-//   x_rot       = (1/√d) · WHT(σ ⊙ x_unit)
-//   idx[i]      = bucketize(x_rot[i])
-//   x_hat_unit  = (1/√d) · σ ⊙ WHT(centroids[idx])     (Πᵀ, H is symmetric)
-//   residual    = x_unit - x_hat_unit
-//   proj        = S · residual                         (Gaussian QJL, unchanged)
+// Quantize one d-vector into a tq4p block. Branches on rotation mode:
+//   TQP_ROT_WHT : x_rot = (1/√d)·WHT(σ ⊙ x_unit),    x_hat = (1/√d)·σ⊙WHT(c[idx])
+//   TQP_ROT_HAAR: x_rot = Π·x_unit (GEMV),           x_hat = Πᵀ·c[idx] (GEMV)
+//
+// Common tail:
+//   residual = x_unit - x_hat_unit
+//   proj     = S · residual  (Gaussian QJL, rotation-agnostic)
 //
 // One thread per element. smem_vec is reused across phases; `x_unit_reg`
-// keeps the per-thread share of x_unit alive across the destructive WHTs.
-template<int D>
+// keeps the per-thread share of x_unit alive across rotation passes.
+template<int D, uint8_t ROT>
 __device__ static inline void tqp_quantize_block_device(
         const float * __restrict__ x,
         uint16_t * orig_norm_out,
@@ -33,6 +34,7 @@ __device__ static inline void tqp_quantize_block_device(
         uint8_t * __restrict__ qs_out,
         uint8_t * __restrict__ signs_out,
         const float * __restrict__ sigma,
+        const float * __restrict__ pi,
         const float * __restrict__ s,
         const float * __restrict__ centroids,
         const float * __restrict__ bounds) {
@@ -41,8 +43,8 @@ __device__ static inline void tqp_quantize_block_device(
     __shared__ float smem_scalars[2];
 
     const int tid = threadIdx.x;
-    const float rsqrt_d = rsqrtf((float)D);
-    const float sigma_tid = sigma[tid];
+    const float rsqrt_d = (ROT == TQP_ROT_WHT) ? rsqrtf((float)D) : 0.0f;
+    const float sigma_tid = (ROT == TQP_ROT_WHT) ? sigma[tid] : 0.0f;
 
     smem_vec[tid] = x[tid];
     __syncthreads();
@@ -62,25 +64,52 @@ __device__ static inline void tqp_quantize_block_device(
     }
     __syncthreads();
 
-    // x_unit = x / ||x||, kept in both smem (for the forward WHT) and in a
-    // per-thread register (for the later residual = x_unit - x_hat_unit).
+    // x_unit = x / ||x||, kept in a per-thread register for later residual.
     const float x_unit_reg = __fmul_rn(smem_vec[tid], smem_scalars[1]);
-    smem_vec[tid] = __fmul_rn(x_unit_reg, sigma_tid);
-    __syncthreads();
 
-    // x_rot = (1/√d) · WHT(σ ⊙ x_unit)
-    tqp_wht_shared<D>(smem_vec);
-    const float x_rot_tid = __fmul_rn(smem_vec[tid], rsqrt_d);
+    float x_rot_tid;
+    if constexpr (ROT == TQP_ROT_WHT) {
+        // smem_vec[tid] = σ ⊙ x_unit, then in-place FWHT, then scale.
+        smem_vec[tid] = __fmul_rn(x_unit_reg, sigma_tid);
+        __syncthreads();
+        tqp_wht_shared<D>(smem_vec);
+        x_rot_tid = __fmul_rn(smem_vec[tid], rsqrt_d);
+    } else {
+        // Dense Haar GEMV: x_rot[tid] = Σ_j Π[tid, j] · x_unit[j].
+        smem_vec[tid] = x_unit_reg;
+        __syncthreads();
+        float acc = 0.0f;
+#pragma unroll 1
+        for (int j = 0; j < D; ++j) {
+            acc = __fadd_rn(acc, __fmul_rn(__ldg(&pi[tid * D + j]), smem_vec[j]));
+        }
+        x_rot_tid = acc;
+    }
     smem_idx[tid] = tqp_bucketize_d3(x_rot_tid, bounds);
     __syncthreads();
 
-    // x_hat_unit = (1/√d) · σ ⊙ WHT(centroids[idx])
-    smem_vec[tid] = centroids[smem_idx[tid]];
-    __syncthreads();
-    tqp_wht_shared<D>(smem_vec);
-    const float x_hat_tid = __fmul_rn(smem_vec[tid], __fmul_rn(sigma_tid, rsqrt_d));
+    float x_hat_tid;
+    if constexpr (ROT == TQP_ROT_WHT) {
+        // x_hat_unit = (1/√d) · σ ⊙ WHT(centroids[idx]).
+        smem_vec[tid] = centroids[smem_idx[tid]];
+        __syncthreads();
+        tqp_wht_shared<D>(smem_vec);
+        x_hat_tid = __fmul_rn(smem_vec[tid], __fmul_rn(sigma_tid, rsqrt_d));
+    } else {
+        // Dense Haar GEMV (transposed): x_hat[tid] = Σ_i Π[i, tid] · c[idx[i]].
+        // Stage c[idx] in smem so every thread can read each entry.
+        smem_vec[tid] = centroids[smem_idx[tid]];
+        __syncthreads();
+        float acc = 0.0f;
+#pragma unroll 1
+        for (int i = 0; i < D; ++i) {
+            acc = __fadd_rn(acc, __fmul_rn(__ldg(&pi[i * D + tid]), smem_vec[i]));
+        }
+        x_hat_tid = acc;
+    }
 
     // residual = x_unit - x_hat_unit
+    __syncthreads();
     smem_vec[tid] = __fadd_rn(x_unit_reg, -x_hat_tid);
     __syncthreads();
 
@@ -129,12 +158,16 @@ __device__ static inline void tqp_quantize_block_device(
 
 // Per-layer sigma lives in __constant__ memory; the kernel reads it by
 // symbol rather than via a kernel-argument pointer (host-side addresses of
-// __constant__ symbols are not usable as device pointers). The layer_idx
-// is passed as a scalar kernel arg and also stamped into the block header.
+// __constant__ symbols are not usable as device pointers). Π lives in
+// device global memory via `pi`. ROT is a template parameter so the dead
+// branch is compiled out.
+template<uint8_t ROT>
 __global__ static void tqp_quantize_kernel_d128(
         const float * __restrict__ x,
         block_tq4p_d128 * __restrict__ y,
-        uint8_t layer_idx,
+        uint8_t layer_byte_val,
+        uint8_t layer,
+        const float * __restrict__ pi,
         const float * __restrict__ s,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
@@ -142,24 +175,28 @@ __global__ static void tqp_quantize_kernel_d128(
         return;
     }
 
-    tqp_quantize_block_device<QK_TQ4P_D128>(
+    tqp_quantize_block_device<QK_TQ4P_D128, ROT>(
         x + b * QK_TQ4P_D128,
         &y[b].orig_norm,
         &y[b].res_d,
         &y[b].layer_idx,
-        layer_idx,
+        layer_byte_val,
         y[b].qs,
         y[b].qjl_signs,
-        &c_tqp_sigma_d128[layer_idx][0],
+        &c_tqp_sigma_d128[layer][0],
+        pi + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
         s,
         c_tqp_centroids_d128,
         c_tqp_boundaries_d128);
 }
 
+template<uint8_t ROT>
 __global__ static void tqp_quantize_kernel_d256(
         const float * __restrict__ x,
         block_tq4p_d256 * __restrict__ y,
-        uint8_t layer_idx,
+        uint8_t layer_byte_val,
+        uint8_t layer,
+        const float * __restrict__ pi,
         const float * __restrict__ s,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
@@ -167,44 +204,59 @@ __global__ static void tqp_quantize_kernel_d256(
         return;
     }
 
-    tqp_quantize_block_device<QK_TQ4P_D256>(
+    tqp_quantize_block_device<QK_TQ4P_D256, ROT>(
         x + b * QK_TQ4P_D256,
         &y[b].orig_norm,
         &y[b].res_d,
         &y[b].layer_idx,
-        layer_idx,
+        layer_byte_val,
         y[b].qs,
         y[b].qjl_signs,
-        &c_tqp_sigma_d256[layer_idx][0],
+        &c_tqp_sigma_d256[layer][0],
+        pi + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
         s,
         c_tqp_centroids_d256,
         c_tqp_boundaries_d256);
 }
 
-extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64_t k, uint8_t layer_idx, cudaStream_t stream) {
+extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
     if (k % QK_TQ4P_D128 != 0) {
         return;
     }
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
-    const uint8_t layer = (uint8_t)(layer_idx % TQP_MAX_LAYERS);
+    const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
+    const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
+    const uint8_t byte_stored = TQP_LAYER_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D128;
-    tqp_quantize_kernel_d128<<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-        x, (block_tq4p_d128 *)y, layer, d_tqp_s_d128, n_blocks);
+    if (rot == TQP_ROT_WHT) {
+        tqp_quantize_kernel_d128<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
+            x, (block_tq4p_d128 *)y, byte_stored, layer, d_tqp_pi_d128, d_tqp_s_d128, n_blocks);
+    } else {
+        tqp_quantize_kernel_d128<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
+            x, (block_tq4p_d128 *)y, byte_stored, layer, d_tqp_pi_d128, d_tqp_s_d128, n_blocks);
+    }
 }
 
-extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64_t k, uint8_t layer_idx, cudaStream_t stream) {
+extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
     if (k % QK_TQ4P_D256 != 0) {
         return;
     }
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
-    const uint8_t layer = (uint8_t)(layer_idx % TQP_MAX_LAYERS);
+    const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
+    const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
+    const uint8_t byte_stored = TQP_LAYER_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D256;
-    tqp_quantize_kernel_d256<<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-        x, (block_tq4p_d256 *)y, layer, d_tqp_s_d256, n_blocks);
+    if (rot == TQP_ROT_WHT) {
+        tqp_quantize_kernel_d256<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
+            x, (block_tq4p_d256 *)y, byte_stored, layer, d_tqp_pi_d256, d_tqp_s_d256, n_blocks);
+    } else {
+        tqp_quantize_kernel_d256<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
+            x, (block_tq4p_d256 *)y, byte_stored, layer, d_tqp_pi_d256, d_tqp_s_d256, n_blocks);
+    }
 }
 
 template<typename Block>
@@ -213,7 +265,7 @@ static int tqp_cuda_quantize_row_host(
         const float * x_host,
         void * y_host,
         int64_t k,
-        uint8_t layer_idx,
+        uint8_t layer_byte,
         void (*device_fn)(const float *, void *, int64_t, uint8_t, cudaStream_t)) {
     if (k <= 0 || k % d != 0) {
         return 1;
@@ -234,7 +286,7 @@ static int tqp_cuda_quantize_row_host(
 
     err = cudaMemcpy(x_dev, x_host, x_bytes, cudaMemcpyHostToDevice);
     if (err == cudaSuccess) {
-        device_fn(x_dev, y_dev, k, layer_idx, 0);
+        device_fn(x_dev, y_dev, k, layer_byte, 0);
         err = cudaGetLastError();
     }
     if (err == cudaSuccess) {
@@ -249,12 +301,12 @@ static int tqp_cuda_quantize_row_host(
     return (int)err;
 }
 
-extern "C" int tqp_cuda_quantize_row_d128(const float * x_host, void * y_host, int64_t k, uint8_t layer_idx) {
+extern "C" int tqp_cuda_quantize_row_d128(const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
     return tqp_cuda_quantize_row_host<block_tq4p_d128>(
-        QK_TQ4P_D128, x_host, y_host, k, layer_idx, ggml_cuda_tqp_quantize_row_d128);
+        QK_TQ4P_D128, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d128);
 }
 
-extern "C" int tqp_cuda_quantize_row_d256(const float * x_host, void * y_host, int64_t k, uint8_t layer_idx) {
+extern "C" int tqp_cuda_quantize_row_d256(const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
     return tqp_cuda_quantize_row_host<block_tq4p_d256>(
-        QK_TQ4P_D256, x_host, y_host, k, layer_idx, ggml_cuda_tqp_quantize_row_d256);
+        QK_TQ4P_D256, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d256);
 }

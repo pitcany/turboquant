@@ -1,4 +1,4 @@
-# TQ4P — TurboQuant-ish KV quantization for ollama's ggml
+# TQ4P — TurboQuant(-ish) KV quantization for ollama's ggml
 
 Two new ggml block quantization types, derived from TurboQuant
 (ICLR 2026, [arXiv 2504.19874](https://arxiv.org/abs/2504.19874)),
@@ -10,35 +10,36 @@ vendored `ml/backend/ggml/ggml/`). Nothing existing is modified in place.
 | `GGML_TYPE_TQ4P_D128` | 128 | Llama 3.x, Qwen 2.5, Qwen 3 | 69 B / 128 | 4.3125 |
 | `GGML_TYPE_TQ4P_D256` | 256 | Qwen 3.5 gated attention | 133 B / 256 | ~4.16 |
 
-Algorithm = Randomized Hadamard Transform Π = (1/√d) · H · diag(σ)
-(replacing the paper's Haar rotation on this branch) + 3-bit Lloyd-Max
-per coord + 1-bit Gaussian QJL on residual. Unbiased inner-product
-estimator with `√(π/2)/d` correction. One byte of each block holds the
-per-layer index (32 layers supported) so Π and S are per-layer without
-changing the wire format.
+**Stage 1** is a random orthogonal rotation Π + 3-bit Lloyd-Max per
+coord. Π is user-selectable **per block**:
 
-## Branch note: WHT swap
+- `TQP_ROT_WHT` (default): Randomized Hadamard Transform
+  Π = (1/√d) · H · diag(σ). O(d log d) to apply, d floats of σ per layer.
+- `TQP_ROT_HAAR`: dense d×d Haar rotation (paper-exact; byte-identical
+  to `turboquant.py::TurboQuantProd`).
 
-This branch (`claude/swap-haar-to-wht-*`) intentionally diverges from the
-paper. The Haar rotation Π is replaced with the Randomized Hadamard
-Transform; per-layer storage drops from `d²` floats (Π) to `d` floats (σ)
-and apply cost drops from O(d²) to O(d log d). Still orthogonal, so the
-paper's distortion bounds still hold for random unit vector inputs, but
-the stored indices / QJL signs no longer match `turboquant.py::TurboQuantProd`
-byte-for-byte.
+**Stage 2** is the QJL estimator: a Gaussian random projection S of the
+residual with a 1-bit sign per coordinate, unbiased inner-product
+estimator with `√(π/2)/d` correction. Shared between rotations.
+
+The high bit of each block's `layer_idx` byte selects the rotation;
+bits 0..4 hold the per-layer index (32 layers). The caller passes a
+packed `layer_byte = (rotation << 7) | (layer & 0x1f)` into quantize /
+prepare_query; dequantize / vec_dot read the byte from the block header.
 
 ## Validation status
 
 The patch is **byte-exactly** self-consistent between the C and Python
-reference implementations:
+reference implementations, across both rotations and 5 layer indices:
 
 | Check | Result |
 |---|---|
-| C `quantize_row_*` output byte-identical to Python reference | ✓ |
+| C `quantize_row_*` byte-identical to Python reference (both rotations) | ✓ |
 | C `dequantize_row_*` matches Python reference (max diff < 1e-4) | ✓ |
 | C `vec_dot` matches Python reference (max diff < 5e-4) | ✓ |
-| Paper MSE bound (≤ 0.043 per vector for 3-bit) | ✓ |
-| Paper IP correlation (≥ 0.85 for 3-bit + 1-bit QJL) | ✓ |
+| Paper MSE bound (≤ 0.043/vec for 3-bit, both rotations) | ✓ |
+| Paper IP correlation (≥ 0.85, both rotations) | ✓ |
+| Haar mode byte-identical to `turboquant.py::TurboQuantProd(seed=42+i)` | ✓ |
 
 Reproduce locally:
 
@@ -129,13 +130,15 @@ load the same bits the C headers contain. `c/libggml_tq_paper.so` and
   (`apply_go_plumbing.sh`) + CUDA dispatch hook. `OLLAMA_KV_CACHE_TYPE=tq4p_d128`
   and `OLLAMA_KV_CACHE_TYPE=tq4p_d256` both resolve to the real GGML
   enum instead of falling back to f16.
-- **Per-layer σ and S** — the block header carries a `layer_idx` byte
-  so the 32 pre-generated per-layer constants (seeds 42+i / 43+i) are
-  selected at quant and dot-product time. Works on both CPU and CUDA
-  paths; the CUDA block struct is size-aligned with the CPU layout
-  (69/133 B) and the CUDA `ggml_cuda_op_tqp_vec_dot` wrapper auto-derives
-  `layer_idx` from the first K-block via a 1-byte d2h copy so
-  `apply_hooks.sh` hook 5 stays unchanged.
+- **Per-layer σ, Π and S + runtime rotation pick** — the block header
+  byte packs `(rotation << 7) | (layer & 0x1f)`. The 32 pre-generated
+  per-layer constants (seeds 42+i / 43+i) are selected at quant and
+  dot-product time. Rotation (WHT or Haar) is selected the same way,
+  without a rebuild. Works on both CPU and CUDA paths; the CUDA block
+  struct is size-aligned with the CPU layout (69/133 B) and the CUDA
+  `ggml_cuda_op_tqp_vec_dot` wrapper auto-derives the packed byte from
+  the first K-block via a 1-byte d2h copy so `apply_hooks.sh` hook 5
+  stays unchanged.
 - **`validate.py` has a TQ4P path** that drives the C library via
   ctypes for attention-score cosine-sim checks (see the `TQ4P (C)` mode
   in the module docstring).

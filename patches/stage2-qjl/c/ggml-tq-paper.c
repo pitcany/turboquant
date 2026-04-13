@@ -1,27 +1,25 @@
-// TurboQuant-ish quantization — CPU reference implementation.
+// TurboQuant(-ish) quantization — CPU reference implementation.
 //
 // Byte-exact mirror of patches/stage2-qjl/python/tq_paper_reference.py.
 //
-// Variant: this branch replaces the paper's Haar random orthogonal rotation
-// Π with a Randomized Hadamard Transform, i.e. Π := (1/√d) · H · diag(σ)
-// where H is the d×d Walsh-Hadamard matrix and σ ∈ {±1}^d is a per-layer
-// random sign vector. This is still orthogonal but O(d log d) to apply, and
-// keeps only a d-entry sign vector per layer instead of a d×d matrix.
+// The rotation Π is user-selectable per block:
+//   TQP_ROT_HAAR: dense d×d Haar matrix (paper-exact).
+//   TQP_ROT_WHT : Randomized Hadamard Transform (1/√d)·H·diag(σ), O(d log d).
+// Both are orthogonal, so the same bound analysis applies. Selection is
+// encoded in the high bit of the block's layer_idx byte (see header).
 //
 // The algorithm is otherwise TurboQuant-ish: 3-bit Lloyd-Max scalar
 // quantization on the rotated unit vector, then a 1-bit Gaussian QJL sign
-// estimator on the residual. The QJL projection S is unchanged (still a
-// d×d Gaussian matrix, per-layer). The Lloyd-Max codebook is regenerated
-// with the same Gaussian approximation — for uniformly random unit vectors
-// the RHT marginals are identical to Haar's, so the codebook comes out
-// numerically the same.
+// estimator on the residual. The QJL projection S is shared between
+// rotations (it's applied to the residual in original space, not rotated
+// space). The Lloyd-Max codebook is computed from the Gaussian-approx
+// marginal, which matches both Haar and RHT for d ≥ 64.
 //
 // This file is deliberately simple: no SIMD, no unrolling, no vectorization.
-// Correctness first; CUDA kernels come in a follow-up commit where perf
-// matters.
+// Correctness first; CUDA kernels exist alongside.
 //
-// Per-layer sign vector σ_i and QJL projection S_i are stored as fp32 in
-// the generated headers, indexed by layer_idx (seeds: σ_i=42+i, S_i=43+i).
+// Per-layer constants are keyed by layer_idx (low 5 bits of layer_byte)
+// with seeds σ_i = Π_i = 42+i and S_i = 43+i. 32 layers supported.
 
 #include "ggml-tq-paper.h"
 
@@ -164,6 +162,44 @@ static inline void tqp_rht_apply_t(int d, const float * sigma, const float * v, 
     for (int i = 0; i < d; ++i) y[i] *= sigma[i] * inv_sqrt_d;
 }
 
+// ---------- Haar rotation (paper-exact) ----------
+//
+// pi is stored row-major as Π[i][j] = pi[i*d + j]. Π is a dense Haar random
+// orthogonal matrix (see turboquant.py::generate_rotation_matrix).
+
+// y = Π · v  (dense GEMV)
+static inline void tqp_pi_apply(int d, const float * pi, const float * v, float * y) {
+    for (int i = 0; i < d; ++i) {
+        float acc = 0.0f;
+        const float * pi_row = pi + (size_t)i * d;
+        for (int j = 0; j < d; ++j) acc += pi_row[j] * v[j];
+        y[i] = acc;
+    }
+}
+
+// y = Πᵀ · v  (GEMV with transposed access; equivalent to sum_i Π[i][:] · v[i])
+static inline void tqp_pi_apply_t(int d, const float * pi, const float * v, float * y) {
+    for (int j = 0; j < d; ++j) y[j] = 0.0f;
+    for (int i = 0; i < d; ++i) {
+        const float vi = v[i];
+        const float * pi_row = pi + (size_t)i * d;
+        for (int j = 0; j < d; ++j) y[j] += pi_row[j] * vi;
+    }
+}
+
+// Dispatch: apply Π based on rotation mode.
+static inline void tqp_rot_apply(int d, uint8_t rot, const float * sigma, const float * pi,
+                                 const float * v, float * y) {
+    if (rot == TQP_ROT_HAAR) tqp_pi_apply(d, pi, v, y);
+    else                     tqp_rht_apply(d, sigma, v, y);
+}
+
+static inline void tqp_rot_apply_t(int d, uint8_t rot, const float * sigma, const float * pi,
+                                   const float * v, float * y) {
+    if (rot == TQP_ROT_HAAR) tqp_pi_apply_t(d, pi, v, y);
+    else                     tqp_rht_apply_t(d, sigma, v, y);
+}
+
 // ---------- Lloyd-Max bucketize ----------
 //
 // Linear search over 7 boundaries; branchless via comparisons and adds.
@@ -188,7 +224,9 @@ static inline uint8_t tqp_bucketize_d3(float x, const float * bounds) {
 
 static void tqp_quantize_block(
         int d,
-        const float * sigma,      // (d,) ±1 sign vector, per-layer
+        uint8_t rotation,         // TQP_ROT_WHT or TQP_ROT_HAAR
+        const float * sigma,      // (d,) ±1 sign vector (WHT)
+        const float * pi,         // (d*d,) row-major Haar matrix (HAAR)
         const float * s,          // (d x d) row-major QJL matrix, per-layer
         const float * centroids,  // (8,)
         const float * bounds,     // (7,)
@@ -209,9 +247,9 @@ static void tqp_quantize_block(
     float x_unit[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) x_unit[i] = x[i] * inv_norm;
 
-    // x_rot = Π · x_unit = (1/√d) · H · diag(σ) · x_unit
+    // x_rot = Π · x_unit
     float x_rot[QK_TQ4P_D256];
-    tqp_rht_apply(d, sigma, x_unit, x_rot);
+    tqp_rot_apply(d, rotation, sigma, pi, x_unit, x_rot);
 
     // indices[i] = bucketize(x_rot[i])
     uint8_t idx[QK_TQ4P_D256];
@@ -221,7 +259,7 @@ static void tqp_quantize_block(
     float x_hat_rot[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) x_hat_rot[i] = centroids[idx[i]];
     float x_hat_unit[QK_TQ4P_D256];
-    tqp_rht_apply_t(d, sigma, x_hat_rot, x_hat_unit);
+    tqp_rot_apply_t(d, rotation, sigma, pi, x_hat_rot, x_hat_unit);
 
     // residual = x_unit - x_hat_unit
     float residual[QK_TQ4P_D256];
@@ -251,7 +289,9 @@ static void tqp_quantize_block(
 
 static void tqp_dequantize_block(
         int d,
+        uint8_t rotation,
         const float * sigma,
+        const float * pi,
         const float * centroids,
         float orig_norm,
         const uint8_t * qs,
@@ -264,7 +304,7 @@ static void tqp_dequantize_block(
     float x_hat_rot[QK_TQ4P_D256];
     for (int i = 0; i < d; ++i) x_hat_rot[i] = centroids[idx[i]];
     float x_hat_unit[QK_TQ4P_D256];
-    tqp_rht_apply_t(d, sigma, x_hat_rot, x_hat_unit);
+    tqp_rot_apply_t(d, rotation, sigma, pi, x_hat_rot, x_hat_unit);
 
     // Scale back to original magnitude
     for (int i = 0; i < d; ++i) y_out[i] = orig_norm * x_hat_unit[i];
@@ -283,7 +323,9 @@ static void tqp_prepare_query(int d, const float * s, const float * q, float * S
 
 static float tqp_vec_dot_block(
         int d,
+        uint8_t rotation,
         const float * sigma,
+        const float * pi,
         const float * centroids,
         const float * q,
         const float * Sq,
@@ -294,7 +336,7 @@ static float tqp_vec_dot_block(
 {
     // Stage 1: term1 = orig_norm · Σ_i (Π·q)[i] · centroids[idx[i]]
     float q_rot[QK_TQ4P_D256];
-    tqp_rht_apply(d, sigma, q, q_rot);
+    tqp_rot_apply(d, rotation, sigma, pi, q, q_rot);
 
     uint8_t idx[QK_TQ4P_D256];
     tqp_unpack_indices_bitplane(qs, idx, d / 8);
@@ -321,22 +363,25 @@ static float tqp_vec_dot_block(
 //   SIGMA_ARR[layer_idx] = pointer to d fp32 ±1 values for the layer's σ
 //   S_ARR[layer_idx]     = pointer to (d*d) floats for the layer's S
 
-#define TQP_DEFINE_ROW_FUNCS(D, SIGMA_ARR, S_ARR, CENTROIDS, BOUNDS)                          \
+#define TQP_DEFINE_ROW_FUNCS(D, SIGMA_ARR, PI_ARR, S_ARR, CENTROIDS, BOUNDS)                  \
     void ggml_quantize_row_tq4p_d##D(const float * x, block_tq4p_d##D * y,                    \
-                                     int64_t k, uint8_t layer_idx) {                           \
+                                     int64_t k, uint8_t layer_byte) {                          \
         assert(k % D == 0);                                                                   \
-        const uint8_t layer_idx_norm = tqp_layer_idx(layer_idx);                              \
+        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte));          \
+        const uint8_t rotation       = TQP_EXTRACT_ROT(layer_byte);                           \
+        const uint8_t stored_byte    = TQP_LAYER_BYTE(layer_idx_norm, rotation);              \
         const float * sigma = SIGMA_ARR[layer_idx_norm];                                      \
+        const float * pi    = PI_ARR[layer_idx_norm];                                         \
         const float * s     = S_ARR[layer_idx_norm];                                          \
         const int64_t nb = k / D;                                                             \
         for (int64_t b = 0; b < nb; ++b) {                                                    \
             float res_d, orig_norm;                                                           \
-            tqp_quantize_block(D, sigma, s, CENTROIDS, BOUNDS,                                \
+            tqp_quantize_block(D, rotation, sigma, pi, s, CENTROIDS, BOUNDS,                  \
                                x + b * D, y[b].qs, y[b].qjl_signs,                            \
                                &res_d, &orig_norm);                                           \
             y[b].orig_norm = tqp_fp32_to_fp16(orig_norm);                                     \
             y[b].res_d     = tqp_fp32_to_fp16(res_d);                                         \
-            y[b].layer_idx = layer_idx_norm;                                                  \
+            y[b].layer_idx = stored_byte;                                                     \
         }                                                                                     \
     }                                                                                         \
                                                                                               \
@@ -344,28 +389,34 @@ static float tqp_vec_dot_block(
         assert(k % D == 0);                                                                   \
         const int64_t nb = k / D;                                                             \
         for (int64_t b = 0; b < nb; ++b) {                                                    \
-            const uint8_t layer_idx_norm = tqp_layer_idx(x[b].layer_idx);                     \
+            const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(x[b].layer_idx));  \
+            const uint8_t rotation       = TQP_EXTRACT_ROT(x[b].layer_idx);                   \
             const float * sigma = SIGMA_ARR[layer_idx_norm];                                  \
+            const float * pi    = PI_ARR[layer_idx_norm];                                     \
             float orig_norm = tqp_fp16_to_fp32(x[b].orig_norm);                               \
-            tqp_dequantize_block(D, sigma, CENTROIDS, orig_norm, x[b].qs, y + b * D);         \
+            tqp_dequantize_block(D, rotation, sigma, pi, CENTROIDS,                           \
+                                 orig_norm, x[b].qs, y + b * D);                              \
         }                                                                                     \
     }                                                                                         \
                                                                                               \
-    void ggml_tqp_prepare_query_d##D(const float * q, float * Sq, uint8_t layer_idx) {        \
-        tqp_prepare_query(D, S_ARR[tqp_layer_idx(layer_idx)], q, Sq);                         \
+    void ggml_tqp_prepare_query_d##D(const float * q, float * Sq, uint8_t layer_byte) {       \
+        (void)layer_byte; /* rotation only affects Π, not Sq */                               \
+        tqp_prepare_query(D, S_ARR[tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte))], q, Sq);     \
     }                                                                                         \
                                                                                               \
     float ggml_tqp_vec_dot_block_d##D(const float * q, const float * Sq,                      \
                                        const block_tq4p_d##D * blk) {                         \
-        const uint8_t layer_idx_norm = tqp_layer_idx(blk->layer_idx);                         \
-        return tqp_vec_dot_block(D, SIGMA_ARR[layer_idx_norm], CENTROIDS, q, Sq,              \
+        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(blk->layer_idx));      \
+        const uint8_t rotation       = TQP_EXTRACT_ROT(blk->layer_idx);                       \
+        return tqp_vec_dot_block(D, rotation, SIGMA_ARR[layer_idx_norm], PI_ARR[layer_idx_norm], \
+                                 CENTROIDS, q, Sq,                                            \
                                  blk->qs, blk->qjl_signs,                                    \
                                  tqp_fp16_to_fp32(blk->orig_norm),                            \
                                  tqp_fp16_to_fp32(blk->res_d));                               \
     }
 
-TQP_DEFINE_ROW_FUNCS(128, TQP_SIGMA_D128, TQP_S_D128, TQP_CENTROIDS_D128, TQP_BOUNDARIES_D128)
-TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUNDARIES_D256)
+TQP_DEFINE_ROW_FUNCS(128, TQP_SIGMA_D128, TQP_PI_D128, TQP_S_D128, TQP_CENTROIDS_D128, TQP_BOUNDARIES_D128)
+TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUNDARIES_D256)
 
 // ---------- ggml dispatch wrappers ----------
 //
