@@ -243,6 +243,31 @@ def test_layer_byte_stored_in_block(d, vectors, layer_idx, rotation):
         assert ref.extract_rotation(blk.layer_idx) == rotation
 
 
+def test_cuda_per_layer_produces_different_bytes(d, vectors, rotation):
+    """Regression guard: CUDA quantize output must actually differ across
+    layer indices. If the kernels silently reverted to reading σ_0/Π_0/S_0
+    for every block (the pre-#8 bug in the plain-Haar CUDA path), this test
+    would fail with identical qs/qjl_signs regardless of layer_idx.
+
+    Different layer indices in [0, 31] use different seeds (42+i, 43+i) so
+    σ_i, Π_i, S_i are all independent. Byte-for-byte identical output
+    across two distinct layer_idx values is statistically impossible when
+    the per-layer constants are actually wired through.
+    """
+    x_np = vectors[0].float().numpy().copy()
+    blk0 = _cuda_quantize(d, x_np, 0, rotation)
+    blk_hi = _cuda_quantize(d, x_np, TEST_LAYERS[-1], rotation)
+    b0 = _block_bytes(blk0)
+    bh = _block_bytes(blk_hi)
+    # Skip the layer_idx byte at offset 4 (which naturally differs); the
+    # real signal is in qs/qjl_signs at offset 5..
+    assert b0[5:] != bh[5:], (
+        f"qs/qjl_signs identical across layer_idx=0 and {TEST_LAYERS[-1]} "
+        f"at d={d}, rot={ROTATION_IDS[rotation]}; CUDA is likely ignoring "
+        f"layer_idx and using layer 0 constants for all blocks"
+    )
+
+
 def test_prepare_query_agreement(d, constants, vectors, layer_idx, rotation):
     layer_byte = ref.layer_byte(layer_idx, rotation)
     for q in vectors[25:35]:
