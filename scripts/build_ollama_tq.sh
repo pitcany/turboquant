@@ -22,14 +22,19 @@
 #   WORKDIR           default: $HOME/.local/src/ollama-tq
 #   OLLAMA_REPO       default: https://github.com/ollama/ollama
 #   OLLAMA_REF        default: (repo default branch)
-#   CUDA              default: 1  (set 0 for CPU-only)
+#   CUDA              default: auto-detect ("1" if nvcc is on PATH, "0" otherwise)
 
 set -euo pipefail
 
 WORKDIR="${WORKDIR:-$HOME/.local/src/ollama-tq}"
 OLLAMA_REPO="${OLLAMA_REPO:-https://github.com/ollama/ollama}"
 OLLAMA_REF="${OLLAMA_REF:-}"
-CUDA="${CUDA:-1}"
+# Auto-detect CUDA: default on if `nvcc` is on PATH, off otherwise. User can
+# override with CUDA=1 or CUDA=0 in the environment.
+if [[ -z "${CUDA:-}" ]]; then
+    if command -v nvcc >/dev/null 2>&1; then CUDA=1; else CUDA=0; fi
+fi
+echo "[=] CUDA=$CUDA (nvcc $(command -v nvcc >/dev/null 2>&1 && echo found || echo 'not found'))"
 
 REBUILD_ONLY=0
 for arg in "$@"; do
