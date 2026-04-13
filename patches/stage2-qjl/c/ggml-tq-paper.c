@@ -26,6 +26,68 @@
 #include <math.h>
 #include <string.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+// ---------- runtime rotation selector ----------
+//
+// Three-tier resolution: per-call explicit > per-thread > per-process > WHT.
+//
+// 0xff is the "unset" sentinel for both thread-local and process default.
+
+#define TQP_ROT_UNSET 0xffu
+
+static _Thread_local uint8_t g_tqp_thread_rotation = TQP_ROT_UNSET;
+
+static uint8_t  g_tqp_process_rotation = TQP_ROT_UNSET;
+static pthread_once_t g_tqp_env_once = PTHREAD_ONCE_INIT;
+
+static void tqp_init_env_rotation(void) {
+    const char * val = getenv("OLLAMA_TQP_ROTATION");
+    if (!val) return;
+    if (val[0] == 'h' || val[0] == 'H') {
+        g_tqp_process_rotation = TQP_ROT_HAAR;
+    } else if (val[0] == 'w' || val[0] == 'W') {
+        g_tqp_process_rotation = TQP_ROT_WHT;
+    }
+    // Unknown values are silently ignored (unset).
+}
+
+void tqp_set_default_rotation(uint8_t rot) {
+    // Ensure env is read first (so explicit set overrides env).
+    pthread_once(&g_tqp_env_once, tqp_init_env_rotation);
+    g_tqp_process_rotation = rot;
+}
+
+void tqp_set_thread_rotation(uint8_t rot) {
+    g_tqp_thread_rotation = rot;
+}
+
+void tqp_clear_thread_rotation(void) {
+    g_tqp_thread_rotation = TQP_ROT_UNSET;
+}
+
+uint8_t tqp_resolve_rotation(uint8_t layer_byte) {
+    // Ensure env var has been read at least once.
+    pthread_once(&g_tqp_env_once, tqp_init_env_rotation);
+
+    // Per-call explicit: bit 6 = 1 means bit 7 is authoritative.
+    if (layer_byte & TQP_BIT6_EXPLICIT) {
+        return (uint8_t)(layer_byte & ~TQP_BIT6_EXPLICIT);
+    }
+
+    // Resolve rotation via cascade.
+    uint8_t rot;
+    if (g_tqp_thread_rotation != TQP_ROT_UNSET) {
+        rot = g_tqp_thread_rotation & 1u;
+    } else if (g_tqp_process_rotation != TQP_ROT_UNSET) {
+        rot = g_tqp_process_rotation & 1u;
+    } else {
+        rot = TQP_ROT_WHT;  // compile-time default
+    }
+
+    return TQP_STORED_BYTE(TQP_EXTRACT_LAYER(layer_byte), rot);
+}
 
 // Generated constants. Regenerate via
 //   python3 patches/stage2-qjl/python/generate_constants.py
@@ -378,9 +440,10 @@ static float tqp_vec_dot_block(
     void ggml_quantize_row_tq4p_d##D(const float * x, block_tq4p_d##D * y,                    \
                                      int64_t k, uint8_t layer_byte) {                          \
         assert(k % D == 0);                                                                   \
-        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte));          \
-        const uint8_t rotation       = TQP_EXTRACT_ROT(layer_byte);                           \
-        const uint8_t stored_byte    = TQP_LAYER_BYTE(layer_idx_norm, rotation);              \
+        const uint8_t resolved       = tqp_resolve_rotation(layer_byte);                      \
+        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(resolved));            \
+        const uint8_t rotation       = TQP_EXTRACT_ROT(resolved);                             \
+        const uint8_t stored_byte    = TQP_STORED_BYTE(layer_idx_norm, rotation);             \
         const float * sigma = SIGMA_ARR[layer_idx_norm];                                      \
         const float * pi    = PI_ARR[layer_idx_norm];                                         \
         const float * s     = S_ARR[layer_idx_norm];                                          \
@@ -439,13 +502,14 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS
     void ggml_quantize_row_tq4p_d##D##_##SUFFIX(const INTYPE * x, block_tq4p_d##D * y,             \
                                                  int64_t k, uint8_t layer_byte) {                   \
         assert(k % D == 0);                                                                        \
+        const uint8_t resolved       = tqp_resolve_rotation(layer_byte);                            \
+        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(resolved));                  \
+        const uint8_t rotation       = TQP_EXTRACT_ROT(resolved);                                   \
+        const uint8_t stored_byte    = TQP_STORED_BYTE(layer_idx_norm, rotation);                   \
         float buf[QK_TQ4P_D256];                                                                   \
         const int64_t nb = k / D;                                                                  \
         for (int64_t b = 0; b < nb; ++b) {                                                         \
             for (int i = 0; i < D; ++i) buf[i] = CONVERTER(x[b * D + i]);                          \
-            const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte));            \
-            const uint8_t rotation       = TQP_EXTRACT_ROT(layer_byte);                             \
-            const uint8_t stored_byte    = TQP_LAYER_BYTE(layer_idx_norm, rotation);                \
             float res_d, orig_norm;                                                                 \
             tqp_quantize_block(D, rotation,                                                         \
                                TQP_SIGMA_D##D[layer_idx_norm],                                     \

@@ -9,7 +9,7 @@ GENERATED = tqp_constants.pt \
             tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h
 
 libggml_tq_paper.so: ggml-tq-paper.c ggml-tq-paper.h $(GENERATED)
-	$(CC) $(CFLAGS) -shared -o $@ ggml-tq-paper.c -lm
+	$(CC) $(CFLAGS) -shared -o $@ ggml-tq-paper.c -lm -lpthread
 
 $(GENERATED):
 	cd ../python && python3 generate_constants.py --dims 64,128,256

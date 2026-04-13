@@ -215,6 +215,76 @@ path.write_text(text)
 print(f"[+] patched Copy() for TQ4P layer_byte: {path}")
 PY
 
+# ---------- 6. OLLAMA_TQP_ROTATION init hook ---------------------------------
+#
+# Read the env var once at ollama startup and call tqp_set_default_rotation
+# via cgo. This ensures the process-level default is set before any quantize
+# call. The C library also reads the env var via pthread_once on first use,
+# but this explicit init allows the Go layer to log the choice.
+
+MARKER_ROT_INIT='tqp_rotation_init'
+info "patching rotation init in $GGML_GO"
+patch_file "$GGML_GO" "$MARKER_ROT_INIT" - "$GGML_GO" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+# Find the init() function or the end of import block. We'll add a standalone
+# init function that calls tqp_set_default_rotation via cgo.
+# Look for "import \"C\"" — this is where cgo declarations live.
+anchor = 'import "C"\n'
+if anchor not in text:
+    print(f"WARNING: 'import \"C\"' not found in {path}; skipping rotation init", file=sys.stderr)
+    sys.exit(0)
+
+# Add the rotation init function after the imports section.
+# Find the first func declaration to insert before it.
+import re
+func_match = re.search(r'^func ', text, re.MULTILINE)
+if not func_match:
+    print(f"WARNING: no func found in {path}; skipping rotation init", file=sys.stderr)
+    sys.exit(0)
+
+init_code = (
+    '// tqp_rotation_init: read OLLAMA_TQP_ROTATION env var and forward\n'
+    '// to the C rotation selector.  Called from init().\n'
+    'func init() {\n'
+    '\tval := os.Getenv("OLLAMA_TQP_ROTATION")\n'
+    '\tif val == "" {\n'
+    '\t\treturn\n'
+    '\t}\n'
+    '\tvar rot C.uint8_t = 0xff // unset\n'
+    '\tswitch {\n'
+    '\tcase len(val) > 0 && (val[0] == \'h\' || val[0] == \'H\'):\n'
+    '\t\trot = 1 // TQP_ROT_HAAR\n'
+    '\tcase len(val) > 0 && (val[0] == \'w\' || val[0] == \'W\'):\n'
+    '\t\trot = 0 // TQP_ROT_WHT\n'
+    '\t}\n'
+    '\tif rot != 0xff {\n'
+    '\t\tC.tqp_set_default_rotation(rot)\n'
+    '\t}\n'
+    '}\n\n'
+)
+
+# Check if os is already imported
+if '"os"' not in text:
+    # Add os import
+    text = text.replace('import "C"\n', 'import "C"\nimport "os"\n', 1)
+    # `func_match` was computed before this mutation; the `import "C"` line
+    # sits before the first func declaration, so inserting "import \"os\"\n"
+    # after it shifts every subsequent offset (including func_match.start())
+    # by the length of the inserted text. Recompute to stay in sync.
+    func_match = re.search(r'^func ', text, re.MULTILINE)
+    if not func_match:
+        print(f"WARNING: no func found in {path} after os import; skipping rotation init", file=sys.stderr)
+        sys.exit(0)
+
+text = text[:func_match.start()] + init_code + text[func_match.start():]
+path.write_text(text)
+print(f"[+] patched rotation init: {path}")
+PY
+
 # ---------- summary ----------------------------------------------------------
 
 echo
@@ -222,3 +292,6 @@ echo "Go plumbing complete. The following cache-type strings now resolve"
 echo "to their correct GGML types instead of falling back to f16:"
 echo "  tq4p_d128 → GGML_TYPE_TQ4P_D128 (enum 40)"
 echo "  tq4p_d256 → GGML_TYPE_TQ4P_D256 (enum 41)"
+echo
+echo "OLLAMA_TQP_ROTATION={wht,haar} is read at startup and forwarded"
+echo "to tqp_set_default_rotation() for process-wide rotation default."
