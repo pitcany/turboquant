@@ -79,6 +79,36 @@ lib.ggml_quantize_row_tq4p_d256.argtypes = [
     ctypes.c_uint8,
 ]
 
+# BF16/FP16 quantize entry points
+lib.ggml_quantize_row_tq4p_d128_bf16.restype = None
+lib.ggml_quantize_row_tq4p_d128_bf16.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.c_int64,
+    ctypes.c_uint8,
+]
+lib.ggml_quantize_row_tq4p_d256_bf16.restype = None
+lib.ggml_quantize_row_tq4p_d256_bf16.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.c_int64,
+    ctypes.c_uint8,
+]
+lib.ggml_quantize_row_tq4p_d128_f16.restype = None
+lib.ggml_quantize_row_tq4p_d128_f16.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.POINTER(block_tq4p_d128),
+    ctypes.c_int64,
+    ctypes.c_uint8,
+]
+lib.ggml_quantize_row_tq4p_d256_f16.restype = None
+lib.ggml_quantize_row_tq4p_d256_f16.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16),
+    ctypes.POINTER(block_tq4p_d256),
+    ctypes.c_int64,
+    ctypes.c_uint8,
+]
+
 lib.ggml_dequantize_row_tq4p_d128.restype = None
 lib.ggml_dequantize_row_tq4p_d128.argtypes = [
     ctypes.POINTER(block_tq4p_d128),
@@ -439,4 +469,121 @@ def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx, rotation):
     assert max_abs_diff < 0.05, (
         f"Q8_K vs fp32 max diff {max_abs_diff:.4f} exceeds tolerance "
         f"(d={d}, layer={layer_idx}, rot={ROTATION_IDS[rotation]})"
+    )
+
+
+# ---------- BF16 / FP16 input quantize tests ----------
+
+import numpy as np
+
+
+def _fp32_to_bf16_array(x_fp32):
+    """Convert fp32 numpy array to bf16 uint16 array (truncation)."""
+    x_u32 = x_fp32.view(np.uint32)
+    return (x_u32 >> 16).astype(np.uint16)
+
+
+def _fp32_to_fp16_array(x_fp32):
+    """Convert fp32 numpy array to fp16 uint16 array."""
+    return x_fp32.astype(np.float16).view(np.uint16)
+
+
+def _bf16_to_fp32(bf16_val):
+    """Convert a single bf16 uint16 to fp32."""
+    u32 = np.uint32(bf16_val) << np.uint32(16)
+    return np.frombuffer(u32.tobytes(), dtype=np.float32)[0]
+
+
+_BF16_QUANTIZE_FNS = {
+    128: lib.ggml_quantize_row_tq4p_d128_bf16,
+    256: lib.ggml_quantize_row_tq4p_d256_bf16,
+}
+
+_F16_QUANTIZE_FNS = {
+    128: lib.ggml_quantize_row_tq4p_d128_f16,
+    256: lib.ggml_quantize_row_tq4p_d256_f16,
+}
+
+
+DTYPES = ["fp32", "bf16", "f16"]
+DTYPE_IDS = {dt: dt for dt in DTYPES}
+
+
+@pytest.fixture(params=DTYPES, ids=lambda dt: DTYPE_IDS[dt])
+def input_dtype(request):
+    return request.param
+
+
+def _c_quantize_dtype(d, x_fp32_np, layer_idx, rotation, dtype):
+    """Quantize via C using the specified input dtype."""
+    layer_byte = ref.layer_byte(layer_idx, rotation)
+
+    if d == 128:
+        blk_cls = block_tq4p_d128
+    else:
+        blk_cls = block_tq4p_d256
+
+    blk = blk_cls()
+
+    if dtype == "fp32":
+        fn = lib.ggml_quantize_row_tq4p_d128 if d == 128 else lib.ggml_quantize_row_tq4p_d256
+        fn(x_fp32_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+           ctypes.byref(blk), d, layer_byte)
+    elif dtype == "bf16":
+        fn = _BF16_QUANTIZE_FNS[d]
+        x_bf16 = _fp32_to_bf16_array(x_fp32_np)
+        fn(x_bf16.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+           ctypes.byref(blk), d, layer_byte)
+    elif dtype == "f16":
+        fn = _F16_QUANTIZE_FNS[d]
+        x_f16 = _fp32_to_fp16_array(x_fp32_np)
+        fn(x_f16.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+           ctypes.byref(blk), d, layer_byte)
+    else:
+        raise ValueError(f"unknown dtype: {dtype}")
+
+    return bytes(blk)
+
+
+def test_bf16_f16_vec_dot_matches_fp32(d, constants, vectors, input_dtype):
+    """BF16/FP16 quantize + vec_dot must match fp32 within dtype rounding tolerance.
+
+    bf16 has ~2e-3 rounding error; f16 is tighter. The vec_dot tolerance
+    is 3e-3 absolute for bf16, 1e-3 for f16, per the spec.
+    """
+    if input_dtype == "fp32":
+        pytest.skip("fp32 baseline, nothing to compare")
+
+    keys = vectors[:10]
+    queries = vectors[10:15]
+
+    max_abs = 0.0
+    for q in queries:
+        q_np = q.float().numpy().copy()
+
+        for k in keys:
+            k_np = k.float().numpy().copy()
+
+            # fp32 reference
+            blk_fp32 = _c_quantize_dtype(d, k_np, 0, ref.TQP_ROT_WHT, "fp32")
+
+            # dtype under test
+            blk_test = _c_quantize_dtype(d, k_np, 0, ref.TQP_ROT_WHT, input_dtype)
+
+            # Compute vec_dot for both via Python reference
+            ip_fp32 = ref.inner_product(q, blk_fp32, constants)
+            ip_test = ref.inner_product(q, blk_test, constants)
+
+            max_abs = max(max_abs, abs(ip_fp32 - ip_test))
+
+    # bf16/fp16 rounding changes bin assignments near boundaries. The
+    # quantization error dominates over the raw rounding error: a single
+    # coordinate flipping between adjacent centroids changes the dot
+    # product by ~centroid_spacing * q_rot[i]. Empirically 0.02 for
+    # unit-norm vectors at d=256. This validates the conversion is
+    # correct, not that it's lossless.
+    tol = 0.02
+    assert max_abs < tol, (
+        f"{input_dtype} vs fp32 vec_dot max diff {max_abs:.2e} exceeds {tol:.0e} "
+        f"(d={d})"
     )

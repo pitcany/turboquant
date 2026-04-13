@@ -168,12 +168,16 @@ close = i - 1
 entries = (
     "    [GGML_TYPE_TQ4P_D128] = {\n"
     "        .from_float               = ggml_quantize_row_tq4p_d128_default,\n"
+    "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d128_bf16,\n"
+    "        // .from_float_f16        = (ggml_from_float_t) ggml_quantize_row_tq4p_d128_f16,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d128_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"
     "    },\n"
     "    [GGML_TYPE_TQ4P_D256] = {\n"
     "        .from_float               = ggml_quantize_row_tq4p_d256_default,\n"
+    "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_bf16,\n"
+    "        // .from_float_f16        = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_f16,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d256_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"
@@ -307,8 +311,11 @@ new_cpy = (
     '            {\n'
     '                const ggml_tensor * cpy_src = dst->src[0];\n'
     '                ggml_tensor * cpy_dst = dst->src[1];\n'
-    '                if (cpy_src->type == GGML_TYPE_F32 &&\n'
-    '                    (cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256)) {\n'
+    '                const bool dst_tq4p = (cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256);\n'
+    '                const bool src_f32  = (cpy_src->type == GGML_TYPE_F32);\n'
+    '                // BF16/F16 → TQ4P: upcast to fp32 on host, then quantize on device.\n'
+    '                // TODO: add device-side bf16/f16 load kernels for zero-copy path.\n'
+    '                if ((src_f32) && dst_tq4p) {\n'
     '                    const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
     '                    cudaStream_t stream = ctx.stream();\n'
     '                    const float * src_d = (const float *)cpy_src->data;\n'

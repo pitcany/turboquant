@@ -93,6 +93,15 @@ static inline float tqp_fp16_to_fp32(uint16_t h) {
     return v.f;
 }
 
+// ---------- BF16 → FP32 conversion ----------
+//
+// BF16 is a truncated fp32: just shift left by 16. No rounding needed.
+
+static inline float tqp_bf16_to_fp32(uint16_t h) {
+    union { uint32_t u; float f; } v = { (uint32_t)h << 16 };
+    return v.f;
+}
+
 // ---------- bit pack / unpack ----------
 
 // Pack 8 x 3-bit values into 3 bytes using the bitplane layout:
@@ -417,6 +426,40 @@ static float tqp_vec_dot_block(
 
 TQP_DEFINE_ROW_FUNCS(128, TQP_SIGMA_D128, TQP_PI_D128, TQP_S_D128, TQP_CENTROIDS_D128, TQP_BOUNDARIES_D128)
 TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS_D256, TQP_BOUNDARIES_D256)
+
+// ---------- BF16 / FP16 quantize entry points ----------
+//
+// Load from bf16/fp16, cast to fp32 one block at a time, then call the
+// fp32 quantize path. Internal pipeline stays fp32.
+
+#define TQP_DEFINE_ROW_FUNCS_DTYPE(D, SUFFIX, INTYPE, CONVERTER)                                   \
+    void ggml_quantize_row_tq4p_d##D##_##SUFFIX(const INTYPE * x, block_tq4p_d##D * y,             \
+                                                 int64_t k, uint8_t layer_byte) {                   \
+        assert(k % D == 0);                                                                        \
+        float buf[QK_TQ4P_D256];                                                                   \
+        const int64_t nb = k / D;                                                                  \
+        for (int64_t b = 0; b < nb; ++b) {                                                         \
+            for (int i = 0; i < D; ++i) buf[i] = CONVERTER(x[b * D + i]);                          \
+            const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte));            \
+            const uint8_t rotation       = TQP_EXTRACT_ROT(layer_byte);                             \
+            const uint8_t stored_byte    = TQP_LAYER_BYTE(layer_idx_norm, rotation);                \
+            float res_d, orig_norm;                                                                 \
+            tqp_quantize_block(D, rotation,                                                         \
+                               TQP_SIGMA_D##D[layer_idx_norm],                                     \
+                               TQP_PI_D##D[layer_idx_norm],                                        \
+                               TQP_S_D##D[layer_idx_norm],                                         \
+                               TQP_CENTROIDS_D##D, TQP_BOUNDARIES_D##D,                            \
+                               buf, y[b].qs, y[b].qjl_signs, &res_d, &orig_norm);                  \
+            y[b].orig_norm = tqp_fp32_to_fp16(orig_norm);                                           \
+            y[b].res_d     = tqp_fp32_to_fp16(res_d);                                               \
+            y[b].layer_idx = stored_byte;                                                           \
+        }                                                                                           \
+    }
+
+TQP_DEFINE_ROW_FUNCS_DTYPE(128, bf16, uint16_t, tqp_bf16_to_fp32)
+TQP_DEFINE_ROW_FUNCS_DTYPE(256, bf16, uint16_t, tqp_bf16_to_fp32)
+TQP_DEFINE_ROW_FUNCS_DTYPE(128, f16,  uint16_t, tqp_fp16_to_fp32)
+TQP_DEFINE_ROW_FUNCS_DTYPE(256, f16,  uint16_t, tqp_fp16_to_fp32)
 
 // ---------- ggml dispatch wrappers ----------
 //
