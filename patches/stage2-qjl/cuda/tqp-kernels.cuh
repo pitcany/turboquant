@@ -131,3 +131,24 @@ __device__ static inline float tqp_unpack_sign_pm1(const uint8_t * signs, int el
     const uint8_t bit = (uint8_t)((signs[elem >> 3] >> (elem & 7)) & 1u);
     return bit ? -1.0f : 1.0f;
 }
+
+// In-place Fast Walsh-Hadamard Transform on `smem[0..D-1]`, unnormalized
+// (caller must multiply by 1/√d for the orthogonal version).
+//
+// Requires: blockDim.x == D, D is a power of 2, one thread per element.
+// Thread `tid` owns `smem[tid]` throughout. Each butterfly stage combines
+// pairs (i, i^h) with a ±1 sum; low-index thread writes (a+b), high-index
+// thread writes (b-a) where a=smem[tid] and b=smem[tid^h].
+template<int D>
+__device__ static inline void tqp_wht_shared(float * smem) {
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int h = 1; h < D; h <<= 1) {
+        __syncthreads();
+        const float a = smem[tid];
+        const float b = smem[tid ^ h];
+        __syncthreads();
+        smem[tid] = ((tid & h) == 0) ? (a + b) : (b - a);
+    }
+    __syncthreads();
+}

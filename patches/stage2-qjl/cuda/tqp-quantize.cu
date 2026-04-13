@@ -14,6 +14,15 @@ extern "C" int tqp_cuda_device_count() {
     return count;
 }
 
+// Quantize one d-vector into a tq4p block using the WHT variant:
+//   x_rot       = (1/√d) · WHT(σ ⊙ x_unit)
+//   idx[i]      = bucketize(x_rot[i])
+//   x_hat_unit  = (1/√d) · σ ⊙ WHT(centroids[idx])     (Πᵀ, H is symmetric)
+//   residual    = x_unit - x_hat_unit
+//   proj        = S · residual                         (Gaussian QJL, unchanged)
+//
+// One thread per element. smem_vec is reused across phases; `x_unit_reg`
+// keeps the per-thread share of x_unit alive across the destructive WHTs.
 template<int D>
 __device__ static inline void tqp_quantize_block_device(
         const float * __restrict__ x,
@@ -21,7 +30,7 @@ __device__ static inline void tqp_quantize_block_device(
         uint16_t * res_d_out,
         uint8_t * __restrict__ qs_out,
         uint8_t * __restrict__ signs_out,
-        const float * __restrict__ pi,
+        const float * __restrict__ sigma,
         const float * __restrict__ s,
         const float * __restrict__ centroids,
         const float * __restrict__ bounds) {
@@ -30,6 +39,8 @@ __device__ static inline void tqp_quantize_block_device(
     __shared__ float smem_scalars[2];
 
     const int tid = threadIdx.x;
+    const float rsqrt_d = rsqrtf((float)D);
+    const float sigma_tid = sigma[tid];
 
     smem_vec[tid] = x[tid];
     __syncthreads();
@@ -49,23 +60,26 @@ __device__ static inline void tqp_quantize_block_device(
     }
     __syncthreads();
 
-    smem_vec[tid] = __fmul_rn(smem_vec[tid], smem_scalars[1]);
+    // x_unit = x / ||x||, kept in both smem (for the forward WHT) and in a
+    // per-thread register (for the later residual = x_unit - x_hat_unit).
+    const float x_unit_reg = __fmul_rn(smem_vec[tid], smem_scalars[1]);
+    smem_vec[tid] = __fmul_rn(x_unit_reg, sigma_tid);
     __syncthreads();
 
-    float acc = 0.0f;
-#pragma unroll 1
-    for (int j = 0; j < D; ++j) {
-        acc = __fadd_rn(acc, __fmul_rn(__ldg(&pi[tid * D + j]), smem_vec[j]));
-    }
-    smem_idx[tid] = tqp_bucketize_d3(acc, bounds);
+    // x_rot = (1/√d) · WHT(σ ⊙ x_unit)
+    tqp_wht_shared<D>(smem_vec);
+    const float x_rot_tid = __fmul_rn(smem_vec[tid], rsqrt_d);
+    smem_idx[tid] = tqp_bucketize_d3(x_rot_tid, bounds);
     __syncthreads();
 
-    float x_hat = 0.0f;
-#pragma unroll 1
-    for (int i = 0; i < D; ++i) {
-        x_hat = __fadd_rn(x_hat, __fmul_rn(__ldg(&pi[i * D + tid]), centroids[smem_idx[i]]));
-    }
-    smem_vec[tid] = __fadd_rn(smem_vec[tid], -x_hat);
+    // x_hat_unit = (1/√d) · σ ⊙ WHT(centroids[idx])
+    smem_vec[tid] = centroids[smem_idx[tid]];
+    __syncthreads();
+    tqp_wht_shared<D>(smem_vec);
+    const float x_hat_tid = __fmul_rn(smem_vec[tid], __fmul_rn(sigma_tid, rsqrt_d));
+
+    // residual = x_unit - x_hat_unit
+    smem_vec[tid] = __fadd_rn(x_unit_reg, -x_hat_tid);
     __syncthreads();
 
     if (tid == 0) {
@@ -110,10 +124,13 @@ __device__ static inline void tqp_quantize_block_device(
     }
 }
 
+// Per-layer sigma lives in __constant__ memory; the kernel reads it by
+// symbol rather than via a kernel-argument pointer (host-side addresses of
+// __constant__ symbols are not usable as device pointers).
 __global__ static void tqp_quantize_kernel_d128(
         const float * __restrict__ x,
         block_tq4p_d128 * __restrict__ y,
-        const float * __restrict__ pi,
+        int layer_idx,
         const float * __restrict__ s,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
@@ -127,7 +144,7 @@ __global__ static void tqp_quantize_kernel_d128(
         &y[b].res_d,
         y[b].qs,
         y[b].qjl_signs,
-        pi,
+        &c_tqp_sigma_d128[layer_idx][0],
         s,
         c_tqp_centroids_d128,
         c_tqp_boundaries_d128);
@@ -136,7 +153,7 @@ __global__ static void tqp_quantize_kernel_d128(
 __global__ static void tqp_quantize_kernel_d256(
         const float * __restrict__ x,
         block_tq4p_d256 * __restrict__ y,
-        const float * __restrict__ pi,
+        int layer_idx,
         const float * __restrict__ s,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
@@ -150,7 +167,7 @@ __global__ static void tqp_quantize_kernel_d256(
         &y[b].res_d,
         y[b].qs,
         y[b].qjl_signs,
-        pi,
+        &c_tqp_sigma_d256[layer_idx][0],
         s,
         c_tqp_centroids_d256,
         c_tqp_boundaries_d256);
@@ -164,8 +181,12 @@ extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64
         return;
     }
     const int64_t n_blocks = k / QK_TQ4P_D128;
+    // TODO(layer_idx): plumb per-block layer index through the CUDA block
+    // struct once it's aligned with the CPU 69/133-byte header. For now
+    // this path uses layer 0, matching the pre-WHT prototype.
+    const int layer_idx = 0;
     tqp_quantize_kernel_d128<<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-        x, (block_tq4p_d128 *)y, d_tqp_pi_d128, d_tqp_s_d128, n_blocks);
+        x, (block_tq4p_d128 *)y, layer_idx, d_tqp_s_d128, n_blocks);
 }
 
 extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64_t k, cudaStream_t stream) {
@@ -176,8 +197,9 @@ extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64
         return;
     }
     const int64_t n_blocks = k / QK_TQ4P_D256;
+    const int layer_idx = 0;
     tqp_quantize_kernel_d256<<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-        x, (block_tq4p_d256 *)y, d_tqp_pi_d256, d_tqp_s_d256, n_blocks);
+        x, (block_tq4p_d256 *)y, layer_idx, d_tqp_s_d256, n_blocks);
 }
 
 template<typename Block>

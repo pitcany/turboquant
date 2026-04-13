@@ -1,12 +1,18 @@
 #pragma once
 
-// NOTE (branch: claude/swap-haar-to-wht-*): these CUDA files reference the
-// legacy TQP_PI_D{128,256} d²-float rotation matrices. After the swap to the
-// Randomized Hadamard Transform in ggml-tq-paper.c, the generated headers
-// expose TQP_SIGMA_D{128,256}[32][d] sign vectors instead. A CUDA port for
-// the WHT variant is tracked as a follow-up (needs a shared-memory WHT
-// kernel + sign-vector broadcast); this .cuh will not compile as-is against
-// the new constants header until that port lands.
+// TurboQuant-ish CUDA constants — WHT variant.
+//
+// Branch: the paper's Haar rotation Π is replaced with the Randomized
+// Hadamard Transform Π = (1/√d) · H · diag(σ). The per-layer d×d rotation
+// matrix is replaced with a per-layer ±1 sign vector σ of length d, stored
+// in __constant__ memory (all 32 layers × d × 4 B ≤ 32 KB — fits cleanly
+// in the constant cache for both d=128 and d=256).
+//
+// Note: like the pre-WHT prototype, this CUDA path uses a single layer
+// index (layer 0) across all blocks. Per-layer dispatch in the kernels is
+// a separate follow-up that also needs the CPU-side per-block layer_idx
+// header to be threaded through the block struct here (the CUDA block
+// struct in tqp-kernels.cuh still matches the pre-per-layer CPU layout).
 
 #include "tqp-kernels.cuh"
 
@@ -24,9 +30,13 @@ static __constant__ float c_tqp_boundaries_d128[7];
 static __constant__ float c_tqp_centroids_d256[8];
 static __constant__ float c_tqp_boundaries_d256[7];
 
-inline float * d_tqp_pi_d128 = nullptr;
+// Per-layer ±1 sign vectors σ_i. Size: 32 × d × 4 B.
+static __constant__ float c_tqp_sigma_d128[TQP_MAX_LAYERS][QK_TQ4P_D128];
+static __constant__ float c_tqp_sigma_d256[TQP_MAX_LAYERS][QK_TQ4P_D256];
+
+// Gaussian QJL matrices S_i stay in device global memory (too large for
+// __constant__: 32 × d² × 4 B = up to 8 MB for d=256).
 inline float * d_tqp_s_d128  = nullptr;
-inline float * d_tqp_pi_d256 = nullptr;
 inline float * d_tqp_s_d256  = nullptr;
 
 inline bool g_tqp_cuda_init_d128 = false;
@@ -43,31 +53,19 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_boundaries_d128, TQP_BOUNDARIES_D128, sizeof(TQP_BOUNDARIES_D128));
             if (err != cudaSuccess) return err;
+            err = cudaMemcpyToSymbol(c_tqp_sigma_d128, TQP_SIGMA_D128, sizeof(TQP_SIGMA_D128));
+            if (err != cudaSuccess) return err;
             g_tqp_cuda_constants_init_d128 = true;
         }
         if (!g_tqp_cuda_init_d128) {
-            float * pi = nullptr;
             float * s = nullptr;
-            err = cudaMalloc((void **)&pi, sizeof(TQP_PI_D128));
-            if (err != cudaSuccess) return err;
             err = cudaMalloc((void **)&s, sizeof(TQP_S_D128));
-            if (err != cudaSuccess) {
-                cudaFree(pi);
-                return err;
-            }
-            err = cudaMemcpy(pi, TQP_PI_D128, sizeof(TQP_PI_D128), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                cudaFree(s);
-                cudaFree(pi);
-                return err;
-            }
+            if (err != cudaSuccess) return err;
             err = cudaMemcpy(s, TQP_S_D128, sizeof(TQP_S_D128), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 cudaFree(s);
-                cudaFree(pi);
                 return err;
             }
-            d_tqp_pi_d128 = pi;
             d_tqp_s_d128 = s;
             g_tqp_cuda_init_d128 = true;
         }
@@ -80,31 +78,19 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
             if (err != cudaSuccess) return err;
             err = cudaMemcpyToSymbol(c_tqp_boundaries_d256, TQP_BOUNDARIES_D256, sizeof(TQP_BOUNDARIES_D256));
             if (err != cudaSuccess) return err;
+            err = cudaMemcpyToSymbol(c_tqp_sigma_d256, TQP_SIGMA_D256, sizeof(TQP_SIGMA_D256));
+            if (err != cudaSuccess) return err;
             g_tqp_cuda_constants_init_d256 = true;
         }
         if (!g_tqp_cuda_init_d256) {
-            float * pi = nullptr;
             float * s = nullptr;
-            err = cudaMalloc((void **)&pi, sizeof(TQP_PI_D256));
-            if (err != cudaSuccess) return err;
             err = cudaMalloc((void **)&s, sizeof(TQP_S_D256));
-            if (err != cudaSuccess) {
-                cudaFree(pi);
-                return err;
-            }
-            err = cudaMemcpy(pi, TQP_PI_D256, sizeof(TQP_PI_D256), cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                cudaFree(s);
-                cudaFree(pi);
-                return err;
-            }
+            if (err != cudaSuccess) return err;
             err = cudaMemcpy(s, TQP_S_D256, sizeof(TQP_S_D256), cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 cudaFree(s);
-                cudaFree(pi);
                 return err;
             }
-            d_tqp_pi_d256 = pi;
             d_tqp_s_d256 = s;
             g_tqp_cuda_init_d256 = true;
         }
@@ -115,14 +101,10 @@ static inline cudaError_t tqp_cuda_init(int head_dim) {
 }
 
 static inline void tqp_cuda_cleanup() {
-    if (d_tqp_pi_d128) cudaFree(d_tqp_pi_d128);
     if (d_tqp_s_d128)  cudaFree(d_tqp_s_d128);
-    if (d_tqp_pi_d256) cudaFree(d_tqp_pi_d256);
     if (d_tqp_s_d256)  cudaFree(d_tqp_s_d256);
 
-    d_tqp_pi_d128 = nullptr;
     d_tqp_s_d128  = nullptr;
-    d_tqp_pi_d256 = nullptr;
     d_tqp_s_d256  = nullptr;
     g_tqp_cuda_init_d128 = false;
     g_tqp_cuda_init_d256 = false;
