@@ -502,13 +502,14 @@ TQP_DEFINE_ROW_FUNCS(256, TQP_SIGMA_D256, TQP_PI_D256, TQP_S_D256, TQP_CENTROIDS
     void ggml_quantize_row_tq4p_d##D##_##SUFFIX(const INTYPE * x, block_tq4p_d##D * y,             \
                                                  int64_t k, uint8_t layer_byte) {                   \
         assert(k % D == 0);                                                                        \
+        const uint8_t resolved       = tqp_resolve_rotation(layer_byte);                            \
+        const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(resolved));                  \
+        const uint8_t rotation       = TQP_EXTRACT_ROT(resolved);                                   \
+        const uint8_t stored_byte    = TQP_STORED_BYTE(layer_idx_norm, rotation);                   \
         float buf[QK_TQ4P_D256];                                                                   \
         const int64_t nb = k / D;                                                                  \
         for (int64_t b = 0; b < nb; ++b) {                                                         \
             for (int i = 0; i < D; ++i) buf[i] = CONVERTER(x[b * D + i]);                          \
-            const uint8_t layer_idx_norm = tqp_layer_idx(TQP_EXTRACT_LAYER(layer_byte));            \
-            const uint8_t rotation       = TQP_EXTRACT_ROT(layer_byte);                             \
-            const uint8_t stored_byte    = TQP_LAYER_BYTE(layer_idx_norm, rotation);                \
             float res_d, orig_norm;                                                                 \
             tqp_quantize_block(D, rotation,                                                         \
                                TQP_SIGMA_D##D[layer_idx_norm],                                     \
