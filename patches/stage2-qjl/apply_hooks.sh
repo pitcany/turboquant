@@ -681,6 +681,28 @@ switch_replacement = (
 )
 t = t.replace(switch_anchor, switch_replacement, 1)
 
+# V->type switch: TQ4P is a KV-cache type, so the V tensor is also TQ4P.
+# Without this patch, the default case in the V->type switch fires and
+# GGML_ABORTs during flash attention.
+v_switch_anchor = (
+    '    switch (V->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '            break;'
+)
+if v_switch_anchor not in t:
+    print('ERROR: fattn.cu V->type switch anchor not found', file=sys.stderr)
+    sys.exit(1)
+v_switch_replacement = (
+    '    switch (V->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            break;'
+)
+t = t.replace(v_switch_anchor, v_switch_replacement, 1)
+
 p.write_text(t)
 print(f"[+] patched: {p}")
 PY
