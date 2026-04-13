@@ -363,15 +363,15 @@ fi
 #      template dispatch, calling tqp-set-rows.cu kernels
 
 MARKER_SET_ROWS='TQ4P_D128 SET_ROWS'
-SET_ROWS_FILE="$GGML_ROOT/src/ggml-cuda/set-rows.cu"
+SET_ROWS_FILE="$GGML/src/ggml-cuda/set-rows.cu"
 
 # (a) supports_op in ggml-cuda.cu
-if [[ -f "$CUDA_FILE" ]]; then
-    if grep -qF "$MARKER_SET_ROWS" "$CUDA_FILE"; then
+if [[ -f "$CUDA_CU" ]]; then
+    if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
         echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
     else
         echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
-        python3 - "$CUDA_FILE" <<'PY'
+        python3 - "$CUDA_CU" <<'PY'
 import sys, pathlib
 
 p = pathlib.Path(sys.argv[1])

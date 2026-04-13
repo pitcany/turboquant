@@ -10,8 +10,7 @@
 // reusing `tqp_quantize_block_device` from tqp-quantize.cu.
 
 #include "tqp-constants-cuda.cuh"
-#include "tqp-kernels.cuh"   // provides tqp_quantize_block_device
-#include "ggml-tq-paper.h"
+#include "tqp-kernels.cuh"   // provides tqp_quantize_block_device + block structs
 
 // ── SET_ROWS kernel for TQ4P_D128 ─────────────────────────────────────
 //
