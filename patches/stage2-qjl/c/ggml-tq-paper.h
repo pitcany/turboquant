@@ -151,26 +151,20 @@ _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 void ggml_quantize_row_tq4p_d128(const float * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
 void ggml_quantize_row_tq4p_d256(const float * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
 
-// 3-arg wrappers for ggml_from_float_t / from_float_ref compatibility.
-// These pass bit 6 = 0 so rotation is resolved at runtime via the
-// per-thread > per-process > compile-time cascade.
+// 3-arg wrappers for ggml_from_float_t / from_float_ref / from_float
+// compatibility. These pass bit 6 = 0 so rotation is resolved at
+// runtime via the per-thread > per-process > compile-time cascade.
 // Layer defaults to 0; the CUDA cpy dispatch uses the full 4-arg variant
-// with layer_byte from the cpy op's op_params[0].
+// with layer_byte from the cpy op's op_params[0]. In a real attention
+// pass, the attention module should set the thread-local rotation (via
+// tqp_set_thread_rotation) before these wrappers fire.
+//
+// Used by both hook 2 (type_traits.from_float_ref) and hook 3
+// (type_traits_cpu.from_float).
 static inline void ggml_quantize_row_tq4p_d128_default(const float * x, void * y, int64_t k) {
     ggml_quantize_row_tq4p_d128(x, (block_tq4p_d128 *)y, k, 0x00);
 }
 static inline void ggml_quantize_row_tq4p_d256_default(const float * x, void * y, int64_t k) {
-    ggml_quantize_row_tq4p_d256(x, (block_tq4p_d256 *)y, k, 0x00);
-}
-
-// Resolved wrappers for type_traits_cpu.from_float (apply_hooks.sh hook 3).
-// Same as _default but named explicitly for the hook site. Layer = 0, rotation
-// resolved via the cascade. In a real attention pass the thread-local should
-// be set by the attention module to the correct rotation.
-static inline void ggml_quantize_row_tq4p_d128_resolved(const float * x, void * y, int64_t k) {
-    ggml_quantize_row_tq4p_d128(x, (block_tq4p_d128 *)y, k, 0x00);
-}
-static inline void ggml_quantize_row_tq4p_d256_resolved(const float * x, void * y, int64_t k) {
     ggml_quantize_row_tq4p_d256(x, (block_tq4p_d256 *)y, k, 0x00);
 }
 

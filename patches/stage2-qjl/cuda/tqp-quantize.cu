@@ -228,7 +228,7 @@ extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64
     }
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
-    const uint8_t byte_stored = TQP_LAYER_BYTE(layer, rot);
+    const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D128;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d128<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
@@ -248,7 +248,7 @@ extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64
     }
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
-    const uint8_t byte_stored = TQP_LAYER_BYTE(layer, rot);
+    const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
     const int64_t n_blocks = k / QK_TQ4P_D256;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d256<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(

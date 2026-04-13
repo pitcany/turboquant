@@ -271,6 +271,14 @@ init_code = (
 if '"os"' not in text:
     # Add os import
     text = text.replace('import "C"\n', 'import "C"\nimport "os"\n', 1)
+    # `func_match` was computed before this mutation; the `import "C"` line
+    # sits before the first func declaration, so inserting "import \"os\"\n"
+    # after it shifts every subsequent offset (including func_match.start())
+    # by the length of the inserted text. Recompute to stay in sync.
+    func_match = re.search(r'^func ', text, re.MULTILINE)
+    if not func_match:
+        print(f"WARNING: no func found in {path} after os import; skipping rotation init", file=sys.stderr)
+        sys.exit(0)
 
 text = text[:func_match.start()] + init_code + text[func_match.start():]
 path.write_text(text)
