@@ -4,6 +4,16 @@ Model: Qwen/Qwen2.5-3B-Instruct (head_dim=128, 36 layers)
 Gaussian-approx bound (3-bit, d=128): 0.034548
 Gaussian-approx bound (3-bit, d=256): 0.034548
 
+> **Note:** the Phase B numbers below were produced with the initial
+> version of `scripts/lloyd_max_sanity.py` that silently wrapped
+> `layer_idx % 32` when indexing into the 32-layer TQ4P constants. That
+> paired layer-35 activations with layer-3 constants (both rotation σ
+> and Haar Π) while labelling the row "Layer 35" — the MSE ratio is
+> still a valid codebook-vs-rotation signal but the row label is
+> misleading. The script now clamps `target_layers` to
+> `min(num_layers, ref.MAX_LAYERS)`, so a rerun on the same model will
+> report the ceiling layer (31) instead of 35. Rerun pending.
+
 ## Phase A: Synthetic Distributions
 
 | d   | Distribution    | Rotation | MSE      | Ratio |

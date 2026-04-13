@@ -179,7 +179,16 @@ def run_phase_b(model_name: str, n_prompts: int = 8) -> List[dict]:
     model.eval()
 
     num_layers = model.config.num_hidden_layers
-    target_layers = [0, num_layers // 2, num_layers - 1]
+    # TQ4P constants cover ref.MAX_LAYERS (32) layers. If the model has
+    # more, clamp the tested range so activations and constants come from
+    # the same layer — silently wrapping layer_idx % MAX_LAYERS would pair
+    # layer-35 activations with layer-3 constants while still labelling
+    # the result "layer 35".
+    usable_layers = min(num_layers, ref.MAX_LAYERS)
+    if num_layers > ref.MAX_LAYERS:
+        print(f"  NOTE: model has {num_layers} layers but TQ4P constants only cover "
+              f"{ref.MAX_LAYERS} layers; clamping test range to first {usable_layers}.")
+    target_layers = [0, usable_layers // 2, usable_layers - 1]
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
     prompts = [
@@ -270,7 +279,9 @@ def run_phase_b(model_name: str, n_prompts: int = 8) -> List[dict]:
                 x_unit = x_unit[perm]
 
             for rot in [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]:
-                mse, rotated = quantize_and_mse(x_unit, constants, layer_idx % 32, rot)
+                # target_layers is already clamped to [0, ref.MAX_LAYERS),
+                # so layer_idx here is a valid index into constants.
+                mse, rotated = quantize_and_mse(x_unit, constants, layer_idx, rot)
                 ratio = mse / gaussian_bound if gaussian_bound > 0 else float("inf")
                 passed = ratio <= THRESHOLD
 
