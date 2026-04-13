@@ -34,7 +34,7 @@ ROTATION_IDS = {ref.TQP_ROT_WHT: "wht", ref.TQP_ROT_HAAR: "haar"}
 
 # ---------- Fixtures ----------
 
-@pytest.fixture(scope="module", params=[128, 256])
+@pytest.fixture(scope="module", params=[64, 128, 256])
 def d(request):
     return request.param
 
