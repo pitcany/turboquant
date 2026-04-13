@@ -708,5 +708,25 @@ print(f"[+] patched: {p}")
 PY
     fi
 fi
+# ---------- 9. GGUF metadata: tq4p.default_rotation KV (writer side) ---------
+#
+# When llama-quantize (or equivalent) writes a GGUF file containing TQ4P
+# types, the quantize path should set the advisory KV pair
+# "tq4p.default_rotation" = "wht" | "haar" so inspection tooling can
+# report the rotation at a glance without reading per-block bytes.
+#
+# This hook patches the GGUF writer to add the KV pair if a TQ4P type is
+# being quantized. The rotation value comes from tqp_resolve_rotation()
+# (i.e., the runtime rotation selector from the env var / thread-local).
+#
+# For now this is a documentation-only hook: the actual GGUF writer
+# instrumentation requires access to the quantize entrypoint in
+# llama-quantize.cpp / model.go, which varies between forks. The hook
+# body below is a template showing the KV write call.
+
+echo "[i] Hook 9: GGUF tq4p.default_rotation KV writer (template-only)"
+echo "    To wire into your quantize path, add after gguf_set_val_*:"
+echo '    gguf_set_val_str(ctx, "tq4p.default_rotation",'
+echo '                     (resolved_rot == TQP_ROT_HAAR) ? "haar" : "wht");'
 
 echo "All hooks applied."
