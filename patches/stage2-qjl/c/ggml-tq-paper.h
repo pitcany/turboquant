@@ -108,6 +108,16 @@ _Static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 void ggml_quantize_row_tq4p_d128(const float * x, block_tq4p_d128 * y, int64_t k, uint8_t layer_byte);
 void ggml_quantize_row_tq4p_d256(const float * x, block_tq4p_d256 * y, int64_t k, uint8_t layer_byte);
 
+// 3-arg wrappers for ggml_from_float_t compatibility. Default to layer 0 +
+// TQP_ROT_WHT. The CUDA cpy dispatch uses the full 4-arg variant with
+// layer_byte from the cpy op's op_params[0].
+static inline void ggml_quantize_row_tq4p_d128_default(const float * x, void * y, int64_t k) {
+    ggml_quantize_row_tq4p_d128(x, (block_tq4p_d128 *)y, k, TQP_LAYER_BYTE(0, TQP_ROT_WHT));
+}
+static inline void ggml_quantize_row_tq4p_d256_default(const float * x, void * y, int64_t k) {
+    ggml_quantize_row_tq4p_d256(x, (block_tq4p_d256 *)y, k, TQP_LAYER_BYTE(0, TQP_ROT_WHT));
+}
+
 // dequantize_row_*: reconstruct fp32 from packed blocks. QJL stage is not
 // used for reconstruction (paper: Stage 2 only contributes to inner-product
 // estimation). layer_idx is read from each block's header.
