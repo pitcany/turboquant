@@ -145,12 +145,15 @@ MODEL=""
 MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
 
 if [[ -n "$MODEL_LIST" ]]; then
-    # Skip header, filter out embedding/cloud models, pick smallest by SIZE col.
+    # awk fields: $1=name $2=id $3=size_num $4=size_unit (GB/MB).
+    # Convert to MB, sort numerically, pick smallest generative model.
     MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
         | grep -viE 'embed|rerank' \
-        | awk '$3 != "-" {print $0}' \
-        | sort -t$'\t' -k3 -h \
-        | head -1 | awk '{print $1}')
+        | awk '$3+0 > 0 {
+            mb = ($4 == "GB") ? $3 * 1024 : $3;
+            printf "%012.1f %s\n", mb, $1
+        }' \
+        | sort -n | head -1 | awk '{print $2}')
 fi
 
 if [[ -z "$MODEL" ]]; then
@@ -160,23 +163,25 @@ if [[ -z "$MODEL" ]]; then
 fi
 echo "[+] using model: $MODEL"
 
-echo "[+] running inference..."
-INFERENCE_OUT=$(mktemp)
+# Use the API directly instead of `ollama run` to get clean JSON without
+# terminal ANSI escape codes from the interactive CLI.
+echo "[+] running inference via /api/generate..."
 set +e
-timeout 60 "$OLLAMA_BIN" run "$MODEL" "hello" > "$INFERENCE_OUT" 2>&1
+RESPONSE=$(curl -sf --max-time 120 \
+    "http://localhost:${PORT}/api/generate" \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"Say hello in one sentence.\",\"stream\":false}" \
+    2>/dev/null)
 INFERENCE_RC=$?
 set -e
 
-if [[ $INFERENCE_RC -ne 0 ]]; then
-    echo "ERROR: inference exited with code $INFERENCE_RC" >&2
-    echo "--- inference output ---"
-    cat "$INFERENCE_OUT" >&2
-    rm -f "$INFERENCE_OUT"
+if [[ $INFERENCE_RC -ne 0 ]] || [[ -z "$RESPONSE" ]]; then
+    echo "ERROR: inference API call failed (curl exit $INFERENCE_RC)" >&2
     fail_log 4
 fi
 
-INFERENCE_TEXT=$(cat "$INFERENCE_OUT")
-rm -f "$INFERENCE_OUT"
+# Extract the response text from JSON.
+INFERENCE_TEXT=$(echo "$RESPONSE" | python3 -c \
+    "import sys,json; print(json.load(sys.stdin).get('response',''))" 2>/dev/null || true)
 
 # ── (e continued) Check log for cache type AFTER model load ────────────
 #
@@ -232,14 +237,11 @@ if [[ -z "$INFERENCE_TEXT" ]]; then
     fail_log 4
 fi
 
-# Strip ANSI escape codes before checking for garbled output.
-CLEAN_TEXT=$(echo "$INFERENCE_TEXT" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r')
-
-# Check for NaN / inf / garbled output indicators.
-if echo "$CLEAN_TEXT" | grep -qiE '\bnan\b|\binf\b' 2>/dev/null; then
+# Check for NaN / inf indicators in the generated text.
+if echo "$INFERENCE_TEXT" | grep -qiE '\bnan\b|\binf\b' 2>/dev/null; then
     echo "ERROR: inference output contains NaN/inf markers" >&2
     echo "--- output ---"
-    echo "$CLEAN_TEXT" | head -10 >&2
+    echo "$INFERENCE_TEXT" | head -10 >&2
     fail_log 4
 fi
 
