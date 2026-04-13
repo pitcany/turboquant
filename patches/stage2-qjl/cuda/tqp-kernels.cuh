@@ -8,11 +8,23 @@
 #define QK_TQ4P_D256 256
 
 // Must match patches/stage2-qjl/c/ggml-tq-paper.h
+//
+// TQP_LAYER_BYTE: the quantize-call layout with bit 6 = 1 ("explicit
+// override"). Use when calling quantize functions to force a specific
+// rotation, bypassing the runtime resolver.
+//
+// TQP_STORED_BYTE: the block-storage layout with bit 6 = 0. Used inside
+// quantize kernels when writing the resolved rotation into a block
+// header. NEVER use TQP_LAYER_BYTE for block storage — it would set
+// bit 6 in the stored byte and corrupt downstream extract_rotation.
 #define TQP_ROT_WHT  0u
 #define TQP_ROT_HAAR 1u
-#define TQP_LAYER_BYTE(layer, rot) ((uint8_t)((((uint32_t)(rot) & 1u) << 7) | ((uint32_t)(layer) & 0x1fu)))
+#define TQP_BIT6_EXPLICIT          (1u << 6)
+#define TQP_LAYER_BYTE(layer, rot) ((uint8_t)(TQP_BIT6_EXPLICIT | (((uint32_t)(rot) & 1u) << 7) | ((uint32_t)(layer) & 0x1fu)))
+#define TQP_STORED_BYTE(layer, rot) ((uint8_t)((((uint32_t)(rot) & 1u) << 7) | ((uint32_t)(layer) & 0x1fu)))
 #define TQP_EXTRACT_LAYER(byte)    ((uint8_t)((byte) & 0x1fu))
 #define TQP_EXTRACT_ROT(byte)      ((uint8_t)(((byte) >> 7) & 1u))
+#define TQP_EXTRACT_EXPLICIT(byte) ((uint8_t)(((byte) >> 6) & 1u))
 
 // Block layout matches the CPU path (patches/stage2-qjl/c/ggml-tq-paper.h):
 //   offset 0..1  orig_norm (fp16)

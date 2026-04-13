@@ -255,6 +255,20 @@ class block_q8k_compat(ctypes.Structure):
 assert ctypes.sizeof(block_q8k_compat) == 292
 
 
+# Runtime rotation selector API
+lib.tqp_set_default_rotation.restype = None
+lib.tqp_set_default_rotation.argtypes = [ctypes.c_uint8]
+
+lib.tqp_set_thread_rotation.restype = None
+lib.tqp_set_thread_rotation.argtypes = [ctypes.c_uint8]
+
+lib.tqp_clear_thread_rotation.restype = None
+lib.tqp_clear_thread_rotation.argtypes = []
+
+lib.tqp_resolve_rotation.restype = ctypes.c_uint8
+lib.tqp_resolve_rotation.argtypes = [ctypes.c_uint8]
+
+
 # ---------- Fixtures ----------
 
 @pytest.fixture(scope="module", params=[64, 128, 256])
@@ -535,6 +549,119 @@ def test_q8k_dispatch_matches_fp32(d, constants, vectors, layer_idx, rotation):
         f"Q8_K vs fp32 max diff {max_abs_diff:.4f} exceeds tolerance "
         f"(d={d}, layer={layer_idx}, rot={ROTATION_IDS[rotation]})"
     )
+
+
+# ---------- Runtime rotation resolver (C-level) ----------
+
+ROT_UNSET = 0xFF
+
+
+class TestCRotationResolver:
+    """Verify the C tqp_resolve_rotation matches the Python resolver across
+    all four rotation sources: explicit, thread, process, compile_time."""
+
+    def _reset(self):
+        lib.tqp_clear_thread_rotation()
+        lib.tqp_set_default_rotation(ROT_UNSET)
+
+    def test_explicit_overrides_all(self):
+        """bit 6 = 1 → bit 7 used as-is, bit 6 cleared in result."""
+        self._reset()
+        lib.tqp_set_thread_rotation(ref.TQP_ROT_HAAR)
+        lib.tqp_set_default_rotation(ref.TQP_ROT_HAAR)
+
+        lb = ref.layer_byte(5, ref.TQP_ROT_WHT)  # explicit WHT
+        resolved = lib.tqp_resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_WHT
+        assert ref.extract_layer(resolved) == 5
+        assert ref.extract_explicit(resolved) == 0
+        self._reset()
+
+    def test_thread_overrides_process(self):
+        """Thread-local overrides process default."""
+        self._reset()
+        lib.tqp_set_default_rotation(ref.TQP_ROT_WHT)
+        lib.tqp_set_thread_rotation(ref.TQP_ROT_HAAR)
+
+        lb = ref.stored_byte(3, 0)  # bit 6 = 0
+        resolved = lib.tqp_resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_HAAR
+        self._reset()
+
+    def test_process_overrides_compile_time(self):
+        """Process default overrides compile-time WHT."""
+        self._reset()
+        lib.tqp_set_default_rotation(ref.TQP_ROT_HAAR)
+
+        lb = ref.stored_byte(3, 0)
+        resolved = lib.tqp_resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_HAAR
+        self._reset()
+
+    def test_compile_time_is_wht(self):
+        """No overrides → compile-time WHT."""
+        self._reset()
+        lb = ref.stored_byte(3, ref.TQP_ROT_HAAR)  # bit 7 = HAAR but bit 6 = 0
+        resolved = lib.tqp_resolve_rotation(lb)
+        assert ref.extract_rotation(resolved) == ref.TQP_ROT_WHT
+        self._reset()
+
+    def test_c_matches_python_resolver(self):
+        """C resolver produces same result as Python resolver for all sources."""
+        self._reset()
+        for layer in [0, 5, 31]:
+            for rot in [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]:
+                # Explicit
+                lb = ref.layer_byte(layer, rot)
+                assert lib.tqp_resolve_rotation(lb) == ref.resolve_rotation(lb), \
+                    f"explicit mismatch layer={layer} rot={rot}"
+
+                # Thread-local
+                lib.tqp_set_thread_rotation(rot)
+                ref.set_thread_rotation(rot)
+                lb = ref.stored_byte(layer, 0)
+                assert lib.tqp_resolve_rotation(lb) == ref.resolve_rotation(lb), \
+                    f"thread mismatch layer={layer} rot={rot}"
+                lib.tqp_clear_thread_rotation()
+                ref.clear_thread_rotation()
+
+                # Process
+                lib.tqp_set_default_rotation(rot)
+                ref.set_default_rotation(rot)
+                lb = ref.stored_byte(layer, 0)
+                assert lib.tqp_resolve_rotation(lb) == ref.resolve_rotation(lb), \
+                    f"process mismatch layer={layer} rot={rot}"
+                self._reset()
+                ref.set_default_rotation(ref._ROT_UNSET)
+
+    def test_thread_quantize_uses_resolved_rotation(self, d, constants, vectors):
+        """Setting thread-local rotation before C quantize call produces the
+        expected rotation in the stored block byte."""
+        self._reset()
+        lib.tqp_set_thread_rotation(ref.TQP_ROT_HAAR)
+
+        x_np = vectors[0].float().numpy().copy()
+        # Pass bit 6 = 0 so resolver kicks in
+        if d == 64:
+            blk = block_tq4p_d64()
+            lib.ggml_quantize_row_tq4p_d64(
+                x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.byref(blk), d, 0x00)
+        elif d == 128:
+            blk = block_tq4p_d128()
+            lib.ggml_quantize_row_tq4p_d128(
+                x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.byref(blk), d, 0x00)
+        else:
+            blk = block_tq4p_d256()
+            lib.ggml_quantize_row_tq4p_d256(
+                x_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.byref(blk), d, 0x00)
+
+        c_bytes = bytes(blk)
+        assert ref.extract_rotation(c_bytes[4]) == ref.TQP_ROT_HAAR
+        assert ref.extract_explicit(c_bytes[4]) == 0
+        self._reset()
 
 
 # ---------- BF16 / FP16 input quantize tests ----------
