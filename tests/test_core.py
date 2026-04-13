@@ -46,7 +46,9 @@ def test_turboquant_prod_bias_stays_small(bits: int) -> None:
     y = y / torch.norm(y, dim=-1, keepdim=True).clamp_min(1e-8)
 
     true_ip = (x * y).sum(dim=-1)
-    estimated_ip = quantizer.inner_product(y, quantizer.quantize(x))
+    # inner_product returns the full (N, M) score matrix; take the diagonal
+    # to get pairwise y_i, x_i scores for this test.
+    estimated_ip = quantizer.inner_product(y, quantizer.quantize(x)).diagonal()
 
     bias = (estimated_ip - true_ip).mean().item()
     assert abs(bias) < 0.01
@@ -65,7 +67,8 @@ def test_mse_only_inner_products_are_more_biased_than_prod() -> None:
     mse_quantizer = TurboQuantMSE(dim, bits, seed=42, device="cpu")
 
     true_ip = (x * y).sum(dim=-1)
-    prod_ip = prod_quantizer.inner_product(y, prod_quantizer.quantize(x))
+    # Full (N, M) score matrix; take the diagonal for pairwise y_i, x_i.
+    prod_ip = prod_quantizer.inner_product(y, prod_quantizer.quantize(x)).diagonal()
     mse_ip = (mse_quantizer.dequantize(mse_quantizer.quantize(x)) * y).sum(dim=-1)
 
     prod_bias = (prod_ip - true_ip).mean().abs().item()
@@ -102,7 +105,7 @@ def test_inner_product_matrix_matches_loop() -> None:
 
     estimated = quantizer.inner_product(queries, compressed)
     expected = torch.stack([
-        quantizer.inner_product(query.unsqueeze(0), compressed)
+        quantizer.inner_product(query, compressed)
         for query in queries
     ])
 
