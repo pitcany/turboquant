@@ -132,7 +132,8 @@ class TestProdQuantizerOnGPU:
         y = _make_unit_vectors(1000, dim, seed=300 + bits, device=device)
 
         compressed = quantizer.quantize(x)
-        estimated = quantizer.inner_product(y, compressed)
+        # inner_product returns (N, M); take diagonal for pairwise y_i, x_i.
+        estimated = quantizer.inner_product(y, compressed).diagonal()
         true_ip = (x * y).sum(dim=-1)
 
         bias = (estimated - true_ip).mean().item()
@@ -194,7 +195,8 @@ class TestKVCacheOnGPU:
 
         queries = torch.randn(1, dim, generator=gen).to(device)
         scores = cache.attention_scores(queries)
-        assert scores.shape == (8,)
+        # 2D query -> 2D (N, M) score matrix.
+        assert scores.shape == (1, 8)
         assert torch.isfinite(scores).all()
 
         vals = cache.get_values()
@@ -216,7 +218,8 @@ class TestKVCacheOnGPU:
 
         assert len(cache) == 20
         scores = cache.attention_scores(torch.randn(1, dim).to(device))
-        assert scores.shape == (20,)
+        # 2D query -> 2D (N, M) score matrix.
+        assert scores.shape == (1, 20)
 
     def test_kv_cache_attention_quality(self, device):
         """Quantized attention scores should correlate with fp32 attention."""
@@ -232,7 +235,8 @@ class TestKVCacheOnGPU:
 
         query = torch.randn(1, dim).to(device)
 
-        tq_scores = cache.attention_scores(query)
+        # 2D query -> (1, n_keys); squeeze for comparison with fp32 reference.
+        tq_scores = cache.attention_scores(query).squeeze(0)
         fp32_scores = (query @ keys.T).squeeze(0)
 
         corr = torch.corrcoef(torch.stack([fp32_scores, tq_scores]))[0, 1].item()
@@ -517,7 +521,8 @@ class TestGPUEdgeCases:
         x = _make_unit_vectors(1, 128, seed=42, device=device)
         compressed = quantizer.quantize(x)
         ip = quantizer.inner_product(x, compressed)
-        assert ip.shape == (1,)
+        # 2D x (1, d) dot 2D x (1, d) -> (1, 1).
+        assert ip.shape == (1, 1)
         # Self inner product of unit vector should be close to 1.0
         assert abs(ip.item() - 1.0) < 0.3, f"Self-IP {ip.item():.4f} too far from 1.0"
 
@@ -561,7 +566,8 @@ class TestInnerProductBatchingBug:
     multiplication, so it only works when n_queries == n_keys or one is 1.
     It CANNOT compute a full (n_queries, n_keys) attention matrix."""
 
-    def test_elementwise_works_for_equal_sizes(self):
+    def test_equal_sizes_returns_full_matrix(self):
+        """Bug #4 fix: N == M no longer shortcuts to (N,) diagonal."""
         dim, bits = 128, 3
         q = TurboQuantProd(dim, bits, seed=42, device="cpu")
         x = _make_unit_vectors(10, dim, seed=1)
@@ -569,9 +575,10 @@ class TestInnerProductBatchingBug:
 
         compressed = q.quantize(x)
         ip = q.inner_product(y, compressed)
-        assert ip.shape == (10,), "Element-wise should work"
+        assert ip.shape == (10, 10), f"Expected (10, 10), got {ip.shape}"
 
     def test_broadcast_1_query_many_keys(self):
+        """Bug #4 fix: 2D (1, d) query returns (1, M), not (M,)."""
         dim, bits = 128, 3
         q = TurboQuantProd(dim, bits, seed=42, device="cpu")
         x = _make_unit_vectors(10, dim, seed=1)
@@ -579,7 +586,7 @@ class TestInnerProductBatchingBug:
 
         compressed = q.quantize(x)
         ip = q.inner_product(y, compressed)
-        assert ip.shape == (10,), "Broadcasting 1 query to many keys should work"
+        assert ip.shape == (1, 10), f"Expected (1, 10), got {ip.shape}"
 
     def test_many_queries_many_keys(self):
         """Bug #4 fix: n_queries != n_keys now returns (n_queries, n_keys)."""
@@ -640,7 +647,8 @@ class TestGPUNumericalValidation:
         y = _make_unit_vectors(n_samples, dim, seed=20, device=device)
 
         compressed = q.quantize(x)
-        estimated = q.inner_product(y, compressed)
+        # inner_product returns (N, N); take diagonal for pairwise y_i, x_i.
+        estimated = q.inner_product(y, compressed).diagonal()
         true_ip = (x * y).sum(dim=-1)
 
         bias = (estimated - true_ip).mean().item()
