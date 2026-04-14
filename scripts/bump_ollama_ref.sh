@@ -84,8 +84,9 @@ sleep 3
 if ! bash "$SMOKE_SCRIPT" 2>&1 | tee /tmp/bump-smoke.log | tail -10; then
     echo
     echo "SMOKE TEST FAILED. Check /tmp/bump-smoke.log"
-    echo "Reverting OLLAMA_REF..."
+    echo "Reverting OLLAMA_REF and checkout..."
     sed -i "s|OLLAMA_REF:-${SHORT_REF}|OLLAMA_REF:-${CURRENT_REF}|" "$BUILD_SCRIPT"
+    git -C "$OLLAMA_DIR" checkout "${CURRENT_REF}" --quiet --detach 2>/dev/null || true
     exit 1
 fi
 

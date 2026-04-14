@@ -93,13 +93,20 @@ jobs:
             exit 0
           fi
 
-          for f in ggml-tq-paper.h ggml-tq-paper.c tqp_centroids_d128.h tqp_centroids_d256.h tqp_constants_d128.h tqp_constants_d256.h; do
+          # Must include d64 — ggml-tq-paper.c #includes tqp_centroids_d64.h
+          # and tqp_constants_d64.h. Missing them would break compilation
+          # if a compile step is ever added downstream of this hook check.
+          for f in ggml-tq-paper.h ggml-tq-paper.c \
+                   tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+                   tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
             cp patches/stage2-qjl/c/$f "$GGML/src/"
           done
           for f in patches/stage2-qjl/cuda/tqp-*.cu patches/stage2-qjl/cuda/tqp-*.cuh; do
             cp "$f" "$GGML/src/ggml-cuda/"
           done
-          for f in tqp_constants_d128.h tqp_constants_d256.h tqp_centroids_d128.h tqp_centroids_d256.h ggml-tq-paper.h; do
+          for f in ggml-tq-paper.h \
+                   tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+                   tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
             cp "patches/stage2-qjl/c/$f" "$GGML/src/ggml-cuda/"
           done
 
