@@ -342,7 +342,8 @@ print('│  MEMORY                                               │')
 print('│    KV cache compression: 3.76x (16 bpw → 4.25 bpw)   │')
 ok = p_overhead < 5
 if have_decode:
-    ok = ok and abs(d_overhead) < 5
+    # Negative decode overhead means tq4p is faster than f16 — still passes.
+    ok = ok and d_overhead < 5
 print('│                                                       │')
 if ok:
     print('│  ✓ TQ4P within expected overhead range                │')
