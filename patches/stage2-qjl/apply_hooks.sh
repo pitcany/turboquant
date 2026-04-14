@@ -892,7 +892,6 @@ if not m:
     sys.exit(1)
 
 ind = m.group(2)  # indentation
-d_var = 'QK_TQ4P_D128'  # head_dim for staging scatter
 
 staging_code = (
     f'{m.group(1)}\n'

@@ -1,4 +1,5 @@
 #include "tqp-staging.cuh"
+#include <cassert>
 #include <cstdio>
 
 // ---------- staging cache ----------
@@ -106,10 +107,16 @@ __global__ static void k_f32_to_f16_scatter(
     dst[dst_row * d + tid] = __float2half_rn(src[row * src_stride + tid]);
 }
 
+// CUDA silently fails kernel launches when blockDim > 1024. Current TQ4P
+// head dims (64/128/256) are safe; guard against a future caller passing
+// a larger dimension so the failure is visible rather than a silent no-op.
+#define TQP_STAGING_MAX_D 1024
+
 extern "C" void tqp_staging_f32_to_f16_scatter_i64(
         const float * src, const int64_t * idx, half * dst,
         int64_t n_rows, int64_t src_stride, int d, cudaStream_t stream) {
     if (n_rows <= 0) return;
+    assert(d > 0 && d <= TQP_STAGING_MAX_D);
     k_f32_to_f16_scatter<<<(int)n_rows, d, 0, stream>>>(src, idx, dst, n_rows, src_stride, d);
 }
 
@@ -117,5 +124,6 @@ extern "C" void tqp_staging_f32_to_f16_scatter_i32(
         const float * src, const int32_t * idx, half * dst,
         int64_t n_rows, int64_t src_stride, int d, cudaStream_t stream) {
     if (n_rows <= 0) return;
+    assert(d > 0 && d <= TQP_STAGING_MAX_D);
     k_f32_to_f16_scatter<<<(int)n_rows, d, 0, stream>>>(src, idx, dst, n_rows, src_stride, d);
 }
