@@ -36,6 +36,11 @@ extern "C" void tqp_staging_put(int device, const void * cache_data,
     if (device < 0 || device >= TQP_STAGING_MAX_DEVICES) return;
     TqpStagingCache & c = g_tqp_staging[device];
     // Should not already exist (caller checks with find first)
+    // NOTE: eviction here drops the reference to a pool-allocated GPU
+    // buffer without freeing it. The pool reclaims it on reset, but under
+    // sustained pressure this can temporarily balloon pool usage. Callers
+    // that drive the cache past TQP_STAGING_MAX_ENTRIES should add a
+    // real free/reuse path before this code is enabled in production.
     if (c.n >= TQP_STAGING_MAX_ENTRIES) {
         for (int i = 0; i < c.n - 1; ++i) c.entries[i] = c.entries[i + 1];
         c.n--;

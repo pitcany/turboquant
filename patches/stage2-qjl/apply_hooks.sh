@@ -720,7 +720,21 @@ echo '                     (resolved_rot == TQP_ROT_HAAR) ? "haar" : "wht");'
 # quantize during prefill entirely, write fp16-only to staging, then bulk-
 # quantize staging→TQ4P between prefill and decode.
 #
-# To re-enable: change TQP_STAGING_ENABLED=0 to =1 below.
+# KNOWN LIMITATIONS if re-enabled as-is:
+#  1. DECODE CORRUPTION: the CPY/SET_ROWS hooks fire for all TQ4P writes,
+#     not just prefill. During decode, SET_ROWS writes one new token into
+#     a full-cache-sized zeroed staging buffer; flash attention then reads
+#     the whole buffer as the KV cache, so prior tokens read as zeros →
+#     garbage output. A production re-enable must gate staging on a
+#     "prefill-only" signal (e.g. n_rows > 1 or an explicit flag set by
+#     the attention module).
+#  2. POOL-LIFETIME LEAKS: the 4-slot staging cache evicts oldest entries
+#     without freeing the evicted pool-allocated buffers. They're reclaimed
+#     when the pool resets, but transient pool pressure builds if the
+#     eviction path fires during a single pass.
+#
+# To re-enable: change TQP_STAGING_ENABLED=0 to =1 below AND address both
+# items above first.
 TQP_STAGING_ENABLED=0
 
 FATTN_COMMON="$GGML/src/ggml-cuda/fattn-common.cuh"
