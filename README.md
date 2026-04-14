@@ -106,6 +106,30 @@ scripts/build_ollama_tq.sh --rebuild
 
 See [docs/OLLAMA_NATIVE.md](docs/OLLAMA_NATIVE.md) for the full workflow, rollback instructions, and troubleshooting.
 
+## Benchmarks
+
+Measured on an RTX 4090, median of 3 runs per configuration, ~2K-token prompt for prefill + 128-token decode. Produced by [`scripts/bench_prefill_tq4p.sh`](scripts/bench_prefill_tq4p.sh).
+
+| Model | Prefill overhead vs f16 | Decode overhead | Decode tok/s |
+|---|---:|---:|---:|
+| qwen2.5:3b      | +13.6% | **-29%** | 283 |
+| llama3.1:8b     |  +9.4% | **-22%** | 195 |
+| llama3.3:70b    |  +1.4% |  **-9%** |  26 |
+
+**KV cache**: 16 bpw → 4.25 bpw (3.76x compression) for `tq4p_d128`; ~3.84x for `tq4p_d256`.
+
+**Key finding**: TQ4P overhead shrinks with model size — it's essentially free on 70B and decode is actually *faster* than f16 across all tested sizes. On large models decode is memory-bandwidth-bound, so moving 4.25 bpw through the bus beats moving 16 bpw by more than the extra quantize math costs.
+
+Reproduce on your own hardware:
+
+```bash
+scripts/bench_prefill_tq4p.sh                       # auto-picks smallest model
+scripts/bench_prefill_tq4p.sh --model llama3.1:8b   # specific model
+scripts/bench_prefill_tq4p.sh --runs 5              # more samples per config
+```
+
+The benchmark prepends a unique per-run tag to defeat ollama's prefix-KV cache and uses the median of N runs to filter cold-start outliers.
+
 ## Validation
 
 ### Synthetic Tests (`tests/test_core.py`, `tests/test_stability.py`)
