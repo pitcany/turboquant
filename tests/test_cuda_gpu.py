@@ -510,8 +510,10 @@ class TestGPUEdgeCases:
 
     def test_large_norm_vectors_on_gpu(self, device):
         quantizer = TurboQuantProd(d=128, bits=3, seed=42, device=device)
+        # Use actual large-norm vectors — do NOT normalize, otherwise this
+        # just duplicates the unit-vector coverage (sibling tiny-norm test
+        # passes raw 1e-15 scaled vectors for the same reason).
         big = torch.randn(4, 128, device=device) * 1e6
-        big = big / big.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         compressed = quantizer.quantize(big)
         ip = quantizer.inner_product(big, compressed)
         assert torch.isfinite(ip).all()
