@@ -316,8 +316,12 @@ __device__ static inline void tqp_quantize_block_device(
     }
 
     if (tid == 0) {
-        *orig_norm_out = tqp_fp32_to_fp16_device(smem_scalars[0]);
-        *res_d_out = tqp_fp32_to_fp16_device(smem_scalars[1]);
+        // Use memcpy for stores to handle misaligned block addresses
+        // (69-byte blocks → second block starts at odd offset).
+        uint16_t norm_val = tqp_fp32_to_fp16_device(smem_scalars[0]);
+        uint16_t resd_val = tqp_fp32_to_fp16_device(smem_scalars[1]);
+        memcpy(orig_norm_out, &norm_val, sizeof(uint16_t));
+        memcpy(res_d_out, &resd_val, sizeof(uint16_t));
         *layer_idx_out = layer_idx_val;
     }
 }

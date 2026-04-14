@@ -29,9 +29,13 @@ __device__ static inline void tqp_dequantize_block_device(
     __shared__ float smem_vec[QK_TQ4P_D256];
 
     const int tid = threadIdx.x;
+    // Use memcpy for potentially misaligned block reads (69-byte blocks →
+    // second block in a row starts at odd offset).
+    uint16_t raw_norm;
+    memcpy(&raw_norm, &blk->orig_norm, sizeof(uint16_t));
     const uint8_t layer = TQP_EXTRACT_LAYER(blk->layer_idx) % TQP_MAX_LAYERS;
     const uint8_t rot = TQP_EXTRACT_ROT(blk->layer_idx);
-    const float orig_norm = tqp_fp16_to_fp32_device(blk->orig_norm);
+    const float orig_norm = tqp_fp16_to_fp32_device(raw_norm);
 
     smem_vec[tid] = centroids[tqp_unpack_index_bitplane(blk->qs, tid)];
     __syncthreads();
@@ -49,8 +53,7 @@ __device__ static inline void tqp_dequantize_block_device(
     }
 
     // Clamp NaN/Inf to zero: uninitialized KV-cache blocks (random orig_norm
-    // fp16 bits — ~2.6% chance of NaN) would poison flash attention's softmax
-    // when the staging dequant covers the full cache allocation.
+    // fp16 bits) would poison flash attention's softmax.
     float result = orig_norm * x_hat_unit;
     if (!isfinite(result)) {
         result = 0.0f;
