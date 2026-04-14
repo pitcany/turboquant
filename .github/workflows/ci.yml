@@ -79,9 +79,13 @@ jobs:
             exit 0
           fi
           echo "Cloning ollama at ref: $OLLAMA_REF"
-          git clone --depth 1 https://github.com/ollama/ollama /tmp/ollama-ci
-          cd /tmp/ollama-ci && git fetch origin "$OLLAMA_REF" && git checkout FETCH_HEAD
-          cd -
+          # Partial clone (commits + trees, blobs on demand) so we can
+          # resolve the short SHA locally. `git fetch origin <short-sha>`
+          # does NOT work: the fetch protocol requires either a full
+          # 40-char SHA or a named ref, so the previous shallow clone
+          # + fetch combo would always fail.
+          git clone --filter=blob:none https://github.com/ollama/ollama /tmp/ollama-ci
+          git -C /tmp/ollama-ci checkout "$OLLAMA_REF"
 
           GGML=/tmp/ollama-ci/ml/backend/ggml/ggml
           if [ ! -f "$GGML/include/ggml.h" ]; then
