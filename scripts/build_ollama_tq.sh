@@ -28,7 +28,7 @@ set -euo pipefail
 
 WORKDIR="${WORKDIR:-$HOME/.local/src/ollama-tq}"
 OLLAMA_REPO="${OLLAMA_REPO:-https://github.com/ollama/ollama}"
-OLLAMA_REF="${OLLAMA_REF:-}"
+OLLAMA_REF="${OLLAMA_REF:-9330bb91}"
 # Auto-detect CUDA: default on if `nvcc` is on PATH, off otherwise. User can
 # override with CUDA=1 or CUDA=0 in the environment.
 if [[ -z "${CUDA:-}" ]]; then

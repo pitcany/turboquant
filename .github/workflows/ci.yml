@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  c-parity:
+    name: C vs Python parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu numpy pytest
+
+      - name: Build C reference library
+        run: |
+          cd patches/stage2-qjl/c
+          make
+
+      - name: Run C vs Python tests (d128 + d256)
+        run: |
+          cd patches/stage2-qjl/python
+          pytest test_c_vs_python.py -v -k "not 64" --tb=short
+
+  cuda-parity:
+    name: CUDA vs CPU parity
+    runs-on: ubuntu-latest
+    # Self-hosted GPU runner would go here. For now, skip if no GPU.
+    # To enable: change to `runs-on: [self-hosted, gpu]`
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install torch numpy pytest
+
+      - name: Build C + CUDA libraries
+        run: |
+          cd patches/stage2-qjl/c && make
+          cd ../cuda && cmake -S . -B build && cmake --build build -j
+
+      - name: Run CUDA vs CPU tests
+        run: |
+          cd patches/stage2-qjl/python
+          pytest test_cuda_vs_cpu.py -v --tb=short
+
+  build-check:
+    name: Ollama hook anchor check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify hooks apply to pinned ollama ref
+        run: |
+          OLLAMA_REF=$(grep 'OLLAMA_REF:-' scripts/build_ollama_tq.sh | grep -oP ':-\K[^}"]+' | head -1)
+          if [ -z "$OLLAMA_REF" ]; then
+            echo "No pinned OLLAMA_REF found, skipping"
+            exit 0
+          fi
+          echo "Cloning ollama at ref: $OLLAMA_REF"
+          git clone --depth 1 https://github.com/ollama/ollama /tmp/ollama-ci
+          cd /tmp/ollama-ci && git fetch origin "$OLLAMA_REF" && git checkout FETCH_HEAD
+          cd -
+
+          GGML=/tmp/ollama-ci/ml/backend/ggml/ggml
+          if [ ! -f "$GGML/include/ggml.h" ]; then
+            echo "ggml tree not at expected path, skipping"
+            exit 0
+          fi
+
+          for f in ggml-tq-paper.h ggml-tq-paper.c tqp_centroids_d128.h tqp_centroids_d256.h tqp_constants_d128.h tqp_constants_d256.h; do
+            cp patches/stage2-qjl/c/$f "$GGML/src/"
+          done
+          for f in patches/stage2-qjl/cuda/tqp-*.cu patches/stage2-qjl/cuda/tqp-*.cuh; do
+            cp "$f" "$GGML/src/ggml-cuda/"
+          done
+          for f in tqp_constants_d128.h tqp_constants_d256.h tqp_centroids_d128.h tqp_centroids_d256.h ggml-tq-paper.h; do
+            cp "patches/stage2-qjl/c/$f" "$GGML/src/ggml-cuda/"
+          done
+
+          bash patches/stage2-qjl/apply_hooks.sh "$GGML"
+          echo "All hooks applied successfully"
