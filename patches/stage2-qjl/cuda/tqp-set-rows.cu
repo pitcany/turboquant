@@ -33,17 +33,17 @@ __global__ static void k_set_rows_tq4p_d128(
         uint8_t layer,
         const float * __restrict__ pi,
         const float * __restrict__ s,
+        const float * __restrict__ sigma,
+        const float * __restrict__ centroids,
+        const float * __restrict__ boundaries,
         int64_t n_rows,
-        int64_t src0_stride_row,    // nb01 / sizeof(float)
-        int64_t dst_stride_row) {   // nb1  (bytes per dest row)
+        int64_t src0_stride_row,
+        int64_t dst_stride_row) {
 
     const int64_t row = (int64_t)blockIdx.x;
     if (row >= n_rows) return;
 
-    // Source: contiguous F32 row
     const float * src_row = src0 + row * src0_stride_row;
-
-    // Destination: scattered via index
     const int64_t dst_row_idx = (int64_t)src1[row];
     block_tq4p_d128 * dst_block = (block_tq4p_d128 *)((char *)dst + dst_row_idx * dst_stride_row);
 
@@ -55,11 +55,11 @@ __global__ static void k_set_rows_tq4p_d128(
         layer_byte_val,
         dst_block->qs,
         dst_block->qjl_signs,
-        &c_tqp_sigma_d128[layer][0],
+        sigma + layer * QK_TQ4P_D128,
         pi + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
         s  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
-        c_tqp_centroids_d128,
-        c_tqp_boundaries_d128);
+        centroids,
+        boundaries);
 }
 
 // ── SET_ROWS kernel for TQ4P_D256 ─────────────────────────────────────
@@ -73,6 +73,9 @@ __global__ static void k_set_rows_tq4p_d256(
         uint8_t layer,
         const float * __restrict__ pi,
         const float * __restrict__ s,
+        const float * __restrict__ sigma,
+        const float * __restrict__ centroids,
+        const float * __restrict__ boundaries,
         int64_t n_rows,
         int64_t src0_stride_row,
         int64_t dst_stride_row) {
@@ -92,11 +95,11 @@ __global__ static void k_set_rows_tq4p_d256(
         layer_byte_val,
         dst_block->qs,
         dst_block->qjl_signs,
-        &c_tqp_sigma_d256[layer][0],
+        sigma + layer * QK_TQ4P_D256,
         pi + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
         s  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
-        c_tqp_centroids_d256,
-        c_tqp_boundaries_d256);
+        centroids,
+        boundaries);
 }
 
 // ── Host dispatch (extern "C" for cross-TU visibility) ────────────────
@@ -120,6 +123,7 @@ extern "C" void ggml_cuda_set_rows_tq4p_d128(
             <<<(unsigned int)n_rows, QK_TQ4P_D128, 0, stream>>>( \
                 src0_d, (const IDX_T *)src1_d, (block_tq4p_d128 *)dst_d, \
                 byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, \
+                tqp_state->sigma_d128, tqp_state->centroids_d128, tqp_state->boundaries_d128, \
                 n_rows, src0_stride_row, dst_stride_row)
 
     if (rot == TQP_ROT_WHT) {
@@ -151,6 +155,7 @@ extern "C" void ggml_cuda_set_rows_tq4p_d256(
             <<<(unsigned int)n_rows, QK_TQ4P_D256, 0, stream>>>( \
                 src0_d, (const IDX_T *)src1_d, (block_tq4p_d256 *)dst_d, \
                 byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, \
+                tqp_state->sigma_d256, tqp_state->centroids_d256, tqp_state->boundaries_d256, \
                 n_rows, src0_stride_row, dst_stride_row)
 
     if (rot == TQP_ROT_WHT) {

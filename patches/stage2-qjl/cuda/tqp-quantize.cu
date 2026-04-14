@@ -17,11 +17,9 @@ extern "C" int tqp_cuda_device_count() {
 // tqp_quantize_block_device is now in tqp-kernels.cuh so it can be shared
 // with tqp-set-rows.cu. The kernel wrappers below call it directly.
 
-// Per-layer sigma lives in __constant__ memory; the kernel reads it by
-// symbol rather than via a kernel-argument pointer (host-side addresses of
-// __constant__ symbols are not usable as device pointers). Π lives in
-// device global memory via `pi`. ROT is a template parameter so the dead
-// branch is compiled out.
+// Per-layer sigma, centroids, and boundaries live in device global memory
+// via TqpDeviceState pointers. Π and S likewise. ROT is a template
+// parameter so the dead branch is compiled out.
 template<uint8_t ROT>
 __global__ static void tqp_quantize_kernel_d128(
         const float * __restrict__ x,
@@ -30,6 +28,9 @@ __global__ static void tqp_quantize_kernel_d128(
         uint8_t layer,
         const float * __restrict__ pi,
         const float * __restrict__ s,
+        const float * __restrict__ sigma,
+        const float * __restrict__ centroids,
+        const float * __restrict__ boundaries,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
     if (b >= n_blocks) {
@@ -44,11 +45,11 @@ __global__ static void tqp_quantize_kernel_d128(
         layer_byte_val,
         y[b].qs,
         y[b].qjl_signs,
-        &c_tqp_sigma_d128[layer][0],
+        sigma + (size_t)layer * QK_TQ4P_D128,
         pi + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
         s  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
-        c_tqp_centroids_d128,
-        c_tqp_boundaries_d128);
+        centroids,
+        boundaries);
 }
 
 template<uint8_t ROT>
@@ -59,6 +60,9 @@ __global__ static void tqp_quantize_kernel_d256(
         uint8_t layer,
         const float * __restrict__ pi,
         const float * __restrict__ s,
+        const float * __restrict__ sigma,
+        const float * __restrict__ centroids,
+        const float * __restrict__ boundaries,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
     if (b >= n_blocks) {
@@ -73,11 +77,11 @@ __global__ static void tqp_quantize_kernel_d256(
         layer_byte_val,
         y[b].qs,
         y[b].qjl_signs,
-        &c_tqp_sigma_d256[layer][0],
+        sigma + (size_t)layer * QK_TQ4P_D256,
         pi + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
         s  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
-        c_tqp_centroids_d256,
-        c_tqp_boundaries_d256);
+        centroids,
+        boundaries);
 }
 
 extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
@@ -97,10 +101,16 @@ extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64
     const int64_t n_blocks = k / QK_TQ4P_D128;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d128<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, n_blocks);
+            x, (block_tq4p_d128 *)y, byte_stored, layer,
+            tqp_state->pi_d128, tqp_state->s_d128,
+            tqp_state->sigma_d128, tqp_state->centroids_d128, tqp_state->boundaries_d128,
+            n_blocks);
     } else {
         tqp_quantize_kernel_d128<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer, tqp_state->pi_d128, tqp_state->s_d128, n_blocks);
+            x, (block_tq4p_d128 *)y, byte_stored, layer,
+            tqp_state->pi_d128, tqp_state->s_d128,
+            tqp_state->sigma_d128, tqp_state->centroids_d128, tqp_state->boundaries_d128,
+            n_blocks);
     }
 }
 
@@ -121,10 +131,16 @@ extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64
     const int64_t n_blocks = k / QK_TQ4P_D256;
     if (rot == TQP_ROT_WHT) {
         tqp_quantize_kernel_d256<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, n_blocks);
+            x, (block_tq4p_d256 *)y, byte_stored, layer,
+            tqp_state->pi_d256, tqp_state->s_d256,
+            tqp_state->sigma_d256, tqp_state->centroids_d256, tqp_state->boundaries_d256,
+            n_blocks);
     } else {
         tqp_quantize_kernel_d256<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer, tqp_state->pi_d256, tqp_state->s_d256, n_blocks);
+            x, (block_tq4p_d256 *)y, byte_stored, layer,
+            tqp_state->pi_d256, tqp_state->s_d256,
+            tqp_state->sigma_d256, tqp_state->centroids_d256, tqp_state->boundaries_d256,
+            n_blocks);
     }
 }
 

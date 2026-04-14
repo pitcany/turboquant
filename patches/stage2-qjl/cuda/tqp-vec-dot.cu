@@ -114,12 +114,13 @@ __global__ static void tqp_vec_dot_kernel_d128(
         const float * __restrict__ Sq,
         const float * __restrict__ q_rot,
         float * __restrict__ out,
-        int64_t n_blocks) {
+        int64_t n_blocks,
+        const float * __restrict__ centroids) {
     const int64_t b = (int64_t)blockIdx.x;
     if (b >= n_blocks) {
         return;
     }
-    const float result = tqp_vec_dot_block_device<QK_TQ4P_D128>(&blocks[b], Sq, q_rot, c_tqp_centroids_d128);
+    const float result = tqp_vec_dot_block_device<QK_TQ4P_D128>(&blocks[b], Sq, q_rot, centroids);
     if (threadIdx.x == 0) {
         out[b] = result;
     }
@@ -130,12 +131,13 @@ __global__ static void tqp_vec_dot_kernel_d256(
         const float * __restrict__ Sq,
         const float * __restrict__ q_rot,
         float * __restrict__ out,
-        int64_t n_blocks) {
+        int64_t n_blocks,
+        const float * __restrict__ centroids) {
     const int64_t b = (int64_t)blockIdx.x;
     if (b >= n_blocks) {
         return;
     }
-    const float result = tqp_vec_dot_block_device<QK_TQ4P_D256>(&blocks[b], Sq, q_rot, c_tqp_centroids_d256);
+    const float result = tqp_vec_dot_block_device<QK_TQ4P_D256>(&blocks[b], Sq, q_rot, centroids);
     if (threadIdx.x == 0) {
         out[b] = result;
     }
@@ -182,8 +184,13 @@ extern "C" void ggml_cuda_tqp_vec_dot_blocks_d128(
     if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     tqp_vec_dot_kernel_d128<<<(unsigned int)n_blocks, 32, 0, stream>>>(
-        (const block_tq4p_d128 *)blocks, Sq, q_rot, out, n_blocks);
+        (const block_tq4p_d128 *)blocks, Sq, q_rot, out, n_blocks,
+        tqp_state->centroids_d128);
 }
 
 extern "C" void ggml_cuda_tqp_vec_dot_blocks_d256(
@@ -192,8 +199,13 @@ extern "C" void ggml_cuda_tqp_vec_dot_blocks_d256(
     if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
         return;
     }
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    if (!tqp_state) {
+        return;
+    }
     tqp_vec_dot_kernel_d256<<<(unsigned int)n_blocks, 64, 0, stream>>>(
-        (const block_tq4p_d256 *)blocks, Sq, q_rot, out, n_blocks);
+        (const block_tq4p_d256 *)blocks, Sq, q_rot, out, n_blocks,
+        tqp_state->centroids_d256);
 }
 
 template<typename Block>
@@ -497,16 +509,18 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     const dim3 grid((unsigned int)ne01, (unsigned int)ne11, (unsigned int)(ne2 * ne3));
     float * dst_d = (float *)dst->data;
 
+    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+
     if (d == QK_TQ4P_D128) {
         tqp_vec_dot_ggml_kernel<QK_TQ4P_D128, block_tq4p_d128><<<grid, 32, 0, stream>>>(
             (const block_tq4p_d128 *)src0->data, Sq, q_rot, dst_d,
             ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3,
-            channel_ratio, sample_ratio, c_tqp_centroids_d128);
+            channel_ratio, sample_ratio, tqp_state->centroids_d128);
     } else {
         tqp_vec_dot_ggml_kernel<QK_TQ4P_D256, block_tq4p_d256><<<grid, 64, 0, stream>>>(
             (const block_tq4p_d256 *)src0->data, Sq, q_rot, dst_d,
             ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3,
-            channel_ratio, sample_ratio, c_tqp_centroids_d256);
+            channel_ratio, sample_ratio, tqp_state->centroids_d256);
     }
 }
 #endif
