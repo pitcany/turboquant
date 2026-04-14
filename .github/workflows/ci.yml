@@ -18,7 +18,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu numpy pytest
+        run: |
+          # Install torch from its CPU-only index (smaller wheel, no CUDA).
+          # Use --extra-index-url (not --index-url) so numpy/pytest still
+          # resolve from PyPI — the torch CPU index doesn't carry them.
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+              torch numpy pytest
 
       - name: Build C reference library
         run: |
