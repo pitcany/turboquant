@@ -126,6 +126,7 @@ run_inference() {
     # Returns: prompt_eval_duration eval_duration prompt_eval_count eval_count (nanoseconds)
     local model="$1"
     local prompt="$2"
+    local num_predict="${3:-1}"
 
     # Build JSON payload safely via python to handle escaping.
     # Explicitly set num_ctx to avoid the VRAM-based default (262144) which
@@ -133,9 +134,9 @@ run_inference() {
     python3 -c "
 import json, sys
 payload = {'model': sys.argv[1], 'prompt': sys.argv[2],
-           'stream': False, 'options': {'num_predict': 1, 'num_ctx': 4096}}
+           'stream': False, 'options': {'num_predict': int(sys.argv[4]), 'num_ctx': 4096}}
 json.dump(payload, open(sys.argv[3], 'w'))
-" "$model" "$prompt" "$PROMPT_JSON_FILE" 2>/dev/null || return 1
+" "$model" "$prompt" "$PROMPT_JSON_FILE" "$num_predict" 2>/dev/null || return 1
 
     local resp
     resp=$(curl -sf --max-time 300 \
@@ -192,8 +193,11 @@ echo
 
 # ── Benchmark loop ─────────────────────────────────────────────────────
 
-TQ4P_TIMES=()
-F16_TIMES=()
+TQ4P_PREFILL=()
+F16_PREFILL=()
+TQ4P_DECODE=()
+F16_DECODE=()
+DECODE_TOKENS=128
 
 for kv_type in tq4p_d128 f16; do
     LOG="/tmp/ollama-bench-${kv_type}.log"
@@ -218,12 +222,14 @@ for kv_type in tq4p_d128 f16; do
         echo "done"
     fi
 
+    # ── Prefill benchmark ──
+    echo "  [prefill]"
     for i in $(seq 1 "$RUNS"); do
-        # Append a unique suffix to bust Ollama's KV cache between runs.
-        run_prompt="${PROMPT} [run ${kv_type} ${i}]"
+        # Prepend a unique tag to bust Ollama's prefix KV cache between runs.
+        run_prompt="[run ${kv_type} ${i}] ${PROMPT}"
         result=$(run_inference "$MODEL" "$run_prompt" 2>/dev/null || true)
         if [[ -z "$result" ]]; then
-            echo "  run $i: FAILED" >&2
+            echo "    run $i: FAILED" >&2
             continue
         fi
 
@@ -231,12 +237,39 @@ for kv_type in tq4p_d128 f16; do
         prefill_ms=$((prefill_ns / 1000000))
         tokens_per_sec=$(python3 -c "print(f'{$prompt_tokens / ($prefill_ns / 1e9):.1f}')" 2>/dev/null)
 
-        echo "  run $i: prefill=${prefill_ms}ms  tokens=${prompt_tokens}  speed=${tokens_per_sec} tok/s"
+        echo "    run $i: prefill=${prefill_ms}ms  tokens=${prompt_tokens}  speed=${tokens_per_sec} tok/s"
 
         if [[ "$kv_type" == "tq4p_d128" ]]; then
-            TQ4P_TIMES+=("$prefill_ns")
+            TQ4P_PREFILL+=("$prefill_ns")
         else
-            F16_TIMES+=("$prefill_ns")
+            F16_PREFILL+=("$prefill_ns")
+        fi
+    done
+
+    # ── Decode benchmark ──
+    echo "  [decode: ${DECODE_TOKENS} tokens]"
+    for i in $(seq 1 "$RUNS"); do
+        # Short prompt to minimize prefill; unique prefix to avoid caching.
+        result=$(run_inference "$MODEL" "[decode ${kv_type} ${i}] Write a story." "$DECODE_TOKENS" 2>/dev/null || true)
+        if [[ -z "$result" ]]; then
+            echo "    run $i: FAILED" >&2
+            continue
+        fi
+
+        read -r prefill_ns decode_ns prompt_tokens gen_tokens <<< "$result"
+        if [[ "$gen_tokens" -le 0 || "$decode_ns" -le 0 ]]; then
+            echo "    run $i: no tokens generated" >&2
+            continue
+        fi
+        decode_ms=$((decode_ns / 1000000))
+        decode_tps=$(python3 -c "print(f'{$gen_tokens / ($decode_ns / 1e9):.1f}')" 2>/dev/null)
+
+        echo "    run $i: decode=${decode_ms}ms  tokens=${gen_tokens}  speed=${decode_tps} tok/s"
+
+        if [[ "$kv_type" == "tq4p_d128" ]]; then
+            TQ4P_DECODE+=("$decode_ns")
+        else
+            F16_DECODE+=("$decode_ns")
         fi
     done
 
@@ -257,51 +290,64 @@ done
 
 # ── Results ────────────────────────────────────────────────────────────
 
-if [[ ${#TQ4P_TIMES[@]} -eq 0 ]] || [[ ${#F16_TIMES[@]} -eq 0 ]]; then
+if [[ ${#TQ4P_PREFILL[@]} -eq 0 ]] || [[ ${#F16_PREFILL[@]} -eq 0 ]]; then
     echo "ERROR: not enough successful runs to compare" >&2
     exit 1
 fi
 
+TQ4P_D_STR=$(IFS=,; echo "${TQ4P_DECODE[*]+"${TQ4P_DECODE[*]}"}")
+F16_D_STR=$(IFS=,; echo "${F16_DECODE[*]+"${F16_DECODE[*]}"}")
+
 python3 -c "
-import sys
+from statistics import median
 
-tq4p = [$(IFS=,; echo "${TQ4P_TIMES[*]}")]
-f16  = [$(IFS=,; echo "${F16_TIMES[*]}")]
+tq4p_p = [$(IFS=,; echo "${TQ4P_PREFILL[*]}")]
+f16_p  = [$(IFS=,; echo "${F16_PREFILL[*]}")]
+tq4p_d = [${TQ4P_D_STR:-}] if '${TQ4P_D_STR:-}' else []
+f16_d  = [${F16_D_STR:-}] if '${F16_D_STR:-}' else []
 
-tq4p_avg = sum(tq4p) / len(tq4p)
-f16_avg  = sum(f16) / len(f16)
+tq4p_p_med = median(tq4p_p)
+f16_p_med  = median(f16_p)
+tq4p_p_ms  = tq4p_p_med / 1e6
+f16_p_ms   = f16_p_med / 1e6
+p_overhead = (tq4p_p_med - f16_p_med) / f16_p_med * 100 if f16_p_med > 0 else float('inf')
 
-tq4p_ms = tq4p_avg / 1e6
-f16_ms  = f16_avg / 1e6
-
-if f16_avg > 0:
-    speedup = f16_avg / tq4p_avg
-    overhead = (tq4p_avg - f16_avg) / f16_avg * 100
-else:
-    speedup = float('inf')
-    overhead = float('inf')
+have_decode = len(tq4p_d) > 0 and len(f16_d) > 0
 
 print()
-print('┌─────────────────────────────────────────────────────┐')
-print('│           PREFILL BENCHMARK RESULTS                 │')
-print('├─────────────────────────────────────────────────────┤')
-print(f'│  f16 (baseline):   {f16_ms:8.1f} ms  ({len(f16)} runs)          │')
-print(f'│  tq4p_d128:        {tq4p_ms:8.1f} ms  ({len(tq4p)} runs)          │')
-print('├─────────────────────────────────────────────────────┤')
-if speedup >= 1:
-    print(f'│  Speedup:          {speedup:8.2f}x                       │')
+print('┌───────────────────────────────────────────────────────┐')
+print('│             TQ4P BENCHMARK RESULTS                    │')
+print('├───────────────────────────────────────────────────────┤')
+print('│  PREFILL (~2K tokens)                                 │')
+print(f'│    f16 (baseline):  {f16_p_ms:7.1f} ms  ({len(f16_p)} runs)           │')
+print(f'│    tq4p_d128:       {tq4p_p_ms:7.1f} ms  ({len(tq4p_p)} runs)           │')
+print(f'│    overhead:        {p_overhead:+6.1f}%                            │')
+
+if have_decode:
+    tq4p_d_med = median(tq4p_d)
+    f16_d_med  = median(f16_d)
+    # Decode tok/s: we need token counts. Use $DECODE_TOKENS as approximation.
+    tq4p_d_tps = $DECODE_TOKENS / (tq4p_d_med / 1e9)
+    f16_d_tps  = $DECODE_TOKENS / (f16_d_med / 1e9)
+    d_overhead = (tq4p_d_med - f16_d_med) / f16_d_med * 100
+
+    print('├───────────────────────────────────────────────────────┤')
+    print(f'│  DECODE ({$DECODE_TOKENS} tokens)                                │')
+    print(f'│    f16 (baseline):  {f16_d_tps:7.1f} tok/s                     │')
+    print(f'│    tq4p_d128:       {tq4p_d_tps:7.1f} tok/s                     │')
+    print(f'│    overhead:        {d_overhead:+6.1f}%                            │')
+
+print('├───────────────────────────────────────────────────────┤')
+print('│  MEMORY                                               │')
+print('│    KV cache compression: 3.76x (16 bpw → 4.25 bpw)   │')
+ok = p_overhead < 5
+if have_decode:
+    # Negative decode overhead means tq4p is faster than f16 — still passes.
+    ok = ok and d_overhead < 5
+print('│                                                       │')
+if ok:
+    print('│  ✓ TQ4P within expected overhead range                │')
 else:
-    print(f'│  Overhead:         {overhead:+7.1f}%                        │')
-print('│                                                     │')
-if speedup >= 0.95:
-    print('│  ✓ TQ4P prefill within expected range               │')
-else:
-    print('│  ✗ TQ4P prefill slower than expected                 │')
-print('└─────────────────────────────────────────────────────┘')
-print()
-print('Notes:')
-print('  - TQ4P quantizes KV cache to 4.25 bpw (vs 16 for f16)')
-print('  - Prefill overhead from on-device quantize kernel is')
-print('    expected to be <5% — amortized over N cached keys')
-print('  - Memory savings: ~3.8x KV cache reduction')
+    print('│  ✗ TQ4P overhead exceeds target (<5%)                 │')
+print('└───────────────────────────────────────────────────────┘')
 "
