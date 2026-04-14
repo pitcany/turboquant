@@ -712,4 +712,217 @@ echo "    To wire into your quantize path, add after gguf_set_val_*:"
 echo '    gguf_set_val_str(ctx, "tq4p.default_rotation",'
 echo '                     (resolved_rot == TQP_ROT_HAAR) ? "haar" : "wht");'
 
+# ---------- 10. TQ4P prefill staging bypass (CPY + fattn) -----------------
+# DISABLED: staging bypass eliminates the dequantize step but the bottleneck
+# is the quantize step (fp32→TQ4P: rotations + Lloyd-Max + QJL). Measured
+# overhead stays at ~14.5% with or without staging. The staging infrastructure
+# (tqp-staging.cu/cuh) is kept for the deferred-quantize approach: skip
+# quantize during prefill entirely, write fp16-only to staging, then bulk-
+# quantize staging→TQ4P between prefill and decode.
+#
+# To re-enable: change TQP_STAGING_ENABLED=0 to =1 below.
+TQP_STAGING_ENABLED=0
+
+FATTN_COMMON="$GGML/src/ggml-cuda/fattn-common.cuh"
+
+if [[ "$TQP_STAGING_ENABLED" -eq 1 && -f "$CUDA_CU" && -f "$FATTN_COMMON" ]]; then
+    if grep -q "tqp_staging" "$CUDA_CU" 2>/dev/null; then
+        echo "[=] ggml-cuda.cu TQ4P staging already patched"
+    else
+        echo "[+] patching ggml-cuda.cu TQ4P CPY staging (Hook 10)"
+        python3 - "$CUDA_CU" <<'PY'
+import pathlib, sys, re
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add include before existing tqp extern declarations
+extern_anchor = 'extern "C" void ggml_cuda_tqp_quantize_row_d128'
+if extern_anchor not in t:
+    print('ERROR: ggml-cuda.cu tqp quantize extern anchor not found', file=sys.stderr)
+    sys.exit(1)
+t = t.replace(
+    extern_anchor,
+    '#include "tqp-staging.cuh"  // Hook 10: prefill staging bypass\n\n'
+    + extern_anchor,
+    1
+)
+
+# Add staging code after the TQ4P quantize in CPY.
+# Match the quantize block by regex to handle any whitespace (tabs/spaces).
+pat = re.compile(
+    r'([ \t]*if \(cpy_dst->type == GGML_TYPE_TQ4P_D128\) \{\n'
+    r'[ \t]*ggml_cuda_tqp_quantize_row_d128\(src_d, dst_d, ne, layer_byte, stream\);\n'
+    r'[ \t]*\} else \{\n'
+    r'[ \t]*ggml_cuda_tqp_quantize_row_d256\(src_d, dst_d, ne, layer_byte, stream\);\n'
+    r'([ \t]*)\})\n'
+    r'([ \t]*\} else \{)'
+)
+m = pat.search(t)
+if not m:
+    print('ERROR: ggml-cuda.cu CPY TQ4P tail anchor not found', file=sys.stderr)
+    sys.exit(1)
+indent = m.group(2)  # indentation of the closing brace
+staging_code = (
+    f'{m.group(1)}\n'
+    f'{indent}// TQ4P staging: stage fp16 for flash attention bypass (Hook 10)\n'
+    f'{indent}{{\n'
+    f'{indent}\tsize_t stg_bytes = 0;\n'
+    f'{indent}\thalf * stg = (half *)ctx.pool().alloc(ne * sizeof(half), &stg_bytes);\n'
+    f'{indent}\ttqp_staging_f32_to_f16(src_d, stg, ne, stream);\n'
+    f'{indent}\ttqp_staging_put(ggml_cuda_get_device(), dst_d, stg, stg_bytes, ne);\n'
+    f'{indent}}}\n'
+    f'{m.group(3)}'
+)
+t = t[:m.start()] + staging_code + t[m.end():]
+
+p.write_text(t)
+print(f'[+] patched: {p}')
+PY
+    fi
+
+    if grep -q "tqp_staging" "$FATTN_COMMON" 2>/dev/null; then
+        echo "[=] fattn-common.cuh TQ4P staging bypass already patched"
+    else
+        echo "[+] patching fattn-common.cuh TQ4P staging bypass (Hook 10)"
+        python3 - "$FATTN_COMMON" <<'PY'
+import pathlib, sys, re
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add include near the top (after common.cuh include)
+inc_pat = re.compile(r'(#include "common\.cuh"[^\n]*\n)')
+m = inc_pat.search(t)
+if not m:
+    print('ERROR: fattn-common.cuh common.cuh include not found', file=sys.stderr)
+    sys.exit(1)
+t = t[:m.end()] + '#include "tqp-staging.cuh"  // Hook 10: prefill staging bypass\n' + t[m.end():]
+
+# K staging bypass: insert before the K dequantize block
+k_pat = re.compile(r'([ \t]*)(if \(need_f16_K && K->type != GGML_TYPE_F16\) \{)')
+m = k_pat.search(t)
+if not m:
+    print('ERROR: fattn-common.cuh K dequantize anchor not found', file=sys.stderr)
+    sys.exit(1)
+ind = m.group(1)  # leading whitespace
+staging_k = (
+    f'{ind}// TQ4P staging bypass — use pre-staged fp16 if available (Hook 10)\n'
+    f'{ind}{{\n'
+    f'{ind}    size_t K_stg_bytes = 0;\n'
+    f'{ind}    half * K_stg = tqp_staging_take(id, K->data, 0, &K_stg_bytes);\n'
+    f'{ind}    if (K_stg) {{\n'
+    f'{ind}        K_f16.ptr = K_stg;\n'
+    f'{ind}        K_f16.actual_size = K_stg_bytes;\n'
+    f'{ind}        K_data = (const char *)K_stg;\n'
+    f'{ind}        nb11 = K->ne[0] * sizeof(half);\n'
+    f'{ind}        nb12 = K->ne[1] * nb11;\n'
+    f'{ind}        nb13 = K->ne[2] * nb12;\n'
+    f'{ind}    }}\n'
+    f'{ind}}}\n'
+    f'\n'
+    f'{ind}if (!K_f16.ptr && need_f16_K && K->type != GGML_TYPE_F16) {{'
+)
+t = t[:m.start()] + staging_k + t[m.end():]
+
+# V staging bypass: insert before the V dequantize block
+v_pat = re.compile(r'([ \t]*)(if \(V && need_f16_V && V->type != GGML_TYPE_F16\) \{)')
+m = v_pat.search(t)
+if not m:
+    print('ERROR: fattn-common.cuh V dequantize anchor not found', file=sys.stderr)
+    sys.exit(1)
+ind = m.group(1)
+staging_v = (
+    f'{ind}// TQ4P staging bypass for V (Hook 10)\n'
+    f'{ind}if (V) {{\n'
+    f'{ind}    size_t V_stg_bytes = 0;\n'
+    f'{ind}    half * V_stg = tqp_staging_take(id, V->data, 0, &V_stg_bytes);\n'
+    f'{ind}    if (V_stg) {{\n'
+    f'{ind}        V_f16.ptr = V_stg;\n'
+    f'{ind}        V_f16.actual_size = V_stg_bytes;\n'
+    f'{ind}        V_data = (const char *)V_stg;\n'
+    f'{ind}        nb21 = V->ne[0] * sizeof(half);\n'
+    f'{ind}        nb22 = V->ne[1] * nb21;\n'
+    f'{ind}        nb23 = V->ne[2] * nb22;\n'
+    f'{ind}    }}\n'
+    f'{ind}}}\n'
+    f'\n'
+    f'{ind}if (V && !V_f16.ptr && need_f16_V && V->type != GGML_TYPE_F16) {{'
+)
+t = t[:m.start()] + staging_v + t[m.end():]
+
+p.write_text(t)
+print(f'[+] patched: {p}')
+PY
+    fi
+fi
+
+SET_ROWS_CU="$GGML/src/ggml-cuda/set-rows.cu"
+if [[ "$TQP_STAGING_ENABLED" -eq 1 && -f "$SET_ROWS_CU" ]]; then
+    if grep -q "tqp_staging" "$SET_ROWS_CU" 2>/dev/null; then
+        echo "[=] set-rows.cu TQ4P staging already patched"
+    else
+        echo "[+] patching set-rows.cu TQ4P SET_ROWS staging (Hook 10b)"
+        python3 - "$SET_ROWS_CU" <<'PY'
+import pathlib, sys, re
+
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+# Add include after existing tqp extern declarations
+anchor = 'extern "C" void ggml_cuda_set_rows_tq4p_d128'
+if anchor not in t:
+    print('ERROR: set-rows.cu tqp extern anchor not found', file=sys.stderr)
+    sys.exit(1)
+t = t.replace(anchor, '#include "tqp-staging.cuh"\n\n' + anchor, 1)
+
+# Find the TQ4P SET_ROWS block and add staging after the quantize calls.
+# The block ends with "return;" — insert staging before that.
+pat = re.compile(
+    r'([ \t]*if \(dst->type == GGML_TYPE_TQ4P_D128\) \{\n'
+    r'[ \t]*ggml_cuda_set_rows_tq4p_d128\([^)]+\);\n'
+    r'[ \t]*\} else \{\n'
+    r'[ \t]*ggml_cuda_set_rows_tq4p_d256\([^)]+\);\n'
+    r'([ \t]*)\})\n'
+    r'([ \t]*return;)'
+)
+m = pat.search(t)
+if not m:
+    print('ERROR: set-rows.cu TQ4P dispatch block not found', file=sys.stderr)
+    sys.exit(1)
+
+ind = m.group(2)  # indentation
+d_var = 'QK_TQ4P_D128'  # head_dim for staging scatter
+
+staging_code = (
+    f'{m.group(1)}\n'
+    f'{ind}// TQ4P staging: scatter fp32→fp16 for flash attention bypass (Hook 10b)\n'
+    f'{ind}{{\n'
+    f'{ind}\tconst int dev = ggml_cuda_get_device();\n'
+    f'{ind}\tconst int64_t ne0 = src0->ne[0];\n'
+    f'{ind}\thalf * stg = tqp_staging_find(dev, dst->data);\n'
+    f'{ind}\tif (!stg) {{\n'
+    f'{ind}\t\tconst int64_t staging_ne = ggml_nelements(dst);\n'
+    f'{ind}\t\tsize_t stg_bytes = 0;\n'
+    f'{ind}\t\tstg = (half *)ctx.pool().alloc(staging_ne * sizeof(half), &stg_bytes);\n'
+    f'{ind}\t\ttqp_staging_put(dev, dst->data, stg, stg_bytes, 0);\n'
+    f'{ind}\t\tcudaMemsetAsync(stg, 0, stg_bytes, stream);\n'
+    f'{ind}\t}}\n'
+    f'{ind}\tif (idx_i64) {{\n'
+    f'{ind}\t\ttqp_staging_f32_to_f16_scatter_i64(src0_d, (const int64_t *)src1->data, stg, n_rows, src0_stride, (int)ne0, stream);\n'
+    f'{ind}\t}} else {{\n'
+    f'{ind}\t\ttqp_staging_f32_to_f16_scatter_i32(src0_d, (const int32_t *)src1->data, stg, n_rows, src0_stride, (int)ne0, stream);\n'
+    f'{ind}\t}}\n'
+    f'{ind}\ttqp_staging_add_elements(dev, dst->data, n_rows * ne0);\n'
+    f'{ind}}}\n'
+    f'{m.group(3)}'
+)
+t = t[:m.start()] + staging_code + t[m.end():]
+
+p.write_text(t)
+print(f'[+] patched: {p}')
+PY
+    fi
+fi
+
 echo "All hooks applied."

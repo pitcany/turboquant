@@ -122,8 +122,9 @@ if [[ "$CUDA" = "1" ]]; then
     if [[ -d "$GGML_CUDA" ]]; then
         echo "[+] copying TQ4P CUDA kernels into $GGML_CUDA/"
         for f in tqp-quantize.cu tqp-prepare-query.cu tqp-vec-dot.cu \
-                 tqp-dequantize.cu \
-                 tqp-set-rows.cu tqp-kernels.cuh tqp-constants-cuda.cuh; do
+                 tqp-dequantize.cu tqp-staging.cu \
+                 tqp-set-rows.cu tqp-kernels.cuh tqp-constants-cuda.cuh \
+                 tqp-staging.cuh; do
             cp "$STAGE2_DIR/cuda/$f" "$GGML_CUDA/"
         done
         for f in tqp_constants_d128.h tqp_constants_d256.h \
