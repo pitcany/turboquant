@@ -2,11 +2,16 @@
 # Patch ollama's Go layer so tq4p_d128 / tq4p_d256 cache-type strings map
 # end-to-end to the correct GGML enum values instead of falling back to f16.
 #
-# Four sites need cases:
+# Six sites need cases / hooks:
 #   1. ml/backend.go              — DType constants (iota enum)
 #   2. ml/backend/ggml/ggml.go    — DType() C→Go and ggmlDType() Go→C
 #   3. runner/ollamarunner/cache.go — kvCacheTypeFromStr  string→ml.DType
 #   4. llama/llama.go              — kvCacheTypeFromStr  string→C.enum_ggml_type
+#   5. fs/ggml/ggml.go             — kvCacheBytesPerElement() bytes/element
+#                                    estimator (searched dynamically)
+#   6. runner/ollamarunner/*.go + fs/ggml/ggml.go
+#                                  — diagnostic slog.Info hooks (searched
+#                                    dynamically)
 #
 # Anchors are value-based (grep for known surrounding patterns), not
 # line-number based, so small upstream drift doesn't break this.
@@ -21,6 +26,9 @@ OLLAMA_DIR="${1:?usage: apply_go_plumbing.sh <ollama-source-dir>}"
 MARKER='DTypeTQ4P_D128'          # Go-visible marker in backend.go
 MARKER_LLAMA='GGML_TYPE_TQ4P'    # C-visible marker in llama.go
 MARKER_STR='tq4p_d128'           # string literal marker in both cache switches
+MARKER_BPE='69.0 / 128.0'        # kvCacheBytesPerElement() patch marker
+MARKER_LOG_CONFIG='TQ4P: KV cache type configured'
+MARKER_LOG_ESTIMATE='TQ4P: KV cache memory estimate'
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -40,6 +48,46 @@ patch_file() {
         return 0
     fi
     python3 "$@"
+}
+
+find_go_file_with_literal() {
+    # find_go_file_with_literal <root> <literal>
+    local root="$1" literal="$2"
+    python3 - "$root" "$literal" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+literal = sys.argv[2]
+matches = []
+
+if not root.exists():
+    print(f"ERROR: search root does not exist: {root}", file=sys.stderr)
+    sys.exit(1)
+
+for path in root.rglob("*.go"):
+    try:
+        text = path.read_text()
+    except UnicodeDecodeError:
+        continue
+    if literal in text:
+        matches.append(path)
+
+if not matches:
+    print(f"ERROR: no Go file under {root} contains literal: {literal!r}", file=sys.stderr)
+    sys.exit(1)
+
+if len(matches) > 1:
+    print(
+        f"ERROR: multiple Go files under {root} contain literal {literal!r}:",
+        file=sys.stderr,
+    )
+    for match in matches:
+        print(f"  - {match}", file=sys.stderr)
+    sys.exit(1)
+
+print(matches[0])
+PY
 }
 
 # ---------- 1. ml/backend.go — DType constants -------------------------------
@@ -285,6 +333,172 @@ path.write_text(text)
 print(f"[+] patched rotation init: {path}")
 PY
 
+# ---------- 7. fs/ggml/ggml.go — kvCacheBytesPerElement ----------------------
+
+BPE_GO="$(find_go_file_with_literal "$OLLAMA_DIR" 'func kvCacheBytesPerElement')"
+info "patching kvCacheBytesPerElement in $BPE_GO"
+patch_file "$BPE_GO" "$MARKER_BPE" - "$BPE_GO" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+func_match = re.search(
+    r'func kvCacheBytesPerElement\s*\([^)]*\)\s*float64\s*\{(?P<body>.*?)^\}',
+    text,
+    re.MULTILINE | re.DOTALL,
+)
+if not func_match:
+    print(f"ERROR: kvCacheBytesPerElement() not found in {path}", file=sys.stderr)
+    sys.exit(1)
+
+body = func_match.group("body")
+if 'case "tq4p_d128":' in body:
+    print(f"[=] kvCacheBytesPerElement already handles TQ4P: {path}")
+    sys.exit(0)
+
+default_match = re.search(r'^(?P<indent>\s*)default:\n', body, re.MULTILINE)
+if not default_match:
+    print(f"ERROR: default: case not found in kvCacheBytesPerElement() in {path}", file=sys.stderr)
+    sys.exit(1)
+
+indent = default_match.group("indent")
+case_indent = indent
+return_indent = indent + "\t"
+insert = (
+    f'{case_indent}case "tq4p_d128":\n'
+    f'{return_indent}return 69.0 / 128.0\n'
+    f'{case_indent}case "tq4p_d256":\n'
+    f'{return_indent}return 133.0 / 256.0\n'
+)
+
+body = body[:default_match.start()] + insert + body[default_match.start():]
+text = text[:func_match.start("body")] + body + text[func_match.end("body"):]
+path.write_text(text)
+print(f"[+] patched kvCacheBytesPerElement: {path}")
+PY
+
+# ---------- 8a. runner/ollamarunner/*.go — KV cache type logging ------------
+
+CONFIG_LOG_GO="$(find_go_file_with_literal "$OLLAMA_DIR/runner/ollamarunner" 'kvCacheTypeFromStr(')"
+info "patching KV cache type logging in $CONFIG_LOG_GO"
+python3 - "$CONFIG_LOG_GO" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+anchor = re.search(
+    r'^(?P<indent>\s*)cache := model\.Config\(\)\.Cache\s*$',
+    text,
+    re.MULTILINE,
+)
+if not anchor:
+    print(f"ERROR: could not find 'cache := model.Config().Cache' in {path}", file=sys.stderr)
+    sys.exit(1)
+
+log_line = (
+    f'{anchor.group("indent")}slog.Info('
+    f'"TQ4P: KV cache type configured", "type", kvCacheType)\n'
+)
+desired_start = anchor.end() + 1
+
+log_line_pattern = re.compile(
+    r'^\s*slog\.Info\("TQ4P: KV cache type configured", "type", kvCacheType\)\n',
+    re.MULTILINE,
+)
+matches = list(log_line_pattern.finditer(text))
+
+if matches:
+    first = matches[0]
+    if first.start() == desired_start and len(matches) == 1:
+        print(f"[=] KV cache type logging already present: {path}")
+        sys.exit(0)
+
+    text = log_line_pattern.sub("", text)
+    anchor = re.search(
+        r'^(?P<indent>\s*)cache := model\.Config\(\)\.Cache\s*$',
+        text,
+        re.MULTILINE,
+    )
+    desired_start = anchor.end() + 1
+
+text = text[:desired_start] + log_line + text[desired_start:]
+
+if '"log/slog"' not in text:
+    group_import = re.search(r'import\s*\(\n(?P<body>.*?)\n\)', text, re.DOTALL)
+    if group_import:
+        body = group_import.group("body")
+        if '\t"log/slog"' not in body:
+            body += '\n\t"log/slog"'
+            text = text[:group_import.start("body")] + body + text[group_import.end("body"):]
+    else:
+        single_imports = list(re.finditer(r'^import\s+"[^"]+"\n', text, re.MULTILINE))
+        if not single_imports:
+            print(f"ERROR: could not add slog import to {path}", file=sys.stderr)
+            sys.exit(1)
+        last = single_imports[-1]
+        text = text[:last.end()] + 'import "log/slog"\n' + text[last.end():]
+
+path.write_text(text)
+print(f"[+] patched KV cache type logging: {path}")
+PY
+
+# ---------- 8b. fs/ggml/ggml.go — KV memory estimate logging ----------------
+
+info "patching KV memory estimate logging in $BPE_GO"
+patch_file "$BPE_GO" "$MARKER_LOG_ESTIMATE" - "$BPE_GO" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+if 'TQ4P: KV cache memory estimate' in text:
+    print(f"[=] KV memory estimate logging already present: {path}")
+    sys.exit(0)
+
+assignment = re.search(
+    r'^(?P<indent>\s*)(?P<bpe>[A-Za-z_]\w*)\s*(?::=|=)\s*kvCacheBytesPerElement\((?P<kv>[A-Za-z_]\w*)\)$',
+    text,
+    re.MULTILINE,
+)
+if not assignment:
+    print(f"ERROR: could not find kvCacheBytesPerElement() call site in {path}", file=sys.stderr)
+    sys.exit(1)
+
+log_line = (
+    f'{assignment.group("indent")}slog.Info('
+    f'"TQ4P: KV cache memory estimate", "bytes_per_element", {assignment.group("bpe")}, '
+    f'"type", {assignment.group("kv")})\n'
+)
+insert_at = assignment.end() + 1
+text = text[:insert_at] + log_line + text[insert_at:]
+
+if '"log/slog"' not in text:
+    group_import = re.search(r'import\s*\(\n(?P<body>.*?)\n\)', text, re.DOTALL)
+    if group_import:
+        body = group_import.group("body")
+        if '\t"log/slog"' not in body:
+            body += '\n\t"log/slog"'
+            text = text[:group_import.start("body")] + body + text[group_import.end("body"):]
+    else:
+        single_imports = list(re.finditer(r'^import\s+"[^"]+"\n', text, re.MULTILINE))
+        if not single_imports:
+            print(f"ERROR: could not add slog import to {path}", file=sys.stderr)
+            sys.exit(1)
+        last = single_imports[-1]
+        text = text[:last.end()] + 'import "log/slog"\n' + text[last.end():]
+
+path.write_text(text)
+print(f"[+] patched KV memory estimate logging: {path}")
+PY
+
 # ---------- summary ----------------------------------------------------------
 
 echo
@@ -292,6 +506,14 @@ echo "Go plumbing complete. The following cache-type strings now resolve"
 echo "to their correct GGML types instead of falling back to f16:"
 echo "  tq4p_d128 → GGML_TYPE_TQ4P_D128 (enum 40)"
 echo "  tq4p_d256 → GGML_TYPE_TQ4P_D256 (enum 41)"
+echo
+echo "kvCacheBytesPerElement() now reports the correct TQ4P byte rates:"
+echo "  tq4p_d128 → 69/128 bytes per element"
+echo "  tq4p_d256 → 133/256 bytes per element"
+echo
+echo "Debug logging now emits:"
+echo "  TQ4P: KV cache type configured"
+echo "  TQ4P: KV cache memory estimate"
 echo
 echo "OLLAMA_TQP_ROTATION={wht,haar} is read at startup and forwarded"
 echo "to tqp_set_default_rotation() for process-wide rotation default."
