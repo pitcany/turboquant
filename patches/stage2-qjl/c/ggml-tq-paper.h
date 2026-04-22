@@ -96,6 +96,11 @@ typedef uint16_t ggml_fp16_t;
     void ggml_quantize_row_tqp_d##D##_b##BITS##_f16(const ggml_fp16_t * x,                       \
                                                     block_tqp_d##D##_b##BITS * y,                \
                                                     int64_t k, uint8_t layer_byte);              \
+    /* _default wrapper: 3-arg from_float callback for ggml dispatch.               \
+     * Always passes layer_byte=0x00, so layer-0 rotation constants are used.      \
+     * For correct per-layer rotation, use the 4-arg form directly or set the      \
+     * thread-local rotation via tqp_set_thread_rotation() before ggml fires       \
+     * this callback.                                                              */\
     static inline void ggml_quantize_row_tqp_d##D##_b##BITS##_default(const float * x,           \
                                                                        void * y, int64_t k) {    \
         ggml_quantize_row_tqp_d##D##_b##BITS(x, (block_tqp_d##D##_b##BITS *)y, k, 0x00);        \

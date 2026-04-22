@@ -218,19 +218,18 @@ import sys, pathlib, re
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 
-# Anchor: the Copy method body.
-old_copy = (
-    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
-    '\treturn &Tensor{\n'
-    '\t\tb: t.b,\n'
-    '\t\tt: C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),\n'
-    '\t}\n'
-    '}'
+# Regex-based replacement: match the entire Copy() method body regardless of
+# its current state (pristine, tq4p-only, or explicit-bits). This avoids
+# accumulating whole-function fallback chains for each patch generation.
+copy_re = re.compile(
+    r'(func \(t \*Tensor\) Copy\(ctx ml\.Context, t2 ml\.Tensor\) ml\.Tensor \{)'
+    r'.*?'
+    r'(\n\})',
+    re.DOTALL,
 )
-# Replace with version that sets op_params[0] = layer_byte for legacy
-# aliases plus the explicit B2/B4 cache types.
-new_copy = (
-    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
+
+new_body = (
+    r'\1' '\n'
     '\tresult := C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t)\n'
     '\t// tqp_layer_byte_explicit_bits: pass layer index to CUDA quantize dispatch.\n'
     '\tc := ctx.(*Context)\n'
@@ -246,28 +245,11 @@ new_copy = (
     '}'
 )
 
-if old_copy in text:
-    text = text.replace(old_copy, new_copy, 1)
-else:
-    old_patched = (
-        'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
-        '\tresult := C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t)\n'
-        '\t// tq4p_layer_byte: pass layer index to CUDA quantize dispatch.\n'
-        '\tc := ctx.(*Context)\n'
-        '\tif c.layer >= 0 {\n'
-        '\t\tdstType := t2.(*Tensor).t._type\n'
-        '\t\tif dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 {\n'
-        '\t\t\tresult.op_params[0] = C.int32_t(c.layer & 0x1f)\n'
-        '\t\t}\n'
-        '\t}\n'
-        '\treturn &Tensor{b: t.b, t: result}\n'
-        '}'
-    )
-    if old_patched in text:
-        text = text.replace(old_patched, new_copy, 1)
-    else:
-        print(f"ERROR: Copy() method not found in {path}", file=sys.stderr)
-        sys.exit(1)
+new_text, count = copy_re.subn(new_body, text, count=1)
+if count == 0:
+    print(f"ERROR: Copy() method not found in {path}", file=sys.stderr)
+    sys.exit(1)
+text = new_text
 path.write_text(text)
 print(f"[+] patched Copy() for TQ4P layer_byte: {path}")
 PY

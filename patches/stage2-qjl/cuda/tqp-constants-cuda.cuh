@@ -377,7 +377,8 @@ static inline cudaError_t tqp_cuda_init_bits_d256(TqpDeviceState & state, int bi
     return cudaSuccess;
 }
 
-static inline cudaError_t tqp_cuda_init(int head_dim, int bits = 3) {
+// No default for `bits` — all call sites must pass an explicit bit width.
+static inline cudaError_t tqp_cuda_init(int head_dim, int bits) {
     int device_id = 0;
     cudaError_t err = tqp_cuda_current_device(&device_id);
     if (err != cudaSuccess) {
