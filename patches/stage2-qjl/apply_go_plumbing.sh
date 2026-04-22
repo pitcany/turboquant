@@ -384,7 +384,7 @@ PY
 
 CONFIG_LOG_GO="$(find_go_file_with_literal "$OLLAMA_DIR/runner/ollamarunner" 'kvCacheTypeFromStr(')"
 info "patching KV cache type logging in $CONFIG_LOG_GO"
-python3 - "$CONFIG_LOG_GO" <<'PY'
+patch_file "$CONFIG_LOG_GO" "$MARKER_LOG_CONFIG" - "$CONFIG_LOG_GO" <<'PY'
 import pathlib
 import re
 import sys
