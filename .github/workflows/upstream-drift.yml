@@ -1,0 +1,87 @@
+name: Upstream Drift Check
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday at 06:00 UTC
+  workflow_dispatch:       # allow manual trigger
+
+jobs:
+  drift-check:
+    name: Test hooks against Ollama HEAD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read pinned ref
+        id: refs
+        run: |
+          PINNED=$(grep 'OLLAMA_REF:-' scripts/build_ollama_tq.sh \
+            | grep -oP ':-\K[^}"]+' | head -1)
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+
+      - name: Clone Ollama at HEAD
+        run: |
+          git clone --filter=blob:none https://github.com/ollama/ollama /tmp/ollama-head
+
+      - name: Report upstream distance
+        env:
+          PINNED: ${{ steps.refs.outputs.pinned }}
+        run: |
+          AHEAD=$(git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" 2>/dev/null | wc -l)
+          echo "Ollama HEAD is **$AHEAD** commits ahead of pinned ref $PINNED"
+          echo "### Recent upstream commits" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" 2>/dev/null \
+            | head -20 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check ggml tree structure
+        run: |
+          GGML=/tmp/ollama-head/ml/backend/ggml/ggml
+          for f in include/ggml.h src/ggml.c src/ggml-cpu/ggml-cpu.c src/CMakeLists.txt; do
+            if [ ! -f "$GGML/$f" ]; then
+              echo "::error::Expected file missing: $GGML/$f"
+              exit 1
+            fi
+          done
+          echo "ggml tree structure intact"
+
+      - name: Copy TQ4P sources
+        run: |
+          GGML=/tmp/ollama-head/ml/backend/ggml/ggml
+          for f in ggml-tq-paper.h ggml-tq-paper.c \
+                   tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+                   tqp_centroids_d64_b2.h tqp_centroids_d64_b3.h tqp_centroids_d64_b4.h \
+                   tqp_centroids_d128_b2.h tqp_centroids_d128_b3.h tqp_centroids_d128_b4.h \
+                   tqp_centroids_d256_b2.h tqp_centroids_d256_b3.h tqp_centroids_d256_b4.h \
+                   tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
+            cp "patches/stage2-qjl/c/$f" "$GGML/src/"
+          done
+          for f in patches/stage2-qjl/cuda/tqp-*.cu patches/stage2-qjl/cuda/tqp-*.cuh; do
+            cp "$f" "$GGML/src/ggml-cuda/"
+          done
+          for f in ggml-tq-paper.h \
+                   tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+                   tqp_centroids_d64_b2.h tqp_centroids_d64_b3.h tqp_centroids_d64_b4.h \
+                   tqp_centroids_d128_b2.h tqp_centroids_d128_b3.h tqp_centroids_d128_b4.h \
+                   tqp_centroids_d256_b2.h tqp_centroids_d256_b3.h tqp_centroids_d256_b4.h \
+                   tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
+            cp "patches/stage2-qjl/c/$f" "$GGML/src/ggml-cuda/"
+          done
+
+      - name: Apply ggml hooks
+        run: |
+          GGML=/tmp/ollama-head/ml/backend/ggml/ggml
+          bash patches/stage2-qjl/apply_hooks.sh "$GGML"
+
+      - name: Apply Go plumbing
+        run: |
+          bash patches/stage2-qjl/apply_go_plumbing.sh /tmp/ollama-head
+
+      - name: Summary
+        if: success()
+        run: echo "All hooks apply cleanly to Ollama HEAD" >> "$GITHUB_STEP_SUMMARY"
