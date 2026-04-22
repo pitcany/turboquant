@@ -21,21 +21,28 @@ jobs:
         run: |
           PINNED=$(grep 'OLLAMA_REF:-' scripts/build_ollama_tq.sh \
             | grep -oP ':-\K[^}"]+' | head -1)
+          if [[ -z "$PINNED" ]]; then
+            echo "::error::Could not extract OLLAMA_REF default from build script; set a pinned ref."
+            exit 1
+          fi
           echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
 
       - name: Clone Ollama at HEAD
         run: |
-          git clone --filter=blob:none https://github.com/ollama/ollama /tmp/ollama-head
+          git clone --filter=blob:none --shallow-since=2024-01-01 \
+            https://github.com/ollama/ollama /tmp/ollama-head
 
       - name: Report upstream distance
         env:
           PINNED: ${{ steps.refs.outputs.pinned }}
         run: |
-          AHEAD=$(git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" 2>/dev/null | wc -l)
+          git -C /tmp/ollama-head cat-file -e "${PINNED}^{commit}" \
+            || { echo "::error::Pinned ref $PINNED not found in Ollama repo"; exit 1; }
+          AHEAD=$(git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" | wc -l)
           echo "Ollama HEAD is **$AHEAD** commits ahead of pinned ref $PINNED" >> "$GITHUB_STEP_SUMMARY"
           echo "### Recent upstream commits" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" 2>/dev/null \
+          git -C /tmp/ollama-head log --oneline "${PINNED}..HEAD" \
             | head -20 >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
@@ -81,6 +88,15 @@ jobs:
         run: |
           bash patches/stage2-qjl/apply_go_plumbing.sh /tmp/ollama-head
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: /tmp/ollama-head/go.mod
+
+      - name: Verify Go plumbing compiles
+        run: |
+          cd /tmp/ollama-head
+          go build ./ml/... ./runner/... ./fs/...
+
       - name: Summary
         if: success()
-        run: echo "All hooks apply cleanly to Ollama HEAD" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "All hooks apply cleanly and Go plumbing compiles against Ollama HEAD" >> "$GITHUB_STEP_SUMMARY"
