@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
         --small-ctx=*) SMALL_CTX="${1#*=}"; shift ;;
         --large-ctx)   LARGE_CTX="${2:?--large-ctx requires a value}"; shift 2 ;;
         --large-ctx=*) LARGE_CTX="${1#*=}"; shift ;;
-        -h|--help)     sed -n '2,18p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,13p' "$0"; exit 0 ;;
         *)             echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
