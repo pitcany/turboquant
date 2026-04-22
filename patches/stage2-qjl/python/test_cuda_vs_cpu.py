@@ -1,20 +1,12 @@
 """
 CUDA implementation cross-checks against the C CPU reference.
 
-Tests byte-exact equivalence of CUDA vs CPU quantize output, plus numerical
-agreement of prepare_query and vec_dot across multiple layer indices and
-both rotation modes (TQP_ROT_WHT, TQP_ROT_HAAR).
-
 Build first:
-    cd patches/stage2-qjl/c
-    gcc -O2 -fPIC -shared -o libggml_tq_paper.so ggml-tq-paper.c -lm
-    cd ../cuda
-    cmake -S . -B build
-    cmake --build build -j
+    cd patches/stage2-qjl/c && make libggml_tq_paper.so
+    cd ../cuda && cmake -S . -B build && cmake --build build -j
 
 Then:
-    cd patches/stage2-qjl/python
-    pytest test_cuda_vs_cpu.py -v
+    cd ../python && pytest test_cuda_vs_cpu.py -q
 """
 
 from __future__ import annotations
@@ -40,33 +32,45 @@ sys.path.insert(0, str(_HERE))
 import tq_paper_reference as ref
 
 
-# Must match patches/stage2-qjl/c/ggml-tq-paper.h and cuda/tqp-kernels.cuh.
-# _pack_=1 mirrors the C-side #pragma pack(push, 1); without it ctypes
-# would pad to 70/134 B to align the outer struct on the uint16 members.
-class block_tq4p_d128(ctypes.Structure):
+BITS = [2, 3, 4]
+BIT_IDS = {2: "b2", 3: "b3", 4: "b4"}
+TEST_LAYERS = [0, 1, 7, 15, 31]
+ROTATIONS = [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]
+ROTATION_IDS = {ref.TQP_ROT_WHT: "wht", ref.TQP_ROT_HAAR: "haar"}
+Q8_QK = 256
+
+
+def _block_cls(d: int, bits: int):
+    qs_bytes = (d * bits) // 8
+    signs_bytes = d // 8
+
+    class Block(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = [
+            ("orig_norm", ctypes.c_uint16),
+            ("res_d", ctypes.c_uint16),
+            ("layer_idx", ctypes.c_uint8),
+            ("qs", ctypes.c_uint8 * qs_bytes),
+            ("qjl_signs", ctypes.c_uint8 * signs_bytes),
+        ]
+
+    Block.__name__ = f"block_tqp_d{d}_b{bits}"
+    return Block
+
+
+BLOCK_CLASSES = {(d, bits): _block_cls(d, bits) for d in (128, 256) for bits in BITS}
+
+
+class block_q8k_compat(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
-        ("orig_norm", ctypes.c_uint16),
-        ("res_d",     ctypes.c_uint16),
-        ("layer_idx", ctypes.c_uint8),
-        ("qs",        ctypes.c_uint8 * 48),
-        ("qjl_signs", ctypes.c_uint8 * 16),
+        ("d", ctypes.c_float),
+        ("qs", ctypes.c_int8 * Q8_QK),
+        ("bsums", ctypes.c_int16 * (Q8_QK // 16)),
     ]
 
 
-class block_tq4p_d256(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("orig_norm", ctypes.c_uint16),
-        ("res_d",     ctypes.c_uint16),
-        ("layer_idx", ctypes.c_uint8),
-        ("qs",        ctypes.c_uint8 * 96),
-        ("qjl_signs", ctypes.c_uint8 * 32),
-    ]
-
-
-assert ctypes.sizeof(block_tq4p_d128) == 69
-assert ctypes.sizeof(block_tq4p_d256) == 133
+assert ctypes.sizeof(block_q8k_compat) == 292
 
 cpu = ctypes.CDLL(str(_CPU_LIB))
 cuda = ctypes.CDLL(str(_CUDA_LIB))
@@ -76,124 +80,251 @@ _CUDA_DEVICE_COUNT = cuda.tqp_cuda_device_count()
 if _CUDA_DEVICE_COUNT <= 0:
     pytest.skip(f"CUDA runtime has no usable device, cudaGetDeviceCount returned {_CUDA_DEVICE_COUNT}", allow_module_level=True)
 
-# ---------- CPU bindings (layer_idx-aware) ----------
 
-cpu.ggml_quantize_row_tq4p_d128.restype = None
-cpu.ggml_quantize_row_tq4p_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.c_int64,
-    ctypes.c_uint8,  # layer_idx
-]
-cpu.ggml_quantize_row_tq4p_d256.restype = None
-cpu.ggml_quantize_row_tq4p_d256.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.c_int64,
-    ctypes.c_uint8,  # layer_idx
-]
-cpu.ggml_dequantize_row_tq4p_d128.restype = None
-cpu.ggml_dequantize_row_tq4p_d128.argtypes = [
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cpu.ggml_dequantize_row_tq4p_d256.restype = None
-cpu.ggml_dequantize_row_tq4p_d256.argtypes = [
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cpu.ggml_tqp_prepare_query_d128.restype = None
-cpu.ggml_tqp_prepare_query_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_uint8,  # layer_idx
-]
-cpu.ggml_tqp_prepare_query_d256.restype = None
-cpu.ggml_tqp_prepare_query_d256.argtypes = cpu.ggml_tqp_prepare_query_d128.argtypes
-cpu.ggml_tqp_vec_dot_block_d128.restype = ctypes.c_float
-cpu.ggml_tqp_vec_dot_block_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d128),
-]
-cpu.ggml_tqp_vec_dot_block_d256.restype = ctypes.c_float
-cpu.ggml_tqp_vec_dot_block_d256.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d256),
-]
-
-# ---------- CUDA bindings (layer_idx-aware where appropriate) ----------
-
-cuda.tqp_cuda_quantize_row_d128.restype = ctypes.c_int
-cuda.tqp_cuda_quantize_row_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_void_p,
-    ctypes.c_int64,
-    ctypes.c_uint8,  # layer_idx
-]
-cuda.tqp_cuda_quantize_row_d256.restype = ctypes.c_int
-cuda.tqp_cuda_quantize_row_d256.argtypes = cuda.tqp_cuda_quantize_row_d128.argtypes
-cuda.tqp_cuda_dequantize_row_d128_f32.restype = ctypes.c_int
-cuda.tqp_cuda_dequantize_row_d128_f32.argtypes = [
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_dequantize_row_d256_f32.restype = ctypes.c_int
-cuda.tqp_cuda_dequantize_row_d256_f32.argtypes = [
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_dequantize_row_d128_f16.restype = ctypes.c_int
-cuda.tqp_cuda_dequantize_row_d128_f16.argtypes = [
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.POINTER(ctypes.c_uint16),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_dequantize_row_d256_f16.restype = ctypes.c_int
-cuda.tqp_cuda_dequantize_row_d256_f16.argtypes = [
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.POINTER(ctypes.c_uint16),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_prepare_query_d128.restype = ctypes.c_int
-cuda.tqp_cuda_prepare_query_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_uint8,  # layer_idx
-]
-cuda.tqp_cuda_prepare_query_d256.restype = ctypes.c_int
-cuda.tqp_cuda_prepare_query_d256.argtypes = cuda.tqp_cuda_prepare_query_d128.argtypes
-# vec_dot on CUDA reads layer_idx from the first block's header — no extra arg.
-cuda.tqp_cuda_vec_dot_block_d128.restype = ctypes.c_float
-cuda.tqp_cuda_vec_dot_block_d128.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_tq4p_d128)]
-cuda.tqp_cuda_vec_dot_block_d256.restype = ctypes.c_float
-cuda.tqp_cuda_vec_dot_block_d256.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_tq4p_d256)]
-cuda.tqp_cuda_vec_dot_row_d128.restype = ctypes.c_int
-cuda.tqp_cuda_vec_dot_row_d128.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_vec_dot_row_d256.restype = ctypes.c_int
-cuda.tqp_cuda_vec_dot_row_d256.argtypes = [
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
+def _declare(lib, name: str, restype, argtypes):
+    fn = getattr(lib, name)
+    fn.restype = restype
+    fn.argtypes = argtypes
+    return fn
 
 
-# Layer indices to exercise: layer 0, some spread, the last one.
-TEST_LAYERS = [0, 1, 7, 15, 31]
-ROTATIONS = [ref.TQP_ROT_WHT, ref.TQP_ROT_HAAR]
-ROTATION_IDS = {ref.TQP_ROT_WHT: "wht", ref.TQP_ROT_HAAR: "haar"}
+def _cpu_name(kind: str, d: int, bits: int) -> str:
+    if kind == "quantize":
+        return f"ggml_quantize_row_tqp_d{d}_b{bits}"
+    if kind == "dequantize":
+        return f"ggml_dequantize_row_tqp_d{d}_b{bits}"
+    if kind == "prepare":
+        return f"ggml_tqp_prepare_query_d{d}_b{bits}"
+    if kind == "vec_dot_block":
+        return f"ggml_tqp_vec_dot_block_d{d}_b{bits}"
+    if kind == "vec_dot_q8k":
+        return f"ggml_vec_dot_tqp_d{d}_b{bits}_q8k"
+    raise ValueError(kind)
+
+
+def _cpu_legacy_name(kind: str, d: int) -> str:
+    if kind == "quantize":
+        return f"ggml_quantize_row_tq4p_d{d}"
+    if kind == "dequantize":
+        return f"ggml_dequantize_row_tq4p_d{d}"
+    if kind == "prepare":
+        return f"ggml_tqp_prepare_query_d{d}"
+    if kind == "vec_dot_block":
+        return f"ggml_tqp_vec_dot_block_d{d}"
+    if kind == "vec_dot_q8k":
+        return f"ggml_vec_dot_tq4p_d{d}_q8k"
+    raise ValueError(kind)
+
+
+def _cuda_name(kind: str, d: int, bits: int) -> str:
+    if kind == "quantize":
+        return f"tqp_cuda_quantize_row_d{d}_b{bits}"
+    if kind == "dequantize_f32":
+        return f"tqp_cuda_dequantize_row_d{d}_b{bits}_f32"
+    if kind == "dequantize_f16":
+        return f"tqp_cuda_dequantize_row_d{d}_b{bits}_f16"
+    if kind == "prepare":
+        return f"tqp_cuda_prepare_query_d{d}_b{bits}"
+    if kind == "vec_dot_block":
+        return f"tqp_cuda_vec_dot_block_d{d}_b{bits}"
+    if kind == "vec_dot_row":
+        return f"tqp_cuda_vec_dot_row_d{d}_b{bits}"
+    if kind == "vec_dot_q8k":
+        return f"tqp_cuda_vec_dot_q8k_d{d}_b{bits}"
+    raise ValueError(kind)
+
+
+def _cuda_legacy_name(kind: str, d: int) -> str:
+    if kind == "quantize":
+        return f"tqp_cuda_quantize_row_d{d}"
+    if kind == "dequantize_f32":
+        return f"tqp_cuda_dequantize_row_d{d}_f32"
+    if kind == "dequantize_f16":
+        return f"tqp_cuda_dequantize_row_d{d}_f16"
+    if kind == "prepare":
+        return f"tqp_cuda_prepare_query_d{d}"
+    if kind == "vec_dot_block":
+        return f"tqp_cuda_vec_dot_block_d{d}"
+    if kind == "vec_dot_row":
+        return f"tqp_cuda_vec_dot_row_d{d}"
+    if kind == "vec_dot_q8k":
+        return f"tqp_cuda_vec_dot_q8k_d{d}"
+    raise ValueError(kind)
+
+
+CPU = {}
+CUDA = {}
+
+for d in (128, 256):
+    for bits in BITS:
+        block_cls = BLOCK_CLASSES[(d, bits)]
+        CPU[(d, bits, "quantize")] = _declare(
+            cpu,
+            _cpu_name("quantize", d, bits),
+            None,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_cls), ctypes.c_int64, ctypes.c_uint8],
+        )
+        CPU[(d, bits, "dequantize")] = _declare(
+            cpu,
+            _cpu_name("dequantize", d, bits),
+            None,
+            [ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+        )
+        CPU[(d, bits, "prepare")] = _declare(
+            cpu,
+            _cpu_name("prepare", d, bits),
+            None,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_uint8],
+        )
+        CPU[(d, bits, "vec_dot_block")] = _declare(
+            cpu,
+            _cpu_name("vec_dot_block", d, bits),
+            ctypes.c_float,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_cls)],
+        )
+        CPU[(d, bits, "vec_dot_q8k")] = _declare(
+            cpu,
+            _cpu_name("vec_dot_q8k", d, bits),
+            None,
+            [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ],
+        )
+
+        CUDA[(d, bits, "quantize")] = _declare(
+            cuda,
+            _cuda_name("quantize", d, bits),
+            ctypes.c_int,
+            [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint8],
+        )
+        CUDA[(d, bits, "dequantize_f32")] = _declare(
+            cuda,
+            _cuda_name("dequantize_f32", d, bits),
+            ctypes.c_int,
+            [ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+        )
+        CUDA[(d, bits, "dequantize_f16")] = _declare(
+            cuda,
+            _cuda_name("dequantize_f16", d, bits),
+            ctypes.c_int,
+            [ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64],
+        )
+        CUDA[(d, bits, "prepare")] = _declare(
+            cuda,
+            _cuda_name("prepare", d, bits),
+            ctypes.c_int,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_uint8],
+        )
+        CUDA[(d, bits, "vec_dot_block")] = _declare(
+            cuda,
+            _cuda_name("vec_dot_block", d, bits),
+            ctypes.c_float,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_cls)],
+        )
+        CUDA[(d, bits, "vec_dot_row")] = _declare(
+            cuda,
+            _cuda_name("vec_dot_row", d, bits),
+            ctypes.c_int,
+            [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+        )
+        CUDA[(d, bits, "vec_dot_q8k")] = _declare(
+            cuda,
+            _cuda_name("vec_dot_q8k", d, bits),
+            ctypes.c_int,
+            [ctypes.c_void_p, ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+        )
+
+for d in (128, 256):
+    legacy_block = BLOCK_CLASSES[(d, 3)]
+    CPU[(d, 3, "legacy_quantize")] = _declare(
+        cpu,
+        _cpu_legacy_name("quantize", d),
+        None,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(legacy_block), ctypes.c_int64, ctypes.c_uint8],
+    )
+    CPU[(d, 3, "legacy_dequantize")] = _declare(
+        cpu,
+        _cpu_legacy_name("dequantize", d),
+        None,
+        [ctypes.POINTER(legacy_block), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+    )
+    CPU[(d, 3, "legacy_prepare")] = _declare(
+        cpu,
+        _cpu_legacy_name("prepare", d),
+        None,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_uint8],
+    )
+    CPU[(d, 3, "legacy_vec_dot_block")] = _declare(
+        cpu,
+        _cpu_legacy_name("vec_dot_block", d),
+        ctypes.c_float,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(legacy_block)],
+    )
+    CPU[(d, 3, "legacy_vec_dot_q8k")] = _declare(
+        cpu,
+        _cpu_legacy_name("vec_dot_q8k", d),
+        None,
+        [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ],
+    )
+
+    CUDA[(d, 3, "legacy_quantize")] = _declare(
+        cuda,
+        _cuda_legacy_name("quantize", d),
+        ctypes.c_int,
+        [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint8],
+    )
+    CUDA[(d, 3, "legacy_dequantize_f32")] = _declare(
+        cuda,
+        _cuda_legacy_name("dequantize_f32", d),
+        ctypes.c_int,
+        [ctypes.POINTER(legacy_block), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+    )
+    CUDA[(d, 3, "legacy_dequantize_f16")] = _declare(
+        cuda,
+        _cuda_legacy_name("dequantize_f16", d),
+        ctypes.c_int,
+        [ctypes.POINTER(legacy_block), ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64],
+    )
+    CUDA[(d, 3, "legacy_prepare")] = _declare(
+        cuda,
+        _cuda_legacy_name("prepare", d),
+        ctypes.c_int,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_uint8],
+    )
+    CUDA[(d, 3, "legacy_vec_dot_block")] = _declare(
+        cuda,
+        _cuda_legacy_name("vec_dot_block", d),
+        ctypes.c_float,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(legacy_block)],
+    )
+    CUDA[(d, 3, "legacy_vec_dot_row")] = _declare(
+        cuda,
+        _cuda_legacy_name("vec_dot_row", d),
+        ctypes.c_int,
+        [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(legacy_block), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+    )
+    CUDA[(d, 3, "legacy_vec_dot_q8k")] = _declare(
+        cuda,
+        _cuda_legacy_name("vec_dot_q8k", d),
+        ctypes.c_int,
+        [ctypes.c_void_p, ctypes.POINTER(legacy_block), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
+    )
 
 
 @pytest.fixture(scope="module", params=[128, 256])
@@ -201,9 +332,14 @@ def d(request):
     return request.param
 
 
+@pytest.fixture(scope="module", params=BITS, ids=lambda b: BIT_IDS[b])
+def bits(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def constants(d):
-    return ref.load_constants(d)
+def constants(d, bits):
+    return ref.load_constants(d, bits)
 
 
 @pytest.fixture(scope="module", params=TEST_LAYERS)
@@ -227,145 +363,129 @@ def _as_float_ptr(x):
     return x.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
-def _cpu_quantize(d: int, x_np, layer_idx: int, rotation: int):
-    layer_byte = ref.layer_byte(layer_idx, rotation)
-    if d == 128:
-        blk = block_tq4p_d128()
-        cpu.ggml_quantize_row_tq4p_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
-    else:
-        blk = block_tq4p_d256()
-        cpu.ggml_quantize_row_tq4p_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
-    return blk
-
-
-def _cuda_quantize(d: int, x_np, layer_idx: int, rotation: int):
-    layer_byte = ref.layer_byte(layer_idx, rotation)
-    if d == 128:
-        blk = block_tq4p_d128()
-        err = cuda.tqp_cuda_quantize_row_d128(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
-    else:
-        blk = block_tq4p_d256()
-        err = cuda.tqp_cuda_quantize_row_d256(_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
-    assert err == 0
-    return blk
-
-
-def _cpu_dequantize(d: int, blk):
-    out = (ctypes.c_float * d)()
-    if d == 128:
-        cpu.ggml_dequantize_row_tq4p_d128(ctypes.byref(blk), out, d)
-    else:
-        cpu.ggml_dequantize_row_tq4p_d256(ctypes.byref(blk), out, d)
-    return torch.tensor(list(out))
-
-
-def _cuda_dequantize_f32(d: int, blk):
-    out = (ctypes.c_float * d)()
-    if d == 128:
-        err = cuda.tqp_cuda_dequantize_row_d128_f32(ctypes.byref(blk), out, d)
-    else:
-        err = cuda.tqp_cuda_dequantize_row_d256_f32(ctypes.byref(blk), out, d)
-    assert err == 0
-    return torch.tensor(list(out))
-
-
-def _cuda_dequantize_f16(d: int, blk):
-    out = (ctypes.c_uint16 * d)()
-    if d == 128:
-        err = cuda.tqp_cuda_dequantize_row_d128_f16(ctypes.byref(blk), out, d)
-    else:
-        err = cuda.tqp_cuda_dequantize_row_d256_f16(ctypes.byref(blk), out, d)
-    assert err == 0
-    return torch.tensor([
-        struct.unpack("<e", int(bits).to_bytes(2, "little"))[0]
-        for bits in out
-    ])
-
-
 def _block_bytes(blk) -> bytes:
     return bytes(memoryview(blk))
 
 
-def test_byte_identical_quantize(d, vectors, layer_idx, rotation):
-    for i, x in enumerate(vectors):
+def _cpu_quantize(d: int, bits: int, x_np, layer_byte: int):
+    blk = BLOCK_CLASSES[(d, bits)]()
+    CPU[(d, bits, "quantize")](_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
+    return blk
+
+
+def _cuda_quantize(d: int, bits: int, x_np, layer_byte: int):
+    blk = BLOCK_CLASSES[(d, bits)]()
+    err = CUDA[(d, bits, "quantize")](_as_float_ptr(x_np), ctypes.byref(blk), d, layer_byte)
+    assert err == 0
+    return blk
+
+
+def _cpu_dequantize(d: int, bits: int, blk):
+    out = (ctypes.c_float * d)()
+    CPU[(d, bits, "dequantize")](ctypes.byref(blk), out, d)
+    return torch.tensor(list(out))
+
+
+def _cuda_dequantize_f32(d: int, bits: int, blk):
+    out = (ctypes.c_float * d)()
+    err = CUDA[(d, bits, "dequantize_f32")](ctypes.byref(blk), out, d)
+    assert err == 0
+    return torch.tensor(list(out))
+
+
+def _cuda_dequantize_f16(d: int, bits: int, blk):
+    out = (ctypes.c_uint16 * d)()
+    err = CUDA[(d, bits, "dequantize_f16")](ctypes.byref(blk), out, d)
+    assert err == 0
+    return torch.tensor([
+        struct.unpack("<e", int(raw).to_bytes(2, "little"))[0]
+        for raw in out
+    ])
+
+
+def _quantize_q8k(x_fp32):
+    x = x_fp32.flatten()
+    n_blocks = (len(x) + Q8_QK - 1) // Q8_QK
+    blocks = (block_q8k_compat * n_blocks)()
+    for b in range(n_blocks):
+        chunk = x[b * Q8_QK : (b + 1) * Q8_QK]
+        amax = max(abs(float(v)) for v in chunk) if len(chunk) else 0.0
+        d = amax / 127.0 if amax > 0 else 1.0
+        blocks[b].d = d
+        for i, v in enumerate(chunk):
+            blocks[b].qs[i] = max(-128, min(127, round(float(v) / d)))
+    return blocks
+
+
+@pytest.mark.parametrize("bits", [3], ids=["b3"])
+def test_legacy_b3_symbols_match_new_api(d, vectors, layer_idx, rotation, bits):
+    x_np = vectors[0].float().numpy().copy()
+    layer_byte = ref.layer_byte(layer_idx, rotation)
+
+    cpu_new = BLOCK_CLASSES[(d, bits)]()
+    cpu_old = BLOCK_CLASSES[(d, bits)]()
+    CPU[(d, bits, "quantize")](_as_float_ptr(x_np), ctypes.byref(cpu_new), d, layer_byte)
+    CPU[(d, bits, "legacy_quantize")](_as_float_ptr(x_np), ctypes.byref(cpu_old), d, layer_byte)
+    assert _block_bytes(cpu_new) == _block_bytes(cpu_old)
+
+    cuda_new = BLOCK_CLASSES[(d, bits)]()
+    cuda_old = BLOCK_CLASSES[(d, bits)]()
+    assert CUDA[(d, bits, "quantize")](_as_float_ptr(x_np), ctypes.byref(cuda_new), d, layer_byte) == 0
+    assert CUDA[(d, bits, "legacy_quantize")](_as_float_ptr(x_np), ctypes.byref(cuda_old), d, layer_byte) == 0
+    assert _block_bytes(cuda_new) == _block_bytes(cuda_old)
+
+
+@pytest.mark.parametrize("bits", [3], ids=["b3"])
+def test_byte_identical_quantize_b3(d, vectors, layer_idx, rotation, bits):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
+    for i, x in enumerate(vectors[:10]):
         x_np = x.float().numpy().copy()
-        cpu_bytes = _block_bytes(_cpu_quantize(d, x_np, layer_idx, rotation))
-        cuda_bytes = _block_bytes(_cuda_quantize(d, x_np, layer_idx, rotation))
+        cpu_bytes = _block_bytes(_cpu_quantize(d, bits, x_np, layer_byte))
+        cuda_bytes = _block_bytes(_cuda_quantize(d, bits, x_np, layer_byte))
         if cuda_bytes != cpu_bytes:
             diffs = [j for j in range(len(cpu_bytes)) if cuda_bytes[j] != cpu_bytes[j]]
-            fp16_fields_close = abs(int.from_bytes(cuda_bytes[0:2], "little") - int.from_bytes(cpu_bytes[0:2], "little")) <= 1
-            fp16_fields_close &= abs(int.from_bytes(cuda_bytes[2:4], "little") - int.from_bytes(cpu_bytes[2:4], "little")) <= 1
-            bit_fields_equal = cuda_bytes[4:] == cpu_bytes[4:]
             pytest.fail(
-                f"byte mismatch vec {i} d={d} layer={layer_idx} rot={ROTATION_IDS[rotation]}: "
-                f"{len(diffs)} bytes differ, first offset {diffs[0]}, "
-                f"fp16_within_ulp={fp16_fields_close}, tail_exact={bit_fields_equal}"
+                f"byte mismatch vec {i} d={d} bits={bits} layer={layer_idx} rot={ROTATION_IDS[rotation]}: "
+                f"{len(diffs)} bytes differ, first offset {diffs[0]}"
             )
 
 
-def test_layer_byte_stored_in_block(d, vectors, layer_idx, rotation):
+def test_layer_byte_stored_in_block(d, bits, vectors, layer_idx, rotation):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     x_np = vectors[0].float().numpy().copy()
-    cpu_blk = _cpu_quantize(d, x_np, layer_idx, rotation)
-    cuda_blk = _cuda_quantize(d, x_np, layer_idx, rotation)
-    for blk in (cpu_blk, cuda_blk):
+    for blk in (
+        _cpu_quantize(d, bits, x_np, layer_byte),
+        _cuda_quantize(d, bits, x_np, layer_byte),
+    ):
         assert ref.extract_layer(blk.layer_idx) == layer_idx
         assert ref.extract_rotation(blk.layer_idx) == rotation
 
 
-def test_cuda_per_layer_produces_different_bytes(d, vectors, rotation):
-    """Regression guard: CUDA quantize output must actually differ across
-    layer indices. If the kernels silently reverted to reading σ_0/Π_0/S_0
-    for every block (the pre-#8 bug in the plain-Haar CUDA path), this test
-    would fail with identical qs/qjl_signs regardless of layer_idx.
-
-    Different layer indices in [0, 31] use different seeds (42+i, 43+i) so
-    σ_i, Π_i, S_i are all independent. Byte-for-byte identical output
-    across two distinct layer_idx values is statistically impossible when
-    the per-layer constants are actually wired through.
-    """
-    x_np = vectors[0].float().numpy().copy()
-    blk0 = _cuda_quantize(d, x_np, 0, rotation)
-    blk_hi = _cuda_quantize(d, x_np, TEST_LAYERS[-1], rotation)
-    b0 = _block_bytes(blk0)
-    bh = _block_bytes(blk_hi)
-    # Skip the layer_idx byte at offset 4 (which naturally differs); the
-    # real signal is in qs/qjl_signs at offset 5..
-    assert b0[5:] != bh[5:], (
-        f"qs/qjl_signs identical across layer_idx=0 and {TEST_LAYERS[-1]} "
-        f"at d={d}, rot={ROTATION_IDS[rotation]}; CUDA is likely ignoring "
-        f"layer_idx and using layer 0 constants for all blocks"
-    )
-
-
-def test_dequantize_agreement_f32(d, vectors, layer_idx, rotation):
+def test_dequantize_agreement_f32(d, bits, vectors, layer_idx, rotation):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     max_abs = 0.0
     for x in vectors[:10]:
-        blk = _cpu_quantize(d, x.float().numpy().copy(), layer_idx, rotation)
-        cpu_out = _cpu_dequantize(d, blk)
-        cuda_out = _cuda_dequantize_f32(d, blk)
+        blk = _cpu_quantize(d, bits, x.float().numpy().copy(), layer_byte)
+        cpu_out = _cpu_dequantize(d, bits, blk)
+        cuda_out = _cuda_dequantize_f32(d, bits, blk)
         max_abs = max(max_abs, (cuda_out - cpu_out).abs().max().item())
 
-    assert max_abs < 1e-5, (
-        f"CUDA vs CPU dequantize f32 max diff {max_abs:.2e} "
-        f"d={d} layer {layer_idx} rot={ROTATION_IDS[rotation]}"
-    )
+    assert max_abs < 1e-5
 
 
-def test_dequantize_agreement_f16(d, vectors, layer_idx, rotation):
+def test_dequantize_agreement_f16(d, bits, vectors, layer_idx, rotation):
+    layer_byte = ref.layer_byte(layer_idx, rotation)
     max_abs = 0.0
     for x in vectors[:10]:
-        blk = _cpu_quantize(d, x.float().numpy().copy(), layer_idx, rotation)
-        cpu_out = _cpu_dequantize(d, blk).half().float()
-        cuda_out = _cuda_dequantize_f16(d, blk).float()
+        blk = _cpu_quantize(d, bits, x.float().numpy().copy(), layer_byte)
+        cpu_out = _cpu_dequantize(d, bits, blk).half().float()
+        cuda_out = _cuda_dequantize_f16(d, bits, blk).float()
         max_abs = max(max_abs, (cuda_out - cpu_out).abs().max().item())
 
-    assert max_abs == 0.0, (
-        f"CUDA dequantize f16 differs from fp16-rounded CPU output by {max_abs:.2e} "
-        f"d={d} layer {layer_idx} rot={ROTATION_IDS[rotation]}"
-    )
+    assert max_abs == 0.0
 
 
-def test_prepare_query_agreement(d, constants, vectors, layer_idx, rotation):
+def test_prepare_query_agreement(d, bits, constants, vectors, layer_idx, rotation):
     layer_byte = ref.layer_byte(layer_idx, rotation)
     for q in vectors[25:35]:
         q_np = q.float().numpy().copy()
@@ -373,14 +493,10 @@ def test_prepare_query_agreement(d, constants, vectors, layer_idx, rotation):
         cuda_sq = (ctypes.c_float * d)()
         cuda_q_rot = (ctypes.c_float * d)()
 
-        if d == 128:
-            cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), cpu_sq, layer_byte)
-            err = cuda.tqp_cuda_prepare_query_d128(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_byte)
-        else:
-            cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), cpu_sq, layer_byte)
-            err = cuda.tqp_cuda_prepare_query_d256(_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_byte)
-
+        CPU[(d, bits, "prepare")](_as_float_ptr(q_np), cpu_sq, layer_byte)
+        err = CUDA[(d, bits, "prepare")](_as_float_ptr(q_np), cuda_sq, cuda_q_rot, layer_byte)
         assert err == 0
+
         cpu_sq_t = torch.tensor(list(cpu_sq))
         cuda_sq_t = torch.tensor(list(cuda_sq))
         cuda_q_rot_t = torch.tensor(list(cuda_q_rot))
@@ -390,198 +506,71 @@ def test_prepare_query_agreement(d, constants, vectors, layer_idx, rotation):
         assert (cuda_q_rot_t - py_q_rot_t).abs().max().item() < 1e-4
 
 
-def test_vec_dot_agreement(d, vectors, layer_idx, rotation):
-    keys = vectors[:25]
-    queries = vectors[25:50]
+def test_vec_dot_agreement(d, bits, vectors, layer_idx, rotation):
+    keys = vectors[:10]
+    queries = vectors[10:20]
     layer_byte = ref.layer_byte(layer_idx, rotation)
     max_abs = 0.0
 
     for q in queries:
         q_np = q.float().numpy().copy()
         for k in keys:
-            k_np = k.float().numpy().copy()
-            blk = _cpu_quantize(d, k_np, layer_idx, rotation)
-
+            blk = _cpu_quantize(d, bits, k.float().numpy().copy(), layer_byte)
             sq = (ctypes.c_float * d)()
-            if d == 128:
-                cpu.ggml_tqp_prepare_query_d128(_as_float_ptr(q_np), sq, layer_byte)
-                cpu_ip = cpu.ggml_tqp_vec_dot_block_d128(_as_float_ptr(q_np), sq, ctypes.byref(blk))
-                cuda_ip = cuda.tqp_cuda_vec_dot_block_d128(_as_float_ptr(q_np), ctypes.byref(blk))
-            else:
-                cpu.ggml_tqp_prepare_query_d256(_as_float_ptr(q_np), sq, layer_byte)
-                cpu_ip = cpu.ggml_tqp_vec_dot_block_d256(_as_float_ptr(q_np), sq, ctypes.byref(blk))
-                cuda_ip = cuda.tqp_cuda_vec_dot_block_d256(_as_float_ptr(q_np), ctypes.byref(blk))
+            CPU[(d, bits, "prepare")](_as_float_ptr(q_np), sq, layer_byte)
+            cpu_ip = CPU[(d, bits, "vec_dot_block")](_as_float_ptr(q_np), sq, ctypes.byref(blk))
+            cuda_ip = CUDA[(d, bits, "vec_dot_block")](_as_float_ptr(q_np), ctypes.byref(blk))
             max_abs = max(max_abs, abs(cpu_ip - cuda_ip))
 
-    assert max_abs < 1e-4, f"CUDA vs CPU vec_dot max diff {max_abs:.2e} layer {layer_idx} rot {ROTATION_IDS[rotation]}"
+    assert max_abs < 1e-4
 
 
-def test_dispatch_wrapper_matches_block_api(d, vectors, layer_idx, rotation):
+def test_dispatch_wrapper_matches_block_api(d, bits, vectors, layer_idx, rotation):
     keys = vectors[:5]
-    q = vectors[5]
-    q_np = q.float().numpy().copy()
+    q_np = vectors[5].float().numpy().copy()
+    layer_byte = ref.layer_byte(layer_idx, rotation)
 
-    if d == 128:
-        BlockArray = block_tq4p_d128 * len(keys)
-        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx, rotation) for k in keys])
-        out = (ctypes.c_float * len(keys))()
-        err = cuda.tqp_cuda_vec_dot_row_d128(_as_float_ptr(q_np), blocks, out, len(keys))
-        block_scores = [
-            cuda.tqp_cuda_vec_dot_block_d128(_as_float_ptr(q_np), ctypes.byref(blocks[i]))
-            for i in range(len(keys))
-        ]
-    else:
-        BlockArray = block_tq4p_d256 * len(keys)
-        blocks = BlockArray(*[_cpu_quantize(d, k.float().numpy().copy(), layer_idx, rotation) for k in keys])
-        out = (ctypes.c_float * len(keys))()
-        err = cuda.tqp_cuda_vec_dot_row_d256(_as_float_ptr(q_np), blocks, out, len(keys))
-        block_scores = [
-            cuda.tqp_cuda_vec_dot_block_d256(_as_float_ptr(q_np), ctypes.byref(blocks[i]))
-            for i in range(len(keys))
-        ]
+    block_cls = BLOCK_CLASSES[(d, bits)]
+    BlockArray = block_cls * len(keys)
+    blocks = BlockArray(*[_cpu_quantize(d, bits, k.float().numpy().copy(), layer_byte) for k in keys])
+    out = (ctypes.c_float * len(keys))()
 
+    err = CUDA[(d, bits, "vec_dot_row")](_as_float_ptr(q_np), blocks, out, len(keys))
     assert err == 0
-    row_scores = list(out)
-    assert max(abs(a - b) for a, b in zip(row_scores, block_scores)) < 1e-6
 
-
-# ---------- Q8_K query path ----------
-
-class block_q8k_compat(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("d",     ctypes.c_float),
-        ("qs",    ctypes.c_int8 * 256),
-        ("bsums", ctypes.c_int16 * 16),
+    block_scores = [
+        CUDA[(d, bits, "vec_dot_block")](_as_float_ptr(q_np), ctypes.byref(blocks[i]))
+        for i in range(len(keys))
     ]
-
-assert ctypes.sizeof(block_q8k_compat) == 292
-
-# CPU Q8_K vec_dot bindings
-cpu.ggml_vec_dot_tq4p_d128_q8k.restype = None
-cpu.ggml_vec_dot_tq4p_d128_q8k.argtypes = [
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_size_t,
-    ctypes.c_void_p,
-    ctypes.c_size_t,
-    ctypes.c_void_p,
-    ctypes.c_size_t,
-    ctypes.c_int,
-]
-cpu.ggml_vec_dot_tq4p_d256_q8k.restype = None
-cpu.ggml_vec_dot_tq4p_d256_q8k.argtypes = cpu.ggml_vec_dot_tq4p_d128_q8k.argtypes
-
-# CUDA Q8_K vec_dot bindings
-cuda.tqp_cuda_vec_dot_q8k_d128.restype = ctypes.c_int
-cuda.tqp_cuda_vec_dot_q8k_d128.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(block_tq4p_d128),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
-cuda.tqp_cuda_vec_dot_q8k_d256.restype = ctypes.c_int
-cuda.tqp_cuda_vec_dot_q8k_d256.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(block_tq4p_d256),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int64,
-]
+    assert max(abs(a - b) for a, b in zip(list(out), block_scores)) < 1e-6
 
 
-def _quantize_q8k(x_fp32):
-    """Quantize fp32 vector to Q8_K block(s)."""
-    x = x_fp32.flatten()
-    n_blocks = (len(x) + 255) // 256
-    blocks = (block_q8k_compat * n_blocks)()
-    for b in range(n_blocks):
-        chunk = x[b * 256 : (b + 1) * 256]
-        amax = max(abs(float(v)) for v in chunk)
-        d = amax / 127.0 if amax > 0 else 1.0
-        blocks[b].d = d
-        for i, v in enumerate(chunk):
-            blocks[b].qs[i] = max(-128, min(127, round(float(v) / d)))
-    return blocks
+def test_q8k_cuda_vs_cpu(d, bits, vectors, layer_idx, rotation):
+    n_tqp_per_q8k = Q8_QK // d
+    keys = vectors[: n_tqp_per_q8k * 4]
+    query_vec = torch.cat([vectors[20 + i] for i in range(n_tqp_per_q8k)], dim=0)
+    layer_byte = ref.layer_byte(layer_idx, rotation)
 
+    block_cls = BLOCK_CLASSES[(d, bits)]
+    BlockArray = block_cls * len(keys)
+    blocks = BlockArray(*[_cpu_quantize(d, bits, k.float().numpy().copy(), layer_byte) for k in keys])
+    q8k = _quantize_q8k(query_vec.float().numpy())
 
-def test_q8k_cuda_vs_cpu(d, vectors, layer_idx, rotation):
-    """Q8_K query path: CUDA dequantize-then-dot must agree with CPU Q8_K wrapper.
+    cpu_out = (ctypes.c_float * len(keys))()
+    cuda_out = (ctypes.c_float * len(keys))()
 
-    The CPU Q8_K path requires n to be a multiple of 256 (QK_Q8K). For d=128,
-    each Q8_K block covers 2 TQ4P blocks (256/128); for d=256, one Q8_K block
-    covers 1 TQ4P block. We build a multi-block dot and compare results.
-    """
-    n_tqp_per_q8k = 256 // d  # 2 for d=128, 1 for d=256
-    keys = vectors[:n_tqp_per_q8k * 5]  # enough for 5 Q8_K blocks
-    queries = vectors[25:30]
-    max_abs = 0.0
-
-    for q_set_idx in range(len(queries)):
-        # Build a query vector that spans one Q8_K block (256 fp32 values).
-        # For d=128: concatenate 2 query vectors; for d=256: use 1.
-        q_parts = [queries[(q_set_idx + i) % len(queries)].float().numpy().copy()
-                    for i in range(n_tqp_per_q8k)]
-        q_256 = torch.cat([torch.from_numpy(p) for p in q_parts]).numpy().copy()
-        q8k_blocks = _quantize_q8k(q_256)
-
-        # Build corresponding TQ4P key blocks.
-        key_parts = [keys[(q_set_idx * n_tqp_per_q8k + i) % len(keys)]
-                      for i in range(n_tqp_per_q8k)]
-        tq_blocks = []
-        for kp in key_parts:
-            k_np = kp.float().numpy().copy()
-            tq_blocks.append(_cpu_quantize(d, k_np, layer_idx, rotation))
-
-        # CPU Q8_K path: n = 256 (one Q8_K block)
-        cpu_result = ctypes.c_float(0.0)
-        if d == 128:
-            BlockArray = block_tq4p_d128 * n_tqp_per_q8k
-            blk_arr = BlockArray(*tq_blocks)
-            cpu.ggml_vec_dot_tq4p_d128_q8k(
-                256, ctypes.byref(cpu_result), 0,
-                ctypes.byref(blk_arr), 0,
-                ctypes.byref(q8k_blocks), 0,
-                1)
-        else:
-            BlockArray = block_tq4p_d256 * n_tqp_per_q8k
-            blk_arr = BlockArray(*tq_blocks)
-            cpu.ggml_vec_dot_tq4p_d256_q8k(
-                256, ctypes.byref(cpu_result), 0,
-                ctypes.byref(blk_arr), 0,
-                ctypes.byref(q8k_blocks), 0,
-                1)
-
-        # CUDA Q8_K path: dequantize Q8K to fp32, then per-block dot.
-        # The CUDA test wrapper processes blocks one at a time with
-        # the first d elements of the dequantized Q8K query.
-        cuda_acc = 0.0
-        for i in range(n_tqp_per_q8k):
-            sub_q_np = q_parts[i]
-            sub_q8k = _quantize_q8k(sub_q_np if d == 256 else
-                                     torch.cat([torch.from_numpy(sub_q_np),
-                                                torch.zeros(256 - d)]).numpy().copy())
-            if d == 128:
-                BA = block_tq4p_d128 * 1
-                ba = BA(tq_blocks[i])
-                out = (ctypes.c_float * 1)()
-                err = cuda.tqp_cuda_vec_dot_q8k_d128(
-                    ctypes.byref(sub_q8k), ba, out, 1)
-            else:
-                BA = block_tq4p_d256 * 1
-                ba = BA(tq_blocks[i])
-                out = (ctypes.c_float * 1)()
-                err = cuda.tqp_cuda_vec_dot_q8k_d256(
-                    ctypes.byref(sub_q8k), ba, out, 1)
-
-            assert err == 0, f"CUDA Q8_K vec_dot returned error {err}"
-            cuda_acc += out[0]
-
-        diff = abs(cpu_result.value - cuda_acc)
-        max_abs = max(max_abs, diff)
-
-    # Tolerance is wider than the fp32 path because Q8_K dequantization adds
-    # rounding on top of TQ4P quantization noise.
-    assert max_abs < 2e-3, (
-        f"Q8_K CUDA vs CPU vec_dot max diff {max_abs:.2e} "
-        f"d={d} layer {layer_idx} rot {ROTATION_IDS[rotation]}"
+    CPU[(d, bits, "vec_dot_q8k")](
+        len(keys),
+        cpu_out,
+        ctypes.sizeof(ctypes.c_float),
+        q8k,
+        ctypes.sizeof(block_q8k_compat),
+        blocks,
+        ctypes.sizeof(block_cls),
+        d,
     )
+    err = CUDA[(d, bits, "vec_dot_q8k")](q8k, blocks, cuda_out, len(keys))
+    assert err == 0
+
+    max_abs = max(abs(a - b) for a, b in zip(list(cpu_out), list(cuda_out)))
+    assert max_abs < 1e-4

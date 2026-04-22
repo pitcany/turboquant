@@ -7,23 +7,25 @@
 #   tq3_0       — turbo-tan/llama.cpp-tq3 Walsh-Hadamard TurboQuant (legacy;
 #                 only relevant if you've manually added tq3_0 to ollama's
 #                 ggml fork; harmless otherwise)
-#   tq4p_d128   — paper-faithful TurboQuant (Llama / Qwen2/3, head_dim 128)
-#   tq4p_d256   — paper-faithful TurboQuant (Qwen3.5 gated attention, head_dim 256)
+#   tq4p_d128   — legacy alias for paper-faithful TurboQuant B3 (head_dim 128)
+#   tq4p_d256   — legacy alias for paper-faithful TurboQuant B3 (head_dim 256)
+#   tqp_d128_b2 / tqp_d128_b4 — configurable-bit-width TurboQuant for d=128
+#   tqp_d256_b2 / tqp_d256_b4 — configurable-bit-width TurboQuant for d=256
 #
 # Targets the pattern []string{"q8_0", "q4_0"} specifically — NOT any file
 # that happens to mention both strings. An earlier version of this script was
 # too aggressive and broke return statements, case bodies, and test data in
 # five files. We now match only Go slice literals.
 #
-# Idempotent: reruns are no-ops if the slice already contains "tq4p_d128".
+# Idempotent: reruns are no-ops if the slice already contains "tqp_d128_b2".
 #
 # Usage: patch_ollama_kv_types.sh <ollama-source-dir>
 
 set -euo pipefail
 
 OLLAMA_DIR="${1:?usage: patch_ollama_kv_types.sh <ollama-source-dir>}"
-NEW_TYPES='"tq3_0", "tq4p_d128", "tq4p_d256"'
-MARKER='tq4p_d128'
+NEW_TYPES='"tq3_0", "tq4p_d128", "tq4p_d256", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"'
+MARKER='tqp_d128_b2'
 
 # Find Go files containing a []string{ ... "q8_0" ... "q4_0" ... } literal.
 # Pre-filter by grep for cheap elimination; full match is done in Python.

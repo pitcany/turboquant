@@ -14,16 +14,10 @@ extern "C" int tqp_cuda_device_count() {
     return count;
 }
 
-// tqp_quantize_block_device is now in tqp-kernels.cuh so it can be shared
-// with tqp-set-rows.cu. The kernel wrappers below call it directly.
-
-// Per-layer sigma, centroids, and boundaries live in device global memory
-// via TqpDeviceState pointers. Π and S likewise. ROT is a template
-// parameter so the dead branch is compiled out.
-template<uint8_t ROT>
-__global__ static void tqp_quantize_kernel_d128(
+template<int D, int BITS, typename Block, uint8_t ROT>
+__global__ static void tqp_quantize_kernel(
         const float * __restrict__ x,
-        block_tq4p_d128 * __restrict__ y,
+        Block * __restrict__ y,
         uint8_t layer_byte_val,
         uint8_t layer,
         const float * __restrict__ pi,
@@ -37,109 +31,77 @@ __global__ static void tqp_quantize_kernel_d128(
         return;
     }
 
-    tqp_quantize_block_device<QK_TQ4P_D128, ROT>(
-        x + b * QK_TQ4P_D128,
+    tqp_quantize_block_device<D, ROT, BITS>(
+        x + b * D,
         &y[b].orig_norm,
         &y[b].res_d,
         &y[b].layer_idx,
         layer_byte_val,
         y[b].qs,
         y[b].qjl_signs,
-        sigma + (size_t)layer * QK_TQ4P_D128,
-        pi + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
-        s  + (size_t)layer * QK_TQ4P_D128 * QK_TQ4P_D128,
+        sigma + (size_t)layer * D,
+        pi + (size_t)layer * D * D,
+        s + (size_t)layer * D * D,
         centroids,
         boundaries);
 }
 
-template<uint8_t ROT>
-__global__ static void tqp_quantize_kernel_d256(
-        const float * __restrict__ x,
-        block_tq4p_d256 * __restrict__ y,
-        uint8_t layer_byte_val,
-        uint8_t layer,
-        const float * __restrict__ pi,
-        const float * __restrict__ s,
-        const float * __restrict__ sigma,
-        const float * __restrict__ centroids,
-        const float * __restrict__ boundaries,
-        int64_t n_blocks) {
-    const int64_t b = (int64_t)blockIdx.x;
-    if (b >= n_blocks) {
+template<int D, int BITS, typename Block>
+static void ggml_cuda_tqp_quantize_row_impl(
+        const float * x,
+        void * y,
+        int64_t k,
+        uint8_t layer_byte,
+        cudaStream_t stream) {
+    if (k % D != 0) {
+        return;
+    }
+    if (tqp_cuda_init(D, BITS) != cudaSuccess) {
         return;
     }
 
-    tqp_quantize_block_device<QK_TQ4P_D256, ROT>(
-        x + b * QK_TQ4P_D256,
-        &y[b].orig_norm,
-        &y[b].res_d,
-        &y[b].layer_idx,
-        layer_byte_val,
-        y[b].qs,
-        y[b].qjl_signs,
-        sigma + (size_t)layer * QK_TQ4P_D256,
-        pi + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
-        s  + (size_t)layer * QK_TQ4P_D256 * QK_TQ4P_D256,
-        centroids,
-        boundaries);
-}
+    const TqpDeviceState * state = tqp_cuda_current_device_state();
+    if (!state) {
+        return;
+    }
 
-extern "C" void ggml_cuda_tqp_quantize_row_d128(const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
-    if (k % QK_TQ4P_D128 != 0) {
-        return;
-    }
-    if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
-        return;
-    }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
-        return;
-    }
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
-    const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
+    const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
     const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
-    const int64_t n_blocks = k / QK_TQ4P_D128;
+    const int64_t n_blocks = k / D;
+
+    const float * pi = tqp_cuda_pi_ptr(state, D);
+    const float * s = tqp_cuda_s_ptr(state, D);
+    const float * sigma = tqp_cuda_sigma_ptr(state, D);
+    const float * centroids = tqp_cuda_centroids_ptr(state, D, BITS);
+    const float * boundaries = tqp_cuda_boundaries_ptr(state, D, BITS);
+    if (!pi || !s || !sigma || !centroids || !boundaries) {
+        return;
+    }
+
     if (rot == TQP_ROT_WHT) {
-        tqp_quantize_kernel_d128<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer,
-            tqp_state->pi_d128, tqp_state->s_d128,
-            tqp_state->sigma_d128, tqp_state->centroids_d128, tqp_state->boundaries_d128,
+        tqp_quantize_kernel<D, BITS, Block, TQP_ROT_WHT><<<(unsigned int)n_blocks, D, 0, stream>>>(
+            x,
+            (Block *)y,
+            byte_stored,
+            layer,
+            pi,
+            s,
+            sigma,
+            centroids,
+            boundaries,
             n_blocks);
     } else {
-        tqp_quantize_kernel_d128<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D128, 0, stream>>>(
-            x, (block_tq4p_d128 *)y, byte_stored, layer,
-            tqp_state->pi_d128, tqp_state->s_d128,
-            tqp_state->sigma_d128, tqp_state->centroids_d128, tqp_state->boundaries_d128,
-            n_blocks);
-    }
-}
-
-extern "C" void ggml_cuda_tqp_quantize_row_d256(const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
-    if (k % QK_TQ4P_D256 != 0) {
-        return;
-    }
-    if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
-        return;
-    }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
-        return;
-    }
-    const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
-    const uint8_t rot   = TQP_EXTRACT_ROT(layer_byte);
-    const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
-    const int64_t n_blocks = k / QK_TQ4P_D256;
-    if (rot == TQP_ROT_WHT) {
-        tqp_quantize_kernel_d256<TQP_ROT_WHT><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer,
-            tqp_state->pi_d256, tqp_state->s_d256,
-            tqp_state->sigma_d256, tqp_state->centroids_d256, tqp_state->boundaries_d256,
-            n_blocks);
-    } else {
-        tqp_quantize_kernel_d256<TQP_ROT_HAAR><<<(unsigned int)n_blocks, QK_TQ4P_D256, 0, stream>>>(
-            x, (block_tq4p_d256 *)y, byte_stored, layer,
-            tqp_state->pi_d256, tqp_state->s_d256,
-            tqp_state->sigma_d256, tqp_state->centroids_d256, tqp_state->boundaries_d256,
+        tqp_quantize_kernel<D, BITS, Block, TQP_ROT_HAAR><<<(unsigned int)n_blocks, D, 0, stream>>>(
+            x,
+            (Block *)y,
+            byte_stored,
+            layer,
+            pi,
+            s,
+            sigma,
+            centroids,
+            boundaries,
             n_blocks);
     }
 }
@@ -186,12 +148,42 @@ static int tqp_cuda_quantize_row_host(
     return (int)err;
 }
 
-extern "C" int tqp_cuda_quantize_row_d128(const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
-    return tqp_cuda_quantize_row_host<block_tq4p_d128>(
-        QK_TQ4P_D128, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d128);
+#define TQP_DEFINE_QUANTIZE(D, BITS)                                                                                             \
+    extern "C" void ggml_cuda_tqp_quantize_row_d##D##_b##BITS(                                                                   \
+            const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {                                    \
+        ggml_cuda_tqp_quantize_row_impl<QK_TQP_D##D, BITS, block_tqp_d##D##_b##BITS>(x, y, k, layer_byte, stream);             \
+    }                                                                                                                            \
+    extern "C" int tqp_cuda_quantize_row_d##D##_b##BITS(                                                                         \
+            const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {                                               \
+        return tqp_cuda_quantize_row_host<block_tqp_d##D##_b##BITS>(                                                             \
+            QK_TQP_D##D, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d##D##_b##BITS);                            \
+    }
+
+TQP_DEFINE_QUANTIZE(128, 2)
+TQP_DEFINE_QUANTIZE(128, 3)
+TQP_DEFINE_QUANTIZE(128, 4)
+TQP_DEFINE_QUANTIZE(256, 2)
+TQP_DEFINE_QUANTIZE(256, 3)
+TQP_DEFINE_QUANTIZE(256, 4)
+
+#undef TQP_DEFINE_QUANTIZE
+
+extern "C" void ggml_cuda_tqp_quantize_row_d128(
+        const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
+    ggml_cuda_tqp_quantize_row_d128_b3(x, y, k, layer_byte, stream);
 }
 
-extern "C" int tqp_cuda_quantize_row_d256(const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
-    return tqp_cuda_quantize_row_host<block_tq4p_d256>(
-        QK_TQ4P_D256, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d256);
+extern "C" void ggml_cuda_tqp_quantize_row_d256(
+        const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
+    ggml_cuda_tqp_quantize_row_d256_b3(x, y, k, layer_byte, stream);
+}
+
+extern "C" int tqp_cuda_quantize_row_d128(
+        const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
+    return tqp_cuda_quantize_row_d128_b3(x_host, y_host, k, layer_byte);
+}
+
+extern "C" int tqp_cuda_quantize_row_d256(
+        const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
+    return tqp_cuda_quantize_row_d256_b3(x_host, y_host, k, layer_byte);
 }

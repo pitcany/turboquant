@@ -20,25 +20,24 @@ Combined: 3 bits per element, ~4x memory reduction, with near-zero impact on att
 
 ### Native Ollama Integration (`patches/stage2-qjl/`)
 
-TurboQuant is integrated directly into Ollama's vendored ggml layer as two new quantization types: `tq4p_d128` (head_dim 128) and `tq4p_d256` (head_dim 256, for Qwen 3.5). The integration is additive — no upstream files are replaced, only extended.
+TurboQuant is integrated directly into Ollama's vendored ggml layer as configurable KV-cache types. The legacy `tq4p_d128` / `tq4p_d256` names remain the B3 aliases, and the new explicit variants are `tqp_d128_b2`, `tqp_d128_b4`, `tqp_d256_b2`, and `tqp_d256_b4`. The integration is additive — no upstream files are replaced, only extended.
 
 The C implementation in `patches/stage2-qjl/c/` is paper-faithful and byte-exact against the Python reference. See [patches/stage2-qjl/PLAN.md](patches/stage2-qjl/PLAN.md) for the algorithm details and [docs/OLLAMA_NATIVE.md](docs/OLLAMA_NATIVE.md) for the full workflow.
 
 ### Compressed Byte Layout
 
-For `head_dim=128` with 2-bit MSE keys + 1-bit QJL + 3-bit MSE values:
+Stage-1 is now selectable per type:
 
-```
-[0..31]    key MSE indices   (128x2 bit = 32 bytes)
-[32..47]   key QJL signs     (128x1 bit = 16 bytes)
-[48..49]   key residual norm (float16)
-[50..51]   key original norm (float16)
-[52..115]  val MSE indices   (128x4 bit = 64 bytes)
-[116..117] val original norm (float16)
-───────    118 bytes total per token per KV head
-```
+| Type | head_dim | Stage-1 bits | bytes/block | bpw |
+|---|---:|---:|---:|---:|
+| `tqp_d128_b2` | 128 | 2 | 53 | 3.3125 |
+| `tq4p_d128` / `tqp_d128_b3` | 128 | 3 | 69 | 4.3125 |
+| `tqp_d128_b4` | 128 | 4 | 85 | 5.3125 |
+| `tqp_d256_b2` | 256 | 2 | 101 | 3.15625 |
+| `tq4p_d256` / `tqp_d256_b3` | 256 | 3 | 133 | 4.15625 |
+| `tqp_d256_b4` | 256 | 4 | 165 | 5.15625 |
 
-vs 512 bytes for fp16 (128 dims x 2 bytes x 2 for K+V) = **4.3x compression**.
+vs 256 bytes for fp16 keys (or 512 bytes for combined K+V at `d=128`).
 
 ## Quick Start
 
@@ -63,15 +62,25 @@ This clones ollama under `$HOME/.local/src/ollama-tq/`, patches its vendored ggm
 # Stop system ollama if running
 systemctl --user stop ollama 2>/dev/null || pkill -x ollama || true
 
-# Llama 3.x, Qwen 2.5, Qwen 3 — head_dim 128
+# Llama 3.x, Qwen 2.5, Qwen 3 — head_dim 128, legacy B3 alias
 OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 \
+    ~/.local/src/ollama-tq/ollama/ollama serve
+
+# Explicit B2 / B4 selection
+OLLAMA_KV_CACHE_TYPE=tqp_d128_b2 OLLAMA_FLASH_ATTENTION=1 \
+    ~/.local/src/ollama-tq/ollama/ollama serve
+OLLAMA_KV_CACHE_TYPE=tqp_d128_b4 OLLAMA_FLASH_ATTENTION=1 \
     ~/.local/src/ollama-tq/ollama/ollama serve
 
 # In another shell
 ollama run qwen2.5-coder:32b
 ```
 
-For Qwen 3.5 (head_dim 256), use `OLLAMA_KV_CACHE_TYPE=tq4p_d256`.
+Use the `d256` cache types only for models whose resolved KV head lengths are
+actually 256. Many Qwen 3.x variants, including the local `qwen3.6:latest`,
+resolve to non-256 head sizes; the local positive `d256` validation below used
+`qwen3.5:4b-q8_0`, which reports `qwen35.attention.key_length = 256` and
+`qwen35.attention.value_length = 256`.
 
 ### Picking a Rotation: WHT vs Haar
 
@@ -116,7 +125,7 @@ Measured on an RTX 4090, median of 3 runs per configuration, ~2K-token prompt fo
 | llama3.1:8b     |  +9.4% | **-22%** | 195 |
 | llama3.3:70b    |  +1.4% |  **-9%** |  26 |
 
-**KV cache**: 16 bpw → 4.25 bpw (3.76x compression) for `tq4p_d128`; ~3.84x for `tq4p_d256`.
+**KV cache**: 16 bpw → 4.25 bpw for the legacy B3 path, or down to ~3.16-3.31 bpw with the new B2 variants.
 
 **Key finding**: TQ4P overhead shrinks with model size — it's essentially free on 70B and decode is actually *faster* than f16 across all tested sizes. On large models decode is memory-bandwidth-bound, so moving 4.25 bpw through the bus beats moving 16 bpw by more than the extra quantize math costs.
 
@@ -161,6 +170,44 @@ Tests TQ4P C-library attention fidelity on actual KV cache data:
 ```bash
 python validate.py          # Needs CUDA GPU
 ```
+
+### Ollama Runtime Validation
+
+Validated locally on 2026-04-21 against the patched Ollama CUDA build with
+`OLLAMA_FLASH_ATTENTION=1`:
+
+| Model | Resolved KV head dim | Validated cache types | Result |
+|---|---:|---|---|
+| `llama3.1:8b` | 128 | `tqp_d128_b2`, `tqp_d128_b4` | Pass |
+| `qwen2.5:3b` | 128 | `tqp_d128_b2` | Pass |
+| `qwen3.5:4b-q8_0` | 256 | `tqp_d256_b2`, `tqp_d256_b4` | Pass |
+
+The model-compatibility guard was also validated: requesting
+`OLLAMA_KV_CACHE_TYPE=tqp_d256_b2` for `llama3.1:8b` no longer crashes the
+runner and falls back cleanly instead of loading an incompatible `d256` KV
+format.
+
+Command pattern used for the positive runtime checks:
+
+```bash
+# shell 1
+OLLAMA_HOST=127.0.0.1:11507 \
+OLLAMA_FLASH_ATTENTION=1 \
+OLLAMA_KV_CACHE_TYPE=tqp_d256_b2 \
+~/.local/src/ollama-tq/ollama/ollama serve
+
+# shell 2
+OLLAMA_HOST=127.0.0.1:11507 \
+curl -s http://127.0.0.1:11507/api/generate -d '{
+  "model": "qwen3.5:4b-q8_0",
+  "prompt": "Say hi in one short sentence.",
+  "stream": false,
+  "options": {"num_predict": 16}
+}'
+```
+
+Swap `tqp_d256_b2` for `tqp_d256_b4` to exercise the second `d256` path, or
+use the corresponding `tqp_d128_*` types with a 128-head model.
 
 ## Project Structure
 

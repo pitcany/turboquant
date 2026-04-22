@@ -19,25 +19,23 @@ __device__ inline half tqp_cast_from_float<half>(float x) {
     return __float2half_rn(x);
 }
 
-template<int D, typename Block, typename dst_t>
+template<int D, int BITS, typename Block, typename dst_t>
 __device__ static inline void tqp_dequantize_block_device(
         const Block * __restrict__ blk,
         dst_t * __restrict__ y,
         const float * __restrict__ pi,
         const float * __restrict__ centroids,
         const float * __restrict__ sigma) {
-    __shared__ float smem_vec[QK_TQ4P_D256];
+    __shared__ float smem_vec[QK_TQP_D256];
 
     const int tid = threadIdx.x;
-    // Use memcpy for potentially misaligned block reads (69-byte blocks →
-    // second block in a row starts at odd offset).
     uint16_t raw_norm;
     memcpy(&raw_norm, &blk->orig_norm, sizeof(uint16_t));
     const uint8_t layer = TQP_EXTRACT_LAYER(blk->layer_idx) % TQP_MAX_LAYERS;
     const uint8_t rot = TQP_EXTRACT_ROT(blk->layer_idx);
     const float orig_norm = tqp_fp16_to_fp32_device(raw_norm);
 
-    smem_vec[tid] = centroids[tqp_unpack_index_bitplane(blk->qs, tid)];
+    smem_vec[tid] = centroids[tqp_unpack_index_bitplane<BITS>(blk->qs, tid)];
     __syncthreads();
 
     float x_hat_unit = 0.0f;
@@ -52,8 +50,6 @@ __device__ static inline void tqp_dequantize_block_device(
         }
     }
 
-    // Clamp NaN/Inf to zero: uninitialized KV-cache blocks (random orig_norm
-    // fp16 bits) would poison flash attention's softmax.
     float result = orig_norm * x_hat_unit;
     if (!isfinite(result)) {
         result = 0.0f;
@@ -61,7 +57,7 @@ __device__ static inline void tqp_dequantize_block_device(
     y[tid] = tqp_cast_from_float<dst_t>(result);
 }
 
-template<int D, typename Block, typename dst_t>
+template<int D, int BITS, typename Block, typename dst_t>
 __global__ static void tqp_dequantize_row_kernel(
         const Block * __restrict__ x,
         dst_t * __restrict__ y,
@@ -74,10 +70,10 @@ __global__ static void tqp_dequantize_row_kernel(
         return;
     }
 
-    tqp_dequantize_block_device<D>(&x[b], y + b * D, pi, centroids, sigma);
+    tqp_dequantize_block_device<D, BITS>(&x[b], y + b * D, pi, centroids, sigma);
 }
 
-template<int D, typename Block, typename dst_t>
+template<int D, int BITS, typename Block, typename dst_t>
 __global__ static void tqp_dequantize_row_nc_kernel(
         const Block * __restrict__ x,
         dst_t * __restrict__ y,
@@ -102,35 +98,39 @@ __global__ static void tqp_dequantize_row_nc_kernel(
 
     const int64_t ibx = i03 * s03 + i02 * s02 + i01 * s01 + b0;
     const int64_t iy = ((i03 * ne02 + i02) * ne01 + i01) * ne00 + b0 * D;
-    tqp_dequantize_block_device<D>(&x[ibx], y + iy, pi, centroids, sigma);
+    tqp_dequantize_block_device<D, BITS>(&x[ibx], y + iy, pi, centroids, sigma);
 }
 
-template<int D, typename Block, typename dst_t>
+template<int D, int BITS, typename Block, typename dst_t>
 static void tqp_dequantize_row_cuda(const void * x, dst_t * y, int64_t k, cudaStream_t stream) {
     if (k <= 0 || k % D != 0) {
         return;
     }
-    if (tqp_cuda_init(D) != cudaSuccess) {
-        return;
-    }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
+    if (tqp_cuda_init(D, BITS) != cudaSuccess) {
         return;
     }
 
-    const float * pi        = (D == QK_TQ4P_D128) ? tqp_state->pi_d128        : tqp_state->pi_d256;
-    const float * centroids = (D == QK_TQ4P_D128) ? tqp_state->centroids_d128 : tqp_state->centroids_d256;
-    const float * sigma     = (D == QK_TQ4P_D128) ? tqp_state->sigma_d128     : tqp_state->sigma_d256;
+    const TqpDeviceState * state = tqp_cuda_current_device_state();
+    if (!state) {
+        return;
+    }
+
+    const float * pi = tqp_cuda_pi_ptr(state, D);
+    const float * centroids = tqp_cuda_centroids_ptr(state, D, BITS);
+    const float * sigma = tqp_cuda_sigma_ptr(state, D);
+    if (!pi || !centroids || !sigma) {
+        return;
+    }
 
     const int64_t n_blocks = k / D;
-    tqp_dequantize_row_kernel<D, Block><<<(unsigned int)n_blocks, D, 0, stream>>>(
+    tqp_dequantize_row_kernel<D, BITS, Block><<<(unsigned int)n_blocks, D, 0, stream>>>(
         (const Block *)x, y, n_blocks, pi, centroids, sigma);
 }
 
-template<int D, typename Block>
+template<int D, int BITS, typename Block, typename dst_t>
 static void tqp_dequantize_row_nc_cuda(
         const void * x,
-        half * y,
+        dst_t * y,
         int64_t ne00,
         int64_t ne01,
         int64_t ne02,
@@ -142,63 +142,25 @@ static void tqp_dequantize_row_nc_cuda(
     if (ne00 <= 0 || ne00 % D != 0) {
         return;
     }
-    if (tqp_cuda_init(D) != cudaSuccess) {
-        return;
-    }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
+    if (tqp_cuda_init(D, BITS) != cudaSuccess) {
         return;
     }
 
-    const float * pi        = (D == QK_TQ4P_D128) ? tqp_state->pi_d128        : tqp_state->pi_d256;
-    const float * centroids = (D == QK_TQ4P_D128) ? tqp_state->centroids_d128 : tqp_state->centroids_d256;
-    const float * sigma     = (D == QK_TQ4P_D128) ? tqp_state->sigma_d128     : tqp_state->sigma_d256;
+    const TqpDeviceState * state = tqp_cuda_current_device_state();
+    if (!state) {
+        return;
+    }
+
+    const float * pi = tqp_cuda_pi_ptr(state, D);
+    const float * centroids = tqp_cuda_centroids_ptr(state, D, BITS);
+    const float * sigma = tqp_cuda_sigma_ptr(state, D);
+    if (!pi || !centroids || !sigma) {
+        return;
+    }
 
     const dim3 grid((unsigned int)(ne00 / D), (unsigned int)ne01, (unsigned int)(ne02 * ne03));
-    tqp_dequantize_row_nc_kernel<D, Block><<<grid, D, 0, stream>>>(
+    tqp_dequantize_row_nc_kernel<D, BITS, Block><<<grid, D, 0, stream>>>(
         (const Block *)x, y, ne00, ne01, ne02, s01, s02, s03, pi, centroids, sigma);
-}
-
-extern "C" void dequantize_row_tq4p_d128_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
-    tqp_dequantize_row_cuda<QK_TQ4P_D128, block_tq4p_d128>(x, y, k, stream);
-}
-
-extern "C" void dequantize_row_tq4p_d256_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
-    tqp_dequantize_row_cuda<QK_TQ4P_D256, block_tq4p_d256>(x, y, k, stream);
-}
-
-extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
-    tqp_dequantize_row_cuda<QK_TQ4P_D128, block_tq4p_d128>(x, y, k, stream);
-}
-
-extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
-    tqp_dequantize_row_cuda<QK_TQ4P_D256, block_tq4p_d256>(x, y, k, stream);
-}
-
-extern "C" void dequantize_row_tq4p_d128_nc_cuda(
-        const void * x, half * y,
-        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
-        int64_t s01, int64_t s02, int64_t s03,
-        cudaStream_t stream) {
-    tqp_dequantize_row_nc_cuda<QK_TQ4P_D128, block_tq4p_d128>(
-        x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
-}
-
-extern "C" void dequantize_row_tq4p_d256_nc_cuda(
-        const void * x, half * y,
-        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
-        int64_t s01, int64_t s02, int64_t s03,
-        cudaStream_t stream) {
-    tqp_dequantize_row_nc_cuda<QK_TQ4P_D256, block_tq4p_d256>(
-        x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
-}
-
-static void dequantize_row_tq4p_d128_u16_cuda(const void * x, uint16_t * y, int64_t k, cudaStream_t stream) {
-    dequantize_row_tq4p_d128_cuda(x, (half *)y, k, stream);
-}
-
-static void dequantize_row_tq4p_d256_u16_cuda(const void * x, uint16_t * y, int64_t k, cudaStream_t stream) {
-    dequantize_row_tq4p_d256_cuda(x, (half *)y, k, stream);
 }
 
 template<typename Block, typename dst_t>
@@ -242,22 +204,90 @@ static int tqp_cuda_dequantize_row_host(
     return (int)err;
 }
 
+#define TQP_DEFINE_DEQUANTIZE(D, BITS, BLOCK)                                                                                    \
+    extern "C" void dequantize_row_tqp_d##D##_b##BITS##_cuda(                                                                    \
+            const void * x, half * y, int64_t k, cudaStream_t stream) {                                                          \
+        tqp_dequantize_row_cuda<QK_TQP_D##D, BITS, BLOCK>(x, y, k, stream);                                                     \
+    }                                                                                                                             \
+    extern "C" void dequantize_row_tqp_d##D##_b##BITS##_f32_cuda(                                                                \
+            const void * x, float * y, int64_t k, cudaStream_t stream) {                                                         \
+        tqp_dequantize_row_cuda<QK_TQP_D##D, BITS, BLOCK>(x, y, k, stream);                                                     \
+    }                                                                                                                             \
+    extern "C" void dequantize_row_tqp_d##D##_b##BITS##_nc_cuda(                                                                 \
+            const void * x, half * y,                                                                                            \
+            int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,                                                              \
+            int64_t s01, int64_t s02, int64_t s03,                                                                               \
+            cudaStream_t stream) {                                                                                                \
+        tqp_dequantize_row_nc_cuda<QK_TQP_D##D, BITS, BLOCK>(x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);            \
+    }                                                                                                                             \
+    static void dequantize_row_tqp_d##D##_b##BITS##_u16_cuda(                                                                    \
+            const void * x, uint16_t * y, int64_t k, cudaStream_t stream) {                                                      \
+        dequantize_row_tqp_d##D##_b##BITS##_cuda(x, (half *)y, k, stream);                                                      \
+    }                                                                                                                             \
+    extern "C" int tqp_cuda_dequantize_row_d##D##_b##BITS##_f32(                                                                 \
+            const BLOCK * x_host, float * y_host, int64_t k) {                                                                   \
+        return tqp_cuda_dequantize_row_host<BLOCK, float>(                                                                       \
+            QK_TQP_D##D, x_host, y_host, k, dequantize_row_tqp_d##D##_b##BITS##_f32_cuda);                                      \
+    }                                                                                                                             \
+    extern "C" int tqp_cuda_dequantize_row_d##D##_b##BITS##_f16(                                                                 \
+            const BLOCK * x_host, uint16_t * y_host, int64_t k) {                                                                \
+        return tqp_cuda_dequantize_row_host<BLOCK, uint16_t>(                                                                    \
+            QK_TQP_D##D, x_host, y_host, k, dequantize_row_tqp_d##D##_b##BITS##_u16_cuda);                                      \
+    }
+
+TQP_DEFINE_DEQUANTIZE(128, 2, block_tqp_d128_b2)
+TQP_DEFINE_DEQUANTIZE(128, 3, block_tqp_d128_b3)
+TQP_DEFINE_DEQUANTIZE(128, 4, block_tqp_d128_b4)
+TQP_DEFINE_DEQUANTIZE(256, 2, block_tqp_d256_b2)
+TQP_DEFINE_DEQUANTIZE(256, 3, block_tqp_d256_b3)
+TQP_DEFINE_DEQUANTIZE(256, 4, block_tqp_d256_b4)
+
+#undef TQP_DEFINE_DEQUANTIZE
+
+extern "C" void dequantize_row_tq4p_d128_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d128_b3_cuda(x, y, k, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d256_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d256_b3_cuda(x, y, k, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d128_b3_f32_cuda(x, y, k, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d256_b3_f32_cuda(x, y, k, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d128_nc_cuda(
+        const void * x, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_row_tqp_d128_b3_nc_cuda(x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d256_nc_cuda(
+        const void * x, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_row_tqp_d256_b3_nc_cuda(x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
 extern "C" int tqp_cuda_dequantize_row_d128_f32(const block_tq4p_d128 * x_host, float * y_host, int64_t k) {
-    return tqp_cuda_dequantize_row_host<block_tq4p_d128, float>(
-        QK_TQ4P_D128, x_host, y_host, k, dequantize_row_tq4p_d128_f32_cuda);
+    return tqp_cuda_dequantize_row_d128_b3_f32(x_host, y_host, k);
 }
 
 extern "C" int tqp_cuda_dequantize_row_d256_f32(const block_tq4p_d256 * x_host, float * y_host, int64_t k) {
-    return tqp_cuda_dequantize_row_host<block_tq4p_d256, float>(
-        QK_TQ4P_D256, x_host, y_host, k, dequantize_row_tq4p_d256_f32_cuda);
+    return tqp_cuda_dequantize_row_d256_b3_f32(x_host, y_host, k);
 }
 
 extern "C" int tqp_cuda_dequantize_row_d128_f16(const block_tq4p_d128 * x_host, uint16_t * y_host, int64_t k) {
-    return tqp_cuda_dequantize_row_host<block_tq4p_d128, uint16_t>(
-        QK_TQ4P_D128, x_host, y_host, k, dequantize_row_tq4p_d128_u16_cuda);
+    return tqp_cuda_dequantize_row_d128_b3_f16(x_host, y_host, k);
 }
 
 extern "C" int tqp_cuda_dequantize_row_d256_f16(const block_tq4p_d256 * x_host, uint16_t * y_host, int64_t k) {
-    return tqp_cuda_dequantize_row_host<block_tq4p_d256, uint16_t>(
-        QK_TQ4P_D256, x_host, y_host, k, dequantize_row_tq4p_d256_u16_cuda);
+    return tqp_cuda_dequantize_row_d256_b3_f16(x_host, y_host, k);
 }

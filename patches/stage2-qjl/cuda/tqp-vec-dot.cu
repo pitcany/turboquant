@@ -6,24 +6,23 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-// Q8_K block layout (matches ggml block_q8_K / block_q8k_compat).
 #define QK_Q8K 256
 #pragma pack(push, 1)
 typedef struct {
-    float   d;
-    int8_t  qs[QK_Q8K];
+    float d;
+    int8_t qs[QK_Q8K];
     int16_t bsums[QK_Q8K / 16];
 } block_q8k_cuda;
 #pragma pack(pop)
 
-// Dequantize Q8_K blocks to contiguous fp32.
-// Grid: (n_blocks,), Block: (256,).
 __global__ static void tqp_dequantize_q8k_kernel(
         const block_q8k_cuda * __restrict__ src,
         float * __restrict__ dst,
         int64_t n_blocks) {
     const int64_t b = (int64_t)blockIdx.x;
-    if (b >= n_blocks) return;
+    if (b >= n_blocks) {
+        return;
+    }
     const int tid = threadIdx.x;
     const float d = src[b].d;
     dst[b * QK_Q8K + tid] = d * (float)src[b].qs[tid];
@@ -31,6 +30,12 @@ __global__ static void tqp_dequantize_q8k_kernel(
 
 extern "C" void ggml_cuda_tqp_prepare_query_d128(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_d256(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d128_b2(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d128_b3(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d128_b4(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d256_b2(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d256_b3(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_d256_b4(const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream);
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
         const float * q, float * Sq, float * q_rot,
         int64_t ne11, int64_t ne12, int64_t ne13,
@@ -43,28 +48,64 @@ extern "C" void ggml_cuda_tqp_prepare_query_batch_d256(
         int64_t s11, int64_t s12, int64_t s13,
         uint8_t layer_byte,
         cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d128_b2(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d128_b3(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d128_b4(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d256_b2(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d256_b3(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d256_b4(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream);
 
-template<int D, typename Block>
+template<int D, int BITS, typename Block>
 __device__ static inline float tqp_vec_dot_block_device(
         const Block * __restrict__ blk,
         const float * __restrict__ Sq,
         const float * __restrict__ q_rot,
         const float * __restrict__ centroids) {
-    __shared__ uint8_t smem_qs[96];
-    __shared__ uint8_t smem_signs[32];
+    __shared__ uint8_t smem_qs[TQP_QS_BYTES(QK_TQP_D256, 4)];
+    __shared__ uint8_t smem_signs[TQP_SIGN_BYTES(QK_TQP_D256)];
     __shared__ float partial_t1[8];
     __shared__ float partial_t2[8];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int idx_bytes = D * 3 / 8;
-    const int sign_bytes = D / 8;
+    constexpr int IDX_BYTES = TQP_QS_BYTES(D, BITS);
+    constexpr int SIGN_BYTES = TQP_SIGN_BYTES(D);
 
-    for (int i = tid; i < idx_bytes; i += blockDim.x) {
+    for (int i = tid; i < IDX_BYTES; i += blockDim.x) {
         smem_qs[i] = blk->qs[i];
     }
-    for (int i = tid; i < sign_bytes; i += blockDim.x) {
+    for (int i = tid; i < SIGN_BYTES; i += blockDim.x) {
         smem_signs[i] = blk->qjl_signs[i];
     }
     __syncthreads();
@@ -75,7 +116,7 @@ __device__ static inline float tqp_vec_dot_block_device(
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
         const int elem = base + e;
-        const uint8_t idx = tqp_unpack_index_bitplane(smem_qs, elem);
+        const uint8_t idx = tqp_unpack_index_bitplane<BITS>(smem_qs, elem);
         const float sign_val = tqp_unpack_sign_pm1(smem_signs, elem);
         t1 += q_rot[elem] * centroids[idx];
         t2 += Sq[elem] * sign_val;
@@ -109,8 +150,9 @@ __device__ static inline float tqp_vec_dot_block_device(
     return 0.0f;
 }
 
-__global__ static void tqp_vec_dot_kernel_d128(
-        const block_tq4p_d128 * __restrict__ blocks,
+template<int D, int BITS, typename Block>
+__global__ static void tqp_vec_dot_kernel(
+        const Block * __restrict__ blocks,
         const float * __restrict__ Sq,
         const float * __restrict__ q_rot,
         float * __restrict__ out,
@@ -120,30 +162,13 @@ __global__ static void tqp_vec_dot_kernel_d128(
     if (b >= n_blocks) {
         return;
     }
-    const float result = tqp_vec_dot_block_device<QK_TQ4P_D128>(&blocks[b], Sq, q_rot, centroids);
+    const float result = tqp_vec_dot_block_device<D, BITS>(&blocks[b], Sq, q_rot, centroids);
     if (threadIdx.x == 0) {
         out[b] = result;
     }
 }
 
-__global__ static void tqp_vec_dot_kernel_d256(
-        const block_tq4p_d256 * __restrict__ blocks,
-        const float * __restrict__ Sq,
-        const float * __restrict__ q_rot,
-        float * __restrict__ out,
-        int64_t n_blocks,
-        const float * __restrict__ centroids) {
-    const int64_t b = (int64_t)blockIdx.x;
-    if (b >= n_blocks) {
-        return;
-    }
-    const float result = tqp_vec_dot_block_device<QK_TQ4P_D256>(&blocks[b], Sq, q_rot, centroids);
-    if (threadIdx.x == 0) {
-        out[b] = result;
-    }
-}
-
-template<int D, typename Block>
+template<int D, int BITS, typename Block>
 __global__ static void tqp_vec_dot_ggml_kernel(
         const Block * __restrict__ blocks,
         const float * __restrict__ Sq,
@@ -172,40 +197,33 @@ __global__ static void tqp_vec_dot_ggml_kernel(
     const float * Sq_i = Sq + query_index * D;
     const float * q_rot_i = q_rot + query_index * D;
 
-    const float result = tqp_vec_dot_block_device<D>(blk, Sq_i, q_rot_i, centroids);
+    const float result = tqp_vec_dot_block_device<D, BITS>(blk, Sq_i, q_rot_i, centroids);
     if (threadIdx.x == 0) {
         dst[sample_dst * d_s3 + channel_dst * d_s2 + col * d_s1 + row] = result;
     }
 }
 
-extern "C" void ggml_cuda_tqp_vec_dot_blocks_d128(
-        const void * blocks, const float * Sq, const float * q_rot,
-        float * out, int64_t n_blocks, cudaStream_t stream) {
-    if (tqp_cuda_init(QK_TQ4P_D128) != cudaSuccess) {
+template<int D, int BITS, typename Block>
+static void ggml_cuda_tqp_vec_dot_blocks_impl(
+        const void * blocks,
+        const float * Sq,
+        const float * q_rot,
+        float * out,
+        int64_t n_blocks,
+        cudaStream_t stream) {
+    if (tqp_cuda_init(D, BITS) != cudaSuccess) {
         return;
     }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
+    const TqpDeviceState * state = tqp_cuda_current_device_state();
+    if (!state) {
         return;
     }
-    tqp_vec_dot_kernel_d128<<<(unsigned int)n_blocks, 32, 0, stream>>>(
-        (const block_tq4p_d128 *)blocks, Sq, q_rot, out, n_blocks,
-        tqp_state->centroids_d128);
-}
-
-extern "C" void ggml_cuda_tqp_vec_dot_blocks_d256(
-        const void * blocks, const float * Sq, const float * q_rot,
-        float * out, int64_t n_blocks, cudaStream_t stream) {
-    if (tqp_cuda_init(QK_TQ4P_D256) != cudaSuccess) {
+    const float * centroids = tqp_cuda_centroids_ptr(state, D, BITS);
+    if (!centroids) {
         return;
     }
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
-    if (!tqp_state) {
-        return;
-    }
-    tqp_vec_dot_kernel_d256<<<(unsigned int)n_blocks, 64, 0, stream>>>(
-        (const block_tq4p_d256 *)blocks, Sq, q_rot, out, n_blocks,
-        tqp_state->centroids_d256);
+    tqp_vec_dot_kernel<D, BITS, Block><<<(unsigned int)n_blocks, D / 4, 0, stream>>>(
+        (const Block *)blocks, Sq, q_rot, out, n_blocks, centroids);
 }
 
 template<typename Block>
@@ -221,9 +239,6 @@ static int tqp_cuda_vec_dot_row_host(
         return 1;
     }
 
-    // All blocks in a single launch are assumed to share a layer_byte
-    // (layer + rotation) per the ggml per-layer tensor convention. Read
-    // it from the first host block.
     const uint8_t layer_byte = blocks_host[0].layer_idx;
 
     float * q_dev = nullptr;
@@ -273,50 +288,10 @@ done:
     return (int)err;
 }
 
-extern "C" int tqp_cuda_vec_dot_row_d128(
-        const float * q_host,
-        const block_tq4p_d128 * blocks_host,
-        float * out_host,
-        int64_t n_blocks) {
-    return tqp_cuda_vec_dot_row_host<block_tq4p_d128>(
-        QK_TQ4P_D128, q_host, blocks_host, out_host, n_blocks,
-        ggml_cuda_tqp_prepare_query_d128,
-        ggml_cuda_tqp_vec_dot_blocks_d128);
-}
-
-extern "C" int tqp_cuda_vec_dot_row_d256(
-        const float * q_host,
-        const block_tq4p_d256 * blocks_host,
-        float * out_host,
-        int64_t n_blocks) {
-    return tqp_cuda_vec_dot_row_host<block_tq4p_d256>(
-        QK_TQ4P_D256, q_host, blocks_host, out_host, n_blocks,
-        ggml_cuda_tqp_prepare_query_d256,
-        ggml_cuda_tqp_vec_dot_blocks_d256);
-}
-
-extern "C" float tqp_cuda_vec_dot_block_d128(
-        const float * q_host,
-        const block_tq4p_d128 * block_host) {
-    float out = 0.0f;
-    const int err = tqp_cuda_vec_dot_row_d128(q_host, block_host, &out, 1);
-    return err == 0 ? out : 0.0f;
-}
-
-extern "C" float tqp_cuda_vec_dot_block_d256(
-        const float * q_host,
-        const block_tq4p_d256 * block_host) {
-    float out = 0.0f;
-    const int err = tqp_cuda_vec_dot_row_d256(q_host, block_host, &out, 1);
-    return err == 0 ? out : 0.0f;
-}
-
-// Q8_K-aware test wrappers: dequantize Q8_K query to fp32 on device,
-// then run the existing prepare_query + vec_dot pipeline.
 template<typename Block>
 static int tqp_cuda_vec_dot_q8k_host(
         int d,
-        const void * q8k_host,    // block_q8k_cuda blocks
+        const void * q8k_host,
         const Block * blocks_host,
         float * out_host,
         int64_t n_blocks,
@@ -325,13 +300,6 @@ static int tqp_cuda_vec_dot_q8k_host(
     if (n_blocks <= 0) return 1;
 
     const uint8_t layer_byte = blocks_host[0].layer_idx;
-    // Q8_K has 256 elements per block. For d=128, d fits in 1/2 Q8K block;
-    // for d=256, d fits in 1 Q8K block. We still need to allocate a full
-    // n_q8k_blocks * QK_Q8K fp32 scratch because the dequantize kernel
-    // launches with QK_Q8K (=256) threads per block and each writes its
-    // slot — if we only sized for d floats, threads d..QK_Q8K-1 would run
-    // past the buffer end. Only the first d entries are consumed by
-    // prepare_query; the tail is harmlessly unused.
     const int64_t n_q8k_blocks = ((int64_t)d + QK_Q8K - 1) / QK_Q8K;
     const size_t q8k_bytes = (size_t)n_q8k_blocks * sizeof(block_q8k_cuda);
     const size_t q_fp32_bytes = (size_t)n_q8k_blocks * QK_Q8K * sizeof(float);
@@ -365,13 +333,11 @@ static int tqp_cuda_vec_dot_q8k_host(
     err = cudaMemcpy(blocks_dev, blocks_host, block_bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) goto done;
 
-    // Dequantize Q8_K to fp32 on device.
     tqp_dequantize_q8k_kernel<<<(unsigned int)n_q8k_blocks, QK_Q8K, 0, 0>>>(
         q8k_dev, q_fp32_dev, n_q8k_blocks);
     err = cudaGetLastError();
     if (err != cudaSuccess) goto done;
 
-    // Run prepare_query + vec_dot with the fp32 query.
     prepare_fn(q_fp32_dev, Sq_dev, q_rot_dev, layer_byte, 0);
     err = cudaGetLastError();
     if (err != cudaSuccess) goto done;
@@ -393,30 +359,104 @@ done:
     return (int)err;
 }
 
+#define TQP_DEFINE_VEC_DOT(D, BITS, BLOCK)                                                                                       \
+    extern "C" void ggml_cuda_tqp_vec_dot_blocks_d##D##_b##BITS(                                                                 \
+            const void * blocks, const float * Sq, const float * q_rot,                                                          \
+            float * out, int64_t n_blocks, cudaStream_t stream) {                                                                \
+        ggml_cuda_tqp_vec_dot_blocks_impl<QK_TQP_D##D, BITS, BLOCK>(blocks, Sq, q_rot, out, n_blocks, stream);                 \
+    }                                                                                                                             \
+    extern "C" int tqp_cuda_vec_dot_row_d##D##_b##BITS(                                                                          \
+            const float * q_host, const BLOCK * blocks_host, float * out_host, int64_t n_blocks) {                              \
+        return tqp_cuda_vec_dot_row_host<BLOCK>(                                                                                 \
+            QK_TQP_D##D, q_host, blocks_host, out_host, n_blocks,                                                                \
+            ggml_cuda_tqp_prepare_query_d##D##_b##BITS,                                                                          \
+            ggml_cuda_tqp_vec_dot_blocks_d##D##_b##BITS);                                                                        \
+    }                                                                                                                             \
+    extern "C" float tqp_cuda_vec_dot_block_d##D##_b##BITS(                                                                      \
+            const float * q_host, const BLOCK * block_host) {                                                                    \
+        float out = 0.0f;                                                                                                        \
+        const int err = tqp_cuda_vec_dot_row_d##D##_b##BITS(q_host, block_host, &out, 1);                                       \
+        return err == 0 ? out : 0.0f;                                                                                            \
+    }                                                                                                                             \
+    extern "C" int tqp_cuda_vec_dot_q8k_d##D##_b##BITS(                                                                          \
+            const void * q8k_host, const BLOCK * blocks_host, float * out_host, int64_t n_blocks) {                             \
+        return tqp_cuda_vec_dot_q8k_host<BLOCK>(                                                                                 \
+            QK_TQP_D##D, q8k_host, blocks_host, out_host, n_blocks,                                                              \
+            ggml_cuda_tqp_prepare_query_d##D##_b##BITS,                                                                          \
+            ggml_cuda_tqp_vec_dot_blocks_d##D##_b##BITS);                                                                        \
+    }
+
+TQP_DEFINE_VEC_DOT(128, 2, block_tqp_d128_b2)
+TQP_DEFINE_VEC_DOT(128, 3, block_tqp_d128_b3)
+TQP_DEFINE_VEC_DOT(128, 4, block_tqp_d128_b4)
+TQP_DEFINE_VEC_DOT(256, 2, block_tqp_d256_b2)
+TQP_DEFINE_VEC_DOT(256, 3, block_tqp_d256_b3)
+TQP_DEFINE_VEC_DOT(256, 4, block_tqp_d256_b4)
+
+#undef TQP_DEFINE_VEC_DOT
+
+extern "C" void ggml_cuda_tqp_vec_dot_blocks_d128(
+        const void * blocks, const float * Sq, const float * q_rot,
+        float * out, int64_t n_blocks, cudaStream_t stream) {
+    ggml_cuda_tqp_vec_dot_blocks_d128_b3(blocks, Sq, q_rot, out, n_blocks, stream);
+}
+
+extern "C" void ggml_cuda_tqp_vec_dot_blocks_d256(
+        const void * blocks, const float * Sq, const float * q_rot,
+        float * out, int64_t n_blocks, cudaStream_t stream) {
+    ggml_cuda_tqp_vec_dot_blocks_d256_b3(blocks, Sq, q_rot, out, n_blocks, stream);
+}
+
+extern "C" int tqp_cuda_vec_dot_row_d128(
+        const float * q_host, const block_tq4p_d128 * blocks_host, float * out_host, int64_t n_blocks) {
+    return tqp_cuda_vec_dot_row_d128_b3(q_host, blocks_host, out_host, n_blocks);
+}
+
+extern "C" int tqp_cuda_vec_dot_row_d256(
+        const float * q_host, const block_tq4p_d256 * blocks_host, float * out_host, int64_t n_blocks) {
+    return tqp_cuda_vec_dot_row_d256_b3(q_host, blocks_host, out_host, n_blocks);
+}
+
+extern "C" float tqp_cuda_vec_dot_block_d128(const float * q_host, const block_tq4p_d128 * block_host) {
+    return tqp_cuda_vec_dot_block_d128_b3(q_host, block_host);
+}
+
+extern "C" float tqp_cuda_vec_dot_block_d256(const float * q_host, const block_tq4p_d256 * block_host) {
+    return tqp_cuda_vec_dot_block_d256_b3(q_host, block_host);
+}
+
 extern "C" int tqp_cuda_vec_dot_q8k_d128(
-        const void * q8k_host,
-        const block_tq4p_d128 * blocks_host,
-        float * out_host,
-        int64_t n_blocks) {
-    return tqp_cuda_vec_dot_q8k_host<block_tq4p_d128>(
-        QK_TQ4P_D128, q8k_host, blocks_host, out_host, n_blocks,
-        ggml_cuda_tqp_prepare_query_d128,
-        ggml_cuda_tqp_vec_dot_blocks_d128);
+        const void * q8k_host, const block_tq4p_d128 * blocks_host, float * out_host, int64_t n_blocks) {
+    return tqp_cuda_vec_dot_q8k_d128_b3(q8k_host, blocks_host, out_host, n_blocks);
 }
 
 extern "C" int tqp_cuda_vec_dot_q8k_d256(
-        const void * q8k_host,
-        const block_tq4p_d256 * blocks_host,
-        float * out_host,
-        int64_t n_blocks) {
-    return tqp_cuda_vec_dot_q8k_host<block_tq4p_d256>(
-        QK_TQ4P_D256, q8k_host, blocks_host, out_host, n_blocks,
-        ggml_cuda_tqp_prepare_query_d256,
-        ggml_cuda_tqp_vec_dot_blocks_d256);
+        const void * q8k_host, const block_tq4p_d256 * blocks_host, float * out_host, int64_t n_blocks) {
+    return tqp_cuda_vec_dot_q8k_d256_b3(q8k_host, blocks_host, out_host, n_blocks);
 }
 
 #if __has_include("common.cuh")
 #include "common.cuh"
+
+static inline bool tqp_ggml_type_to_dbits(ggml_type type, int * d, int * bits) {
+    switch (type) {
+        case GGML_TYPE_TQ4P_D128: *d = QK_TQP_D128; *bits = 3; return true;
+        case GGML_TYPE_TQ4P_D256: *d = QK_TQP_D256; *bits = 3; return true;
+#ifdef GGML_TYPE_TQP_D128_B2
+        case GGML_TYPE_TQP_D128_B2: *d = QK_TQP_D128; *bits = 2; return true;
+#endif
+#ifdef GGML_TYPE_TQP_D128_B4
+        case GGML_TYPE_TQP_D128_B4: *d = QK_TQP_D128; *bits = 4; return true;
+#endif
+#ifdef GGML_TYPE_TQP_D256_B2
+        case GGML_TYPE_TQP_D256_B2: *d = QK_TQP_D256; *bits = 2; return true;
+#endif
+#ifdef GGML_TYPE_TQP_D256_B4
+        case GGML_TYPE_TQP_D256_B4: *d = QK_TQP_D256; *bits = 4; return true;
+#endif
+        default: return false;
+    }
+}
 
 extern "C" void ggml_cuda_op_tqp_vec_dot(
         ggml_backend_cuda_context & ctx,
@@ -425,12 +465,14 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
         ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_K);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256);
     GGML_ASSERT(ggml_is_contiguous(src0));
+
+    int d = 0;
+    int bits = 0;
+    GGML_ASSERT(tqp_ggml_type_to_dbits(src0->type, &d, &bits));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
-    const int d = src0->type == GGML_TYPE_TQ4P_D128 ? QK_TQ4P_D128 : QK_TQ4P_D256;
     GGML_ASSERT(ne00 == d);
     GGML_ASSERT(ne10 == d);
     GGML_ASSERT(nb0 == (int64_t)sizeof(float));
@@ -440,7 +482,7 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     GGML_ASSERT(ne3 % ne03 == 0);
 
     cudaStream_t stream = ctx.stream();
-    CUDA_CHECK(tqp_cuda_init(d));
+    CUDA_CHECK(tqp_cuda_init(d, bits));
 
     const int64_t n_queries = ne11 * ne12 * ne13;
     ggml_cuda_pool_alloc<float> Sq_alloc(ctx.pool(), n_queries * d);
@@ -448,10 +490,11 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     float * Sq = Sq_alloc.get();
     float * q_rot = q_rot_alloc.get();
 
-    // If src1 is Q8_K, dequantize to a contiguous fp32 buffer first.
     ggml_cuda_pool_alloc<float> q8k_fp32_alloc;
     const float * src1_d;
-    int64_t q_s11, q_s12, q_s13;
+    int64_t q_s11;
+    int64_t q_s12;
+    int64_t q_s13;
 
     if (src1->type == GGML_TYPE_Q8_K) {
         const int64_t n_elements = ggml_nelements(src1);
@@ -464,7 +507,6 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
         CUDA_CHECK(cudaGetLastError());
 
         src1_d = fp32_buf;
-        // After dequantize, data is contiguous: stride = d per column.
         q_s11 = (int64_t)d;
         q_s12 = ne11 * (int64_t)d;
         q_s13 = ne11 * ne12 * (int64_t)d;
@@ -476,23 +518,35 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
         q_s13 = nb13 / (int64_t)sizeof(float);
     }
 
-    // K-cache tensors are homogeneously one (layer, rotation) pair's worth
-    // of blocks; read the packed layer_byte from the first block via a
-    // 1-byte synchronous d2h copy and reuse it across all prepare_query
-    // and vec_dot launches in this op.
     uint8_t layer_byte = 0;
     {
         const uint8_t * first_block = (const uint8_t *)src0->data;
-        const size_t layer_byte_offset = offsetof(block_tq4p_d128, layer_idx);
-        CUDA_CHECK(cudaMemcpyAsync(&layer_byte, first_block + layer_byte_offset, 1,
-                                   cudaMemcpyDeviceToHost, stream));
+        const size_t layer_byte_offset = offsetof(block_tqp_d128_b2, layer_idx);
+        CUDA_CHECK(cudaMemcpyAsync(&layer_byte, first_block + layer_byte_offset, 1, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    if (d == QK_TQ4P_D128) {
-        ggml_cuda_tqp_prepare_query_batch_d128(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
-    } else {
-        ggml_cuda_tqp_prepare_query_batch_d256(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+    switch ((d << 8) | bits) {
+        case (QK_TQP_D128 << 8) | 2:
+            ggml_cuda_tqp_prepare_query_batch_d128_b2(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        case (QK_TQP_D128 << 8) | 3:
+            ggml_cuda_tqp_prepare_query_batch_d128_b3(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        case (QK_TQP_D128 << 8) | 4:
+            ggml_cuda_tqp_prepare_query_batch_d128_b4(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        case (QK_TQP_D256 << 8) | 2:
+            ggml_cuda_tqp_prepare_query_batch_d256_b2(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        case (QK_TQP_D256 << 8) | 3:
+            ggml_cuda_tqp_prepare_query_batch_d256_b3(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        case (QK_TQP_D256 << 8) | 4:
+            ggml_cuda_tqp_prepare_query_batch_d256_b4(src1_d, Sq, q_rot, ne11, ne12, ne13, q_s11, q_s12, q_s13, layer_byte, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported TQP CUDA vec-dot type");
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -505,22 +559,48 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
     const int64_t d_s3 = nb3 / (int64_t)sizeof(float);
     const int64_t channel_ratio = ne2 / ne02;
     const int64_t sample_ratio = ne3 / ne03;
-
     const dim3 grid((unsigned int)ne01, (unsigned int)ne11, (unsigned int)(ne2 * ne3));
     float * dst_d = (float *)dst->data;
 
-    const TqpDeviceState * tqp_state = tqp_cuda_current_device_state();
+    const TqpDeviceState * state = tqp_cuda_current_device_state();
+    const float * centroids = tqp_cuda_centroids_ptr(state, d, bits);
+    GGML_ASSERT(centroids != nullptr);
 
-    if (d == QK_TQ4P_D128) {
-        tqp_vec_dot_ggml_kernel<QK_TQ4P_D128, block_tq4p_d128><<<grid, 32, 0, stream>>>(
-            (const block_tq4p_d128 *)src0->data, Sq, q_rot, dst_d,
-            ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3,
-            channel_ratio, sample_ratio, tqp_state->centroids_d128);
-    } else {
-        tqp_vec_dot_ggml_kernel<QK_TQ4P_D256, block_tq4p_d256><<<grid, 64, 0, stream>>>(
-            (const block_tq4p_d256 *)src0->data, Sq, q_rot, dst_d,
-            ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3,
-            channel_ratio, sample_ratio, tqp_state->centroids_d256);
+    switch ((d << 8) | bits) {
+        case (QK_TQP_D128 << 8) | 2:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D128, 2, block_tqp_d128_b2><<<grid, QK_TQP_D128 / 4, 0, stream>>>(
+                (const block_tqp_d128_b2 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        case (QK_TQP_D128 << 8) | 3:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D128, 3, block_tqp_d128_b3><<<grid, QK_TQP_D128 / 4, 0, stream>>>(
+                (const block_tqp_d128_b3 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        case (QK_TQP_D128 << 8) | 4:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D128, 4, block_tqp_d128_b4><<<grid, QK_TQP_D128 / 4, 0, stream>>>(
+                (const block_tqp_d128_b4 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        case (QK_TQP_D256 << 8) | 2:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D256, 2, block_tqp_d256_b2><<<grid, QK_TQP_D256 / 4, 0, stream>>>(
+                (const block_tqp_d256_b2 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        case (QK_TQP_D256 << 8) | 3:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D256, 3, block_tqp_d256_b3><<<grid, QK_TQP_D256 / 4, 0, stream>>>(
+                (const block_tqp_d256_b3 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        case (QK_TQP_D256 << 8) | 4:
+            tqp_vec_dot_ggml_kernel<QK_TQP_D256, 4, block_tqp_d256_b4><<<grid, QK_TQP_D256 / 4, 0, stream>>>(
+                (const block_tqp_d256_b4 *)src0->data, Sq, q_rot, dst_d,
+                ne11, ne2, s01, s02, s03, d_s1, d_s2, d_s3, channel_ratio, sample_ratio, centroids);
+            break;
+        default:
+            GGML_ABORT("unsupported TQP CUDA vec-dot type");
     }
+
+    CUDA_CHECK(cudaGetLastError());
 }
 #endif

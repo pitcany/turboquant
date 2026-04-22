@@ -1,59 +1,59 @@
-# Byte layout spec — `TQ4P_D128` and `TQ4P_D256`
+# Byte layout spec — `TQP_D{dim}_B{bits}` and legacy `TQ4P_*` aliases
 
-All multi-byte fields are little-endian. fp16 is IEEE 754 half-precision
+All multi-byte fields are little-endian. `fp16` is IEEE 754 half-precision
 (round-to-nearest-even), matching `ggml_fp32_to_fp16` and
 `struct.pack('<e', ...)` in Python.
 
-## `block_tq4p_d128` (69 bytes per 128 elements = 4.3125 bpw)
+Legacy compatibility:
 
-| Offset | Size | Field | Notes |
-|---|---|---|---|
-| 0 | 2 | `orig_norm` (fp16) | `‖x‖` before unit normalization |
-| 2 | 2 | `res_d` (fp16) | `‖x_unit − Πᵀ · centroids[idx]‖` |
-| 4 | 1 | `layer_idx` (uint8) | Packed (rotation << 7) \| (layer & 0x1f); selects σ_i/Π_i/S_i and rotation mode |
-| 5 | 48 | `qs[48]` | 128 × 3-bit Lloyd-Max indices, bitplane-packed |
-| 53 | 16 | `qjl_signs[16]` | 128 × 1-bit sign bits (1 = negative) |
+- `tq4p_d128` = `tqp_d128_b3`
+- `tq4p_d256` = `tqp_d256_b3`
 
-## `block_tq4p_d256` (133 bytes per 256 elements = 4.15625 bpw)
+## Block sizes
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 2 | `orig_norm` (fp16) |
-| 2 | 2 | `res_d` (fp16) |
-| 4 | 1 | `layer_idx` (uint8) | Packed (rotation << 7) \| (layer & 0x1f) |
-| 5 | 96 | `qs[96]` — 256 × 3-bit indices |
-| 101 | 32 | `qjl_signs[32]` — 256 × 1-bit signs |
+| Type | Offset 0..1 | Offset 2..3 | Offset 4 | `qs` bytes | `qjl_signs` bytes | total |
+|---|---|---|---|---:|---:|---:|
+| `tqp_d128_b2` | `orig_norm` | `res_d` | `layer_idx` | 32 | 16 | 53 |
+| `tqp_d128_b3` / `tq4p_d128` | `orig_norm` | `res_d` | `layer_idx` | 48 | 16 | 69 |
+| `tqp_d128_b4` | `orig_norm` | `res_d` | `layer_idx` | 64 | 16 | 85 |
+| `tqp_d256_b2` | `orig_norm` | `res_d` | `layer_idx` | 64 | 32 | 101 |
+| `tqp_d256_b3` / `tq4p_d256` | `orig_norm` | `res_d` | `layer_idx` | 96 | 32 | 133 |
+| `tqp_d256_b4` | `orig_norm` | `res_d` | `layer_idx` | 128 | 32 | 165 |
 
-## 3-bit bitplane index packing
+`orig_norm` stores `‖x‖` before unit normalization. `res_d` stores
+`‖x_unit − Πᵀ · centroids[idx]‖`.
 
-For each group of 8 consecutive coordinates, 3 bytes are emitted:
+## Bitplane index packing
 
-```
-byte[0]  bit i = (idx_i >> 0) & 1       // low bits
-byte[1]  bit i = (idx_i >> 1) & 1       // mid bits
-byte[2]  bit i = (idx_i >> 2) & 1       // high bits
+For each group of 8 consecutive coordinates, `bits` bytes are emitted:
+
+```text
+byte[plane] bit i = (idx_i >> plane) & 1
 ```
 
-d=128 → 16 groups × 3 B = 48 B.
-d=256 → 32 groups × 3 B = 96 B.
+Examples:
+
+- `d=128, bits=2` → 16 groups × 2 B = 32 B
+- `d=128, bits=4` → 16 groups × 4 B = 64 B
+- `d=256, bits=3` → 32 groups × 3 B = 96 B
 
 This is the standard ggml bitplane pattern. Unpacking is branchless bitwise
-ops; the 3 planes are independent so SIMD / warp can broadcast each plane.
+ops; the planes are independent so SIMD / warps can broadcast each plane.
 
 ## QJL sign packing
 
 Sign for coord `i` lives at bit `i % 8` of byte `qjl_signs[i / 8]`.
 
-- bit set (1) → sign is **negative**
-- bit clear (0) → sign is **positive**
+- bit set (1) → sign is negative
+- bit clear (0) → sign is positive
 
 ## Packed layer / rotation byte
 
 Each block stores a packed byte at offset 4:
 
-```
+```text
 bit 7        = rotation (0 = TQP_ROT_WHT, 1 = TQP_ROT_HAAR)
-bits 5..6    = reserved (must be 0)
+bits 5..6    = reserved (must be 0 in stored blocks)
 bits 0..4    = layer_idx (0..31)
 ```
 
@@ -65,25 +65,19 @@ Use `TQP_LAYER_BYTE(layer, rotation)` / `TQP_EXTRACT_LAYER` /
 Every layer has three pre-generated constants, all selected via the low
 5 bits of the packed byte:
 
-- **σ_i** (WHT sign vector): `(2 * torch.randint(0, 2, (d,), gen(seed=42+i)) - 1).float()`.
-- **Π_i** (Haar rotation): `generate_rotation_matrix(d, seed=42+i)`
-  (dense d×d, matches `turboquant.py::TurboQuantProd(seed=42+i)`).
-- **S_i** (Gaussian QJL): `generate_qjl_matrix(d, m=d, seed=43+i)`.
+- `σ_i` (WHT sign vector): `(2 * torch.randint(0, 2, (d,), gen(seed=42+i)) - 1).float()`
+- `Π_i` (Haar rotation): `generate_rotation_matrix(d, seed=42+i)`
+- `S_i` (Gaussian QJL): `generate_qjl_matrix(d, m=d, seed=43+i)`
 
-The kernel uses σ_i when bit 7 is clear (WHT) and Π_i when it's set (Haar).
-S_i is used in both modes (QJL operates on the residual in original space,
-not rotated space). Centroids and boundaries are shared across all layers
-and rotations — they depend only on the post-rotation marginal, which
-for d ≥ 64 is the same Gaussian-approximated distribution under Haar and
-RHT (identical on uniform unit vectors by sphere symmetry).
+The kernel uses `σ_i` when bit 7 is clear (WHT) and `Π_i` when it's set
+(Haar). `S_i` is used in both modes because QJL operates on the residual in
+original space, not rotated space.
 
-32 layers are precomputed (layer_idx in [0, 31]). The layer index and
-rotation mode are passed explicitly at quantize time; they are not
-derived from tensor naming.
+Centroids and boundaries are shared across all layers and rotations for a
+given `(d, bits)` pair and live in the generated headers as:
 
-## Reference data
+- `TQP_CENTROIDS_D{D}_B{B}[2^B]`
+- `TQP_BOUNDARIES_D{D}_B{B}[2^B - 1]`
 
-Per-layer data lives in the C headers as:
-- `TQP_SIGMA_D{D}[32][D]`: ±1 fp32 sign vector per layer (for WHT).
-- `TQP_PI_D{D}[32][D*D]`: fp32 Haar rotation matrix per layer, row-major.
-- `TQP_S_D{D}[32][D*D]`: fp32 QJL matrix per layer, row-major.
+The legacy headers `tqp_centroids_d{D}.h` alias the B3 symbols to preserve
+the original include names.

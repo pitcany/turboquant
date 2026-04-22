@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build ollama with the TurboQuant paper-faithful TQ4P KV cache.
+# Build ollama with the configurable-bit-width TurboQuant KV cache.
 #
 # Patches ollama's OWN vendored ggml in place. No llama.cpp fork is cloned
 # or symlinked.
 #
 # Three additive patches:
-#   1. TQ4P ggml quant types, dropped into  ml/backend/ggml/ggml/src/
+#   1. TQP/TQ4P ggml quant types, dropped into ml/backend/ggml/ggml/src/
 #      and registered via 4 hooks in that same tree.
-#   2. ollama Go KV-cache-type allowlist widened to accept "tq4p_d128" and
-#      "tq4p_d256".
+#   2. ollama Go KV-cache-type allowlist widened to accept the legacy
+#      "tq4p_d128"/"tq4p_d256" aliases plus the explicit "tqp_d*_b*" names.
 #   3. ollama Go plumbing: switch-case entries in 4 Go files so the
 #      cache-type strings map to the correct GGML enum values end-to-end.
 #
@@ -104,15 +104,18 @@ if [[ ! -f "$GGML/include/ggml.h" ]]; then
     exit 1
 fi
 
-# ---- Apply TQ4P patch --------------------------------------------------------
+# ---- Apply TQP/TQ4P patch ----------------------------------------------------
 
-echo "[+] regenerating TQ4P constants (Π, S, Lloyd-Max)"
-(cd "$STAGE2_DIR/python" && python3 generate_constants.py --out-c ../c --out-pt ../c >/dev/null)
+echo "[+] regenerating TQP constants (Π, S, Lloyd-Max)"
+(cd "$STAGE2_DIR/python" && python3 generate_constants.py --bits 2,3,4 --dims 64,128,256 --out-c ../c --out-pt ../c >/dev/null)
 
 GGML_SRC="$GGML/src"
-echo "[+] copying TQ4P sources into $GGML_SRC/"
+echo "[+] copying TQP/TQ4P sources into $GGML_SRC/"
 for f in ggml-tq-paper.h ggml-tq-paper.c \
          tqp_centroids_d64.h tqp_centroids_d128.h tqp_centroids_d256.h \
+         tqp_centroids_d64_b2.h tqp_centroids_d64_b3.h tqp_centroids_d64_b4.h \
+         tqp_centroids_d128_b2.h tqp_centroids_d128_b3.h tqp_centroids_d128_b4.h \
+         tqp_centroids_d256_b2.h tqp_centroids_d256_b3.h tqp_centroids_d256_b4.h \
          tqp_constants_d64.h tqp_constants_d128.h tqp_constants_d256.h; do
     cp "$STAGE2_DIR/c/$f" "$GGML_SRC/"
 done
@@ -128,6 +131,8 @@ if [[ "$CUDA" = "1" ]]; then
         done
         for f in tqp_constants_d128.h tqp_constants_d256.h \
                  tqp_centroids_d128.h tqp_centroids_d256.h \
+                 tqp_centroids_d128_b2.h tqp_centroids_d128_b3.h tqp_centroids_d128_b4.h \
+                 tqp_centroids_d256_b2.h tqp_centroids_d256_b3.h tqp_centroids_d256_b4.h \
                  ggml-tq-paper.h; do
             cp "$STAGE2_DIR/c/$f" "$GGML_CUDA/"
         done
@@ -143,7 +148,7 @@ bash "$APPLY_HOOKS" "$GGML"
 
 bash "$PATCH_ALLOWLIST" "$OLLAMA_DIR"
 
-# ---- Patch Go switch statements so tq4p types resolve end-to-end ------------
+# ---- Patch Go switch statements so TQP/TQ4P types resolve end-to-end --------
 
 bash "$APPLY_GO_PLUMBING" "$OLLAMA_DIR"
 
@@ -228,8 +233,14 @@ $(ls "$OLLAMA_DIR"/*.so* "$OLLAMA_DIR"/cuda_v*/*.so 2>/dev/null | sed 's|.*/||;s
 Run with:
     OLLAMA_KV_CACHE_TYPE=tq4p_d128 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
 
+Explicit bit-width selection:
+    OLLAMA_KV_CACHE_TYPE=tqp_d128_b2 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tqp_d128_b4 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+
 For Qwen 3.5 (head_dim=256):
     OLLAMA_KV_CACHE_TYPE=tq4p_d256 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tqp_d256_b2 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
+    OLLAMA_KV_CACHE_TYPE=tqp_d256_b4 OLLAMA_FLASH_ATTENTION=1 $OLLAMA_DIR/ollama serve
 
 TQ4P now registers CUDA dequantizers for ggml-cuda's flash-attention staging
 buffer, so flash attention can stay enabled for TQ4P KV cache runs.

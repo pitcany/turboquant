@@ -18,7 +18,7 @@
 set -euo pipefail
 
 OLLAMA_DIR="${1:?usage: apply_go_plumbing.sh <ollama-source-dir>}"
-MARKER='DTypeTQ4P_D128'          # Go-visible marker in backend.go
+MARKER='DTypeTQP_D128_B2'        # Go-visible marker in backend.go
 MARKER_LLAMA='GGML_TYPE_TQ4P'    # C-visible marker in llama.go
 MARKER_STR='tq4p_d128'           # string literal marker in both cache switches
 
@@ -65,6 +65,10 @@ if anchor not in text:
 insertion = (
     "\tDTypeTQ4P_D128\n"
     "\tDTypeTQ4P_D256\n"
+    "\tDTypeTQP_D128_B2\n"
+    "\tDTypeTQP_D128_B4\n"
+    "\tDTypeTQP_D256_B2\n"
+    "\tDTypeTQP_D256_B4\n"
 )
 text = text.replace(anchor, anchor.rstrip('\r\n') + '\n' + insertion, 1)
 path.write_text(text)
@@ -74,6 +78,7 @@ PY
 # ---------- 2. ml/backend/ggml/ggml.go — DType() and ggmlDType() ------------
 
 GGML_GO="$OLLAMA_DIR/ml/backend/ggml/ggml.go"
+FS_GGML_GO="$OLLAMA_DIR/fs/ggml/ggml.go"
 info "patching DType() and ggmlDType() in $GGML_GO"
 patch_file "$GGML_GO" "$MARKER" - "$GGML_GO" <<'PY'
 import sys, pathlib
@@ -94,6 +99,14 @@ insert_dtype = (
     "\t\treturn ml.DTypeTQ4P_D128\n"
     "\tcase C.GGML_TYPE_TQ4P_D256:\n"
     "\t\treturn ml.DTypeTQ4P_D256\n"
+    "\tcase C.GGML_TYPE_TQP_D128_B2:\n"
+    "\t\treturn ml.DTypeTQP_D128_B2\n"
+    "\tcase C.GGML_TYPE_TQP_D128_B4:\n"
+    "\t\treturn ml.DTypeTQP_D128_B4\n"
+    "\tcase C.GGML_TYPE_TQP_D256_B2:\n"
+    "\t\treturn ml.DTypeTQP_D256_B2\n"
+    "\tcase C.GGML_TYPE_TQP_D256_B4:\n"
+    "\t\treturn ml.DTypeTQP_D256_B4\n"
 )
 text = text.replace(anchor_dtype, anchor_dtype + insert_dtype, 1)
 
@@ -109,6 +122,14 @@ insert_ggml = (
     "\t\treturn C.GGML_TYPE_TQ4P_D128\n"
     "\tcase ml.DTypeTQ4P_D256:\n"
     "\t\treturn C.GGML_TYPE_TQ4P_D256\n"
+    "\tcase ml.DTypeTQP_D128_B2:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D128_B2\n"
+    "\tcase ml.DTypeTQP_D128_B4:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D128_B4\n"
+    "\tcase ml.DTypeTQP_D256_B2:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D256_B2\n"
+    "\tcase ml.DTypeTQP_D256_B4:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D256_B4\n"
 )
 text = text.replace(anchor_ggml, anchor_ggml + insert_ggml, 1)
 
@@ -138,6 +159,14 @@ insert = (
     '\t\treturn ml.DTypeTQ4P_D128\n'
     '\tcase "tq4p_d256":\n'
     '\t\treturn ml.DTypeTQ4P_D256\n'
+    '\tcase "tqp_d128_b2":\n'
+    '\t\treturn ml.DTypeTQP_D128_B2\n'
+    '\tcase "tqp_d128_b4":\n'
+    '\t\treturn ml.DTypeTQP_D128_B4\n'
+    '\tcase "tqp_d256_b2":\n'
+    '\t\treturn ml.DTypeTQP_D256_B2\n'
+    '\tcase "tqp_d256_b4":\n'
+    '\t\treturn ml.DTypeTQP_D256_B4\n'
 )
 text = text.replace(anchor, anchor + insert, 1)
 path.write_text(text)
@@ -165,6 +194,14 @@ insert = (
     '\t\treturn C.GGML_TYPE_TQ4P_D128\n'
     '\tcase "tq4p_d256":\n'
     '\t\treturn C.GGML_TYPE_TQ4P_D256\n'
+    '\tcase "tqp_d128_b2":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D128_B2\n'
+    '\tcase "tqp_d128_b4":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D128_B4\n'
+    '\tcase "tqp_d256_b2":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D256_B2\n'
+    '\tcase "tqp_d256_b4":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D256_B4\n'
 )
 text = text.replace(anchor, anchor + insert, 1)
 path.write_text(text)
@@ -173,56 +210,139 @@ PY
 
 # ---------- 5. ml/backend/ggml/ggml.go — Copy() op_params for TQ4P ----------
 
-MARKER_COPY='tq4p_layer_byte'
+MARKER_COPY='tqp_layer_byte_explicit_bits'
 info "patching Copy() to set op_params[0] for TQ4P in $GGML_GO"
 patch_file "$GGML_GO" "$MARKER_COPY" - "$GGML_GO" <<'PY'
-import sys, pathlib
+import sys, pathlib, re
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 
-# Anchor: the Copy method body.
-old_copy = (
-    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
-    '\treturn &Tensor{\n'
-    '\t\tb: t.b,\n'
-    '\t\tt: C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),\n'
-    '\t}\n'
-    '}'
+# Regex-based replacement: match the entire Copy() method body regardless of
+# its current state (pristine, tq4p-only, or explicit-bits). This avoids
+# accumulating whole-function fallback chains for each patch generation.
+copy_re = re.compile(
+    r'(func \(t \*Tensor\) Copy\(ctx ml\.Context, t2 ml\.Tensor\) ml\.Tensor \{)'
+    r'.*?'
+    r'(\n\})',
+    re.DOTALL,
 )
-if old_copy not in text:
-    print(f"ERROR: Copy() method not found in {path}", file=sys.stderr)
-    sys.exit(1)
 
-# Replace with version that sets op_params[0] = layer_byte for TQ4P.
-# The tq4p_layer_byte marker allows idempotent re-patching.
-new_copy = (
-    'func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {\n'
+new_body = (
+    r'\1' '\n'
     '\tresult := C.ggml_cpy(ctx.(*Context).ctx, t.t, t2.(*Tensor).t)\n'
-    '\t// tq4p_layer_byte: pass layer index to CUDA quantize dispatch.\n'
+    '\t// tqp_layer_byte_explicit_bits: pass layer index to CUDA quantize dispatch.\n'
     '\tc := ctx.(*Context)\n'
     '\tif c.layer >= 0 {\n'
     '\t\tdstType := t2.(*Tensor).t._type\n'
-    '\t\tif dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 {\n'
+    '\t\tif dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 ||\n'
+    '\t\t\tdstType == C.GGML_TYPE_TQP_D128_B2 || dstType == C.GGML_TYPE_TQP_D128_B4 ||\n'
+    '\t\t\tdstType == C.GGML_TYPE_TQP_D256_B2 || dstType == C.GGML_TYPE_TQP_D256_B4 {\n'
     '\t\t\tresult.op_params[0] = C.int32_t(c.layer & 0x1f)\n'
     '\t\t}\n'
     '\t}\n'
     '\treturn &Tensor{b: t.b, t: result}\n'
     '}'
 )
-text = text.replace(old_copy, new_copy, 1)
+
+new_text, count = copy_re.subn(new_body, text, count=1)
+if count == 0:
+    print(f"ERROR: Copy() method not found in {path}", file=sys.stderr)
+    sys.exit(1)
+text = new_text
 path.write_text(text)
 print(f"[+] patched Copy() for TQ4P layer_byte: {path}")
 PY
 
-# ---------- 6. OLLAMA_TQP_ROTATION init hook ---------------------------------
+# ---------- 6. model-aware KV cache type guard --------------------------------
+#
+# Ollama's SupportsKVCacheType() is only a string allowlist upstream. For the
+# TurboQuant d128/d256 families that is insufficient: a d256 cache type must
+# only be used when the model's resolved key/value head lengths are 256.
+
+MARKER_KV_SUPPORT='tqp_kv_cache_head_dim_guard'
+info "patching SupportsKVCacheType() head-dim guard in $FS_GGML_GO"
+patch_file "$FS_GGML_GO" "$MARKER_KV_SUPPORT" - "$FS_GGML_GO" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+old_support = (
+    '// SupportsKVCacheType checks if the requested cache type is supported\n'
+    'func (f GGML) SupportsKVCacheType(cacheType string) bool {\n'
+    '\tif cacheType == "" || cacheType == "f16" {\n'
+    '\t\treturn true\n'
+    '\t}\n'
+    '\n'
+    '\treturn slices.Contains([]string{"q8_0", "q4_0", "tq3_0", "tq4p_d128", "tq4p_d256", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"}, cacheType)\n'
+    '}\n'
+)
+old_support_pristine = (
+    '// SupportsKVCacheType checks if the requested cache type is supported\n'
+    'func (f GGML) SupportsKVCacheType(cacheType string) bool {\n'
+    '\tif cacheType == "" || cacheType == "f16" {\n'
+    '\t\treturn true\n'
+    '\t}\n'
+    '\n'
+    '\treturn slices.Contains([]string{"q8_0", "q4_0"}, cacheType)\n'
+    '}\n'
+)
+
+new_support = (
+    '// tqp_kv_cache_head_dim_guard: constrain TurboQuant KV types to models\n'
+    '// whose resolved key/value head lengths match the requested block size.\n'
+    'func kvCacheTypeHeadDim(cacheType string) (uint64, bool) {\n'
+    '\tswitch cacheType {\n'
+    '\tcase "tq4p_d128", "tqp_d128_b2", "tqp_d128_b4":\n'
+    '\t\treturn 128, true\n'
+    '\tcase "tq4p_d256", "tqp_d256_b2", "tqp_d256_b4":\n'
+    '\t\treturn 256, true\n'
+    '\tdefault:\n'
+    '\t\treturn 0, false\n'
+    '\t}\n'
+    '}\n'
+    '\n'
+    '// SupportsKVCacheType checks if the requested cache type is supported.\n'
+    'func (f GGML) SupportsKVCacheType(cacheType string) bool {\n'
+    '\tif cacheType == "" || cacheType == "f16" {\n'
+    '\t\treturn true\n'
+    '\t}\n'
+    '\n'
+    '\tif !slices.Contains([]string{"q8_0", "q4_0", "tq3_0", "tq4p_d128", "tq4p_d256", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"}, cacheType) {\n'
+    '\t\treturn false\n'
+    '\t}\n'
+    '\n'
+    '\texpectedHeadDim, constrained := kvCacheTypeHeadDim(cacheType)\n'
+    '\tif !constrained {\n'
+    '\t\treturn true\n'
+    '\t}\n'
+    '\n'
+    '\theadCountK := f.KV().EmbeddingHeadCountK()\n'
+    '\theadCountV := f.KV().EmbeddingHeadCountV()\n'
+    '\treturn headCountK == expectedHeadDim && headCountV == expectedHeadDim\n'
+    '}\n'
+)
+
+if old_support in text:
+    text = text.replace(old_support, new_support, 1)
+elif old_support_pristine in text:
+    text = text.replace(old_support_pristine, new_support, 1)
+else:
+    print(f"ERROR: SupportsKVCacheType() block not found in {path}", file=sys.stderr)
+    sys.exit(1)
+path.write_text(text)
+print(f"[+] patched SupportsKVCacheType() head-dim guard: {path}")
+PY
+
+# ---------- 7. OLLAMA_TQP_ROTATION init hook ---------------------------------
 #
 # Read the env var once at ollama startup and call tqp_set_default_rotation
 # via cgo. This ensures the process-level default is set before any quantize
 # call. The C library also reads the env var via pthread_once on first use,
 # but this explicit init allows the Go layer to log the choice.
 
-MARKER_ROT_INIT='tqp_rotation_init'
+MARKER_ROT_INIT='tqp_set_default_rotation(uint8_t rot);'
 info "patching rotation init in $GGML_GO"
 patch_file "$GGML_GO" "$MARKER_ROT_INIT" - "$GGML_GO" <<'PY'
 import sys, pathlib
@@ -230,22 +350,19 @@ import sys, pathlib
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 
-# Find the init() function or the end of import block. We'll add a standalone
-# init function that calls tqp_set_default_rotation via cgo.
-# Look for "import \"C\"" — this is where cgo declarations live.
-anchor = 'import "C"\n'
-if anchor not in text:
-    print(f"WARNING: 'import \"C\"' not found in {path}; skipping rotation init", file=sys.stderr)
+# Add the cgo declaration into the preamble immediately before import "C".
+preamble_anchor = '// #include "ggml-backend.h"\nimport "C"\n'
+if preamble_anchor in text:
+    text = text.replace(
+        preamble_anchor,
+        '// #include "ggml-backend.h"\n// void tqp_set_default_rotation(uint8_t rot);\nimport "C"\n',
+        1,
+    )
+elif 'tqp_set_default_rotation(uint8_t rot);' not in text:
+    print(f"WARNING: cgo preamble anchor not found in {path}; skipping rotation init", file=sys.stderr)
     sys.exit(0)
 
-# Add the rotation init function after the imports section.
-# Find the first func declaration to insert before it.
 import re
-func_match = re.search(r'^func ', text, re.MULTILINE)
-if not func_match:
-    print(f"WARNING: no func found in {path}; skipping rotation init", file=sys.stderr)
-    sys.exit(0)
-
 init_code = (
     '// tqp_rotation_init: read OLLAMA_TQP_ROTATION env var and forward\n'
     '// to the C rotation selector.  Called from init().\n'
@@ -267,20 +384,16 @@ init_code = (
     '}\n\n'
 )
 
-# Check if os is already imported
 if '"os"' not in text:
-    # Add os import
     text = text.replace('import "C"\n', 'import "C"\nimport "os"\n', 1)
-    # `func_match` was computed before this mutation; the `import "C"` line
-    # sits before the first func declaration, so inserting "import \"os\"\n"
-    # after it shifts every subsequent offset (including func_match.start())
-    # by the length of the inserted text. Recompute to stay in sync.
+
+if 'tqp_rotation_init: read OLLAMA_TQP_ROTATION env var and forward' not in text:
     func_match = re.search(r'^func ', text, re.MULTILINE)
     if not func_match:
-        print(f"WARNING: no func found in {path} after os import; skipping rotation init", file=sys.stderr)
+        print(f"WARNING: no func found in {path}; skipping rotation init", file=sys.stderr)
         sys.exit(0)
+    text = text[:func_match.start()] + init_code + text[func_match.start():]
 
-text = text[:func_match.start()] + init_code + text[func_match.start():]
 path.write_text(text)
 print(f"[+] patched rotation init: {path}")
 PY
