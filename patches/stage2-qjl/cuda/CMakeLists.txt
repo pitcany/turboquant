@@ -15,6 +15,7 @@ add_library(ggml_tq_paper_cuda SHARED
     tqp-prepare-query.cu
     tqp-vec-dot.cu
     tqp-dequantize.cu
+    tqp-set-rows.cu
 )
 
 target_include_directories(ggml_tq_paper_cuda PRIVATE

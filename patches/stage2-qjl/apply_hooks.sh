@@ -42,7 +42,7 @@ MARKER="tq4p"
 if grep -qi "$MARKER" "$GGML_H" 2>/dev/null; then
     echo "[=] ggml.h already patched"
 else
-    echo "[+] ggml.h: adding TQ4P_D128/TQ4P_D256 enum values"
+    echo "[+] ggml.h: adding TQ4P + explicit TQP enum values"
     python3 - "$GGML_H" <<'PY'
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1])
@@ -52,25 +52,33 @@ t = re.sub(r'\s*//.*TurboQuant paper-faithful.*\n', '', t)
 t = re.sub(r'\s*//.*See src/ggml-tq-paper\.h.*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQ4P_D128\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQ4P_D256\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D128_B2\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D128_B4\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D256_B2\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D256_B4\s*=\s*\d+,\s*\n', '', t)
 m = re.search(r"\s*GGML_TYPE_COUNT\s*=\s*(\d+),", t)
 if not m:
     sys.exit("ggml.h: no GGML_TYPE_COUNT line found")
 n = int(m.group(1))
 insert = (
     "\n"
-    "        // TurboQuant paper-faithful (Haar rotation + Lloyd-Max + QJL).\n"
+    "        // TurboQuant paper-faithful (Haar/WHT rotation + Lloyd-Max + QJL).\n"
     "        // See src/ggml-tq-paper.h. Added by patches/stage2-qjl.\n"
     f"        GGML_TYPE_TQ4P_D128 = {n},\n"
-    f"        GGML_TYPE_TQ4P_D256 = {n+1},"
+    f"        GGML_TYPE_TQ4P_D256 = {n+1},\n"
+    f"        GGML_TYPE_TQP_D128_B2 = {n+2},\n"
+    f"        GGML_TYPE_TQP_D128_B4 = {n+3},\n"
+    f"        GGML_TYPE_TQP_D256_B2 = {n+4},\n"
+    f"        GGML_TYPE_TQP_D256_B4 = {n+5},"
 )
 t = t[:m.start()] + insert + re.sub(
     r"GGML_TYPE_COUNT\s*=\s*\d+,",
-    f"GGML_TYPE_COUNT   = {n+2},",
+    f"GGML_TYPE_COUNT   = {n+6},",
     t[m.start():],
     count=1,
 )
 p.write_text(t)
-print(f"[+] TQ4P_D128 = {n}, TQ4P_D256 = {n+1}, COUNT -> {n+2}")
+print(f"[+] TQ4P_D128 = {n}, TQ4P_D256 = {n+1}, TQP_D128_B2 = {n+2}, TQP_D128_B4 = {n+3}, TQP_D256_B2 = {n+4}, TQP_D256_B4 = {n+5}, COUNT -> {n+6}")
 PY
 fi
 
@@ -128,6 +136,38 @@ entries = (
     "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d256,\n"
     "        .from_float_ref           = ggml_quantize_row_tq4p_d256_default,\n"
     "    },\n"
+    "    [GGML_TYPE_TQP_D128_B2] = {\n"
+    "        .type_name                = \"tqp_d128_b2\",\n"
+    "        .blck_size                = QK_TQP_D128,\n"
+    "        .type_size                = sizeof(block_tqp_d128_b2),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d128_b2,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d128_b2_default,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D128_B4] = {\n"
+    "        .type_name                = \"tqp_d128_b4\",\n"
+    "        .blck_size                = QK_TQP_D128,\n"
+    "        .type_size                = sizeof(block_tqp_d128_b4),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d128_b4,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d128_b4_default,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D256_B2] = {\n"
+    "        .type_name                = \"tqp_d256_b2\",\n"
+    "        .blck_size                = QK_TQP_D256,\n"
+    "        .type_size                = sizeof(block_tqp_d256_b2),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d256_b2,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d256_b2_default,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D256_B4] = {\n"
+    "        .type_name                = \"tqp_d256_b4\",\n"
+    "        .blck_size                = QK_TQP_D256,\n"
+    "        .type_size                = sizeof(block_tqp_d256_b4),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d256_b4,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d256_b4_default,\n"
+    "    },\n"
 )
 t = t[:close] + entries + t[close:]
 p.write_text(t)
@@ -184,6 +224,30 @@ entries = (
     "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_bf16,\n"
     "        // .from_float_f16        = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_f16,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d256_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D128_B2] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d128_b2_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d128_b2_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D128_B4] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d128_b4_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d128_b4_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D256_B2] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d256_b2_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d256_b2_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D256_B4] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d256_b4_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d256_b4_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"
     "    },\n"
@@ -264,7 +328,10 @@ if not split_line:
 insert_at = sig.end() + split_line.end()
 dispatch = (
     '\n'
-    '    if (!split && (src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256)) {\n'
+    '    if (!split && (\n'
+    '            src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '            src0->type == GGML_TYPE_TQP_D128_B2 || src0->type == GGML_TYPE_TQP_D128_B4 ||\n'
+    '            src0->type == GGML_TYPE_TQP_D256_B2 || src0->type == GGML_TYPE_TQP_D256_B4)) {\n'
     '        ggml_cuda_op_tqp_vec_dot(ctx, src0, src1, dst);\n'
     '        return;\n'
     '    }\n'
@@ -277,7 +344,7 @@ fi
 
 # ---------- 6. ggml-cuda.cu: F32 → TQ4P on-device quantize in CPY dispatch ----
 if [[ -f "$CUDA_CU" && -f "$GGML/src/ggml-cuda/tqp-quantize.cu" ]]; then
-    if grep -q "ggml_cuda_tqp_quantize_row" "$CUDA_CU" 2>/dev/null; then
+    if grep -q "ggml_cuda_tqp_quantize_row_d128_b2" "$CUDA_CU" 2>/dev/null; then
         echo "[=] ggml-cuda.cu CPY→TQ4P dispatch already patched"
     else
         echo "[+] ggml-cuda.cu: F32 → TQ4P on-device quantize in CPY dispatch"
@@ -299,6 +366,18 @@ quant_decl = (
     'extern "C" void ggml_cuda_tqp_quantize_row_d256(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
     '    cudaStream_t stream);\n'
+    'extern "C" void ggml_cuda_tqp_quantize_row_d128_b2(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
+    'extern "C" void ggml_cuda_tqp_quantize_row_d128_b4(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
+    'extern "C" void ggml_cuda_tqp_quantize_row_d256_b2(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
+    'extern "C" void ggml_cuda_tqp_quantize_row_d256_b4(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n'
 )
 idx = t.index(vec_dot_decl)
 # Insert before the vec_dot declaration
@@ -316,7 +395,10 @@ new_cpy = (
     '            {\n'
     '                const ggml_tensor * cpy_src = dst->src[0];\n'
     '                ggml_tensor * cpy_dst = dst->src[1];\n'
-    '                const bool dst_tq4p = (cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256);\n'
+    '                const bool dst_tq4p = (\n'
+    '                    cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                    cpy_dst->type == GGML_TYPE_TQP_D128_B2 || cpy_dst->type == GGML_TYPE_TQP_D128_B4 ||\n'
+    '                    cpy_dst->type == GGML_TYPE_TQP_D256_B2 || cpy_dst->type == GGML_TYPE_TQP_D256_B4);\n'
     '                const bool src_f32  = (cpy_src->type == GGML_TYPE_F32);\n'
     '                // BF16/F16 → TQ4P: upcast to fp32 on host, then quantize on device.\n'
     '                // TODO: add device-side bf16/f16 load kernels for zero-copy path.\n'
@@ -328,8 +410,16 @@ new_cpy = (
     '                    const int64_t ne = ggml_nelements(cpy_src);\n'
     '                    if (cpy_dst->type == GGML_TYPE_TQ4P_D128) {\n'
     '                        ggml_cuda_tqp_quantize_row_d128(src_d, dst_d, ne, layer_byte, stream);\n'
-    '                    } else {\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQ4P_D256) {\n'
     '                        ggml_cuda_tqp_quantize_row_d256(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D128_B2) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d128_b2(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D128_B4) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d128_b4(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D256_B2) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d256_b2(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else {\n'
+    '                        ggml_cuda_tqp_quantize_row_d256_b4(src_d, dst_d, ne, layer_byte, stream);\n'
     '                    }\n'
     '                } else {\n'
     '                    ggml_cuda_cpy(ctx, cpy_src, cpy_dst);\n'
@@ -354,6 +444,18 @@ else:
         '                    return true;\n'
         '                }\n'
         '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D256) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B2) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B4) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B2) {\n'
+        '                    return true;\n'
+        '                }\n'
+        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B4) {\n'
         '                    return true;\n'
         '                }'
     )
@@ -391,7 +493,7 @@ TQP_VEC_DOT_IMPL="$GGML/src/ggml-cuda/tqp-vec-dot.cu"
 
 # (a) MUL_MAT supports_op in ggml-cuda.cu — only depends on tqp-vec-dot.cu.
 if [[ -f "$CUDA_CU" && -f "$TQP_VEC_DOT_IMPL" ]]; then
-    if grep -qF "$MARKER_MUL_MAT" "$CUDA_CU"; then
+    if grep -q "case GGML_TYPE_TQP_D128_B2:" "$CUDA_CU" 2>/dev/null; then
         echo "[=] ggml-cuda.cu MUL_MAT supports_op already patched"
     else
         echo "[+] patching ggml-cuda.cu MUL_MAT supports_op for TQ4P"
@@ -410,6 +512,10 @@ mulmat_new = (
     '                    case GGML_TYPE_BF16:\n'
     '                    case GGML_TYPE_TQ4P_D128: // Hook 7: TQ4P MUL_MAT on GPU\n'
     '                    case GGML_TYPE_TQ4P_D256:\n'
+    '                    case GGML_TYPE_TQP_D128_B2:\n'
+    '                    case GGML_TYPE_TQP_D128_B4:\n'
+    '                    case GGML_TYPE_TQP_D256_B2:\n'
+    '                    case GGML_TYPE_TQP_D256_B4:\n'
     '                        return true;\n'
     '                    default:\n'
     '                        return false;'
@@ -424,7 +530,7 @@ fi
 
 # (b) SET_ROWS supports_op in ggml-cuda.cu — needs set-rows.cu + tqp-set-rows.cu.
 if [[ -f "$CUDA_CU" && -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
-    if grep -qF "$MARKER_SET_ROWS" "$CUDA_CU"; then
+    if grep -q "op->type == GGML_TYPE_TQP_D128_B2" "$CUDA_CU" 2>/dev/null; then
         echo "[=] ggml-cuda.cu SET_ROWS supports_op already patched"
     else
         echo "[+] patching ggml-cuda.cu SET_ROWS supports_op for TQ4P"
@@ -441,7 +547,9 @@ if anchor not in t:
 replacement = (
     'op->type == GGML_TYPE_IQ4_NL ||\n'
     '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
-    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&'
+    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                       op->type == GGML_TYPE_TQP_D128_B2 || op->type == GGML_TYPE_TQP_D128_B4 ||\n'
+    '                       op->type == GGML_TYPE_TQP_D256_B2 || op->type == GGML_TYPE_TQP_D256_B4) &&'
 )
 t = t.replace(anchor, replacement, 1)
 
@@ -453,7 +561,7 @@ fi
 
 # (c) dispatch in set-rows.cu — same guard as (b).
 if [[ -f "$SET_ROWS_FILE" && -f "$TQP_SET_ROWS_IMPL" ]]; then
-    if grep -qF "$MARKER_SET_ROWS" "$SET_ROWS_FILE"; then
+    if grep -q "ggml_cuda_set_rows_tqp_d128_b2" "$SET_ROWS_FILE" 2>/dev/null; then
         echo "[=] set-rows.cu TQ4P dispatch already patched"
     else
         echo "[+] patching set-rows.cu TQ4P dispatch"
@@ -478,6 +586,18 @@ decl_block = (
     'extern "C" void ggml_cuda_set_rows_tq4p_d256(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
     '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tqp_d128_b2(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tqp_d128_b4(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tqp_d256_b2(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void ggml_cuda_set_rows_tqp_d256_b4(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
 )
 t = t.replace(include_anchor, decl_block, 1)
 
@@ -496,7 +616,9 @@ dispatch_new = (
     '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
     '\n'
     '    // TQ4P_D128 SET_ROWS — Hook 7.\n'
-    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256) {\n'
+    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '            dst->type == GGML_TYPE_TQP_D128_B2 || dst->type == GGML_TYPE_TQP_D128_B4 ||\n'
+    '            dst->type == GGML_TYPE_TQP_D256_B2 || dst->type == GGML_TYPE_TQP_D256_B4) {\n'
     '        const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
     '        const float * src0_d = (const float *)src0->data;\n'
     '        const bool idx_i64 = (src1->type == GGML_TYPE_I64);\n'
@@ -506,8 +628,16 @@ dispatch_new = (
     '        const int64_t dst_stride = dst->nb[1];\n'
     '        if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
     '            ggml_cuda_set_rows_tq4p_d128(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
-    '        } else {\n'
+    '        } else if (dst->type == GGML_TYPE_TQ4P_D256) {\n'
     '            ggml_cuda_set_rows_tq4p_d256(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQP_D128_B2) {\n'
+    '            ggml_cuda_set_rows_tqp_d128_b2(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQP_D128_B4) {\n'
+    '            ggml_cuda_set_rows_tqp_d128_b4(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQP_D256_B2) {\n'
+    '            ggml_cuda_set_rows_tqp_d256_b2(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else {\n'
+    '            ggml_cuda_set_rows_tqp_d256_b4(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
     '        }\n'
     '        return;\n'
     '    }\n'
@@ -529,7 +659,7 @@ fi
 TQP_DEQUANT_IMPL="$GGML/src/ggml-cuda/tqp-dequantize.cu"
 
 if [[ -f "$CONVERT_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
-    if grep -q "dequantize_row_tq4p_d128_cuda" "$CONVERT_CU" 2>/dev/null; then
+    if grep -q "dequantize_row_tqp_d128_b2_cuda" "$CONVERT_CU" 2>/dev/null; then
         echo "[=] convert.cu TQ4P dequantize dispatch already patched"
     else
         echo "[+] patching convert.cu TQ4P dequantize dispatch"
@@ -559,6 +689,26 @@ decl = (
     'extern "C" void dequantize_row_tq4p_d256_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
     '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b2_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d128_b4_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b2_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    'extern "C" void dequantize_row_tqp_d256_b4_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
 )
 t = t.replace(include_anchor, decl, 1)
 
@@ -577,6 +727,14 @@ fp16_replacement = (
     '            return dequantize_row_tq4p_d128_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B2:\n'
+    '            return dequantize_row_tqp_d128_b2_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B4:\n'
+    '            return dequantize_row_tqp_d128_b4_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B2:\n'
+    '            return dequantize_row_tqp_d256_b2_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B4:\n'
+    '            return dequantize_row_tqp_d256_b4_cuda;\n'
     '        case GGML_TYPE_F32:'
 )
 t = t.replace(fp16_anchor, fp16_replacement, 1)
@@ -596,6 +754,14 @@ fp32_replacement = (
     '            return dequantize_row_tq4p_d128_f32_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B2:\n'
+    '            return dequantize_row_tqp_d128_b2_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B4:\n'
+    '            return dequantize_row_tqp_d128_b4_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B2:\n'
+    '            return dequantize_row_tqp_d256_b2_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B4:\n'
+    '            return dequantize_row_tqp_d256_b4_f32_cuda;\n'
     '        case GGML_TYPE_F16:'
 )
 t = t.replace(fp32_anchor, fp32_replacement, 1)
@@ -615,6 +781,14 @@ fp16_nc_replacement = (
     '            return dequantize_row_tq4p_d128_nc_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B2:\n'
+    '            return dequantize_row_tqp_d128_b2_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D128_B4:\n'
+    '            return dequantize_row_tqp_d128_b4_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B2:\n'
+    '            return dequantize_row_tqp_d256_b2_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D256_B4:\n'
+    '            return dequantize_row_tqp_d256_b4_nc_cuda;\n'
     '        case GGML_TYPE_BF16:'
 )
 t = t.replace(fp16_nc_anchor, fp16_nc_replacement, 1)
@@ -626,7 +800,7 @@ PY
 fi
 
 if [[ -f "$FATTN_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
-    if grep -q "TQ4P flash-attention staging" "$FATTN_CU" 2>/dev/null; then
+    if grep -q "GGML_TYPE_TQP_D128_B2" "$FATTN_CU" 2>/dev/null; then
         echo "[=] fattn.cu TQ4P staging already patched"
     else
         echo "[+] patching fattn.cu TQ4P flash-attention staging"
@@ -647,8 +821,12 @@ old_macro = (
 new_macro = (
     '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
     '    {                                                                                                            \\\n'
-    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256;               \\\n'
-    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '            || K->type == GGML_TYPE_TQP_D128_B2 || K->type == GGML_TYPE_TQP_D128_B4                           \\\n'
+    '            || K->type == GGML_TYPE_TQP_D256_B2 || K->type == GGML_TYPE_TQP_D256_B4;                          \\\n'
+    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '            || V->type == GGML_TYPE_TQP_D128_B2 || V->type == GGML_TYPE_TQP_D128_B4                           \\\n'
+    '            || V->type == GGML_TYPE_TQP_D256_B2 || V->type == GGML_TYPE_TQP_D256_B4;                          \\\n'
     '        const bool type_K_okay = K->type == (type_K)                                                            \\\n'
     '            || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16)                                           \\\n'
     '            || (type_K_tq4p && (type_K) == GGML_TYPE_F16); /* TQ4P flash-attention staging */                    \\\n'
@@ -677,6 +855,10 @@ switch_replacement = (
     '        case GGML_TYPE_F16:\n'
     '        case GGML_TYPE_TQ4P_D128:\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
+    '        case GGML_TYPE_TQP_D128_B2:\n'
+    '        case GGML_TYPE_TQP_D128_B4:\n'
+    '        case GGML_TYPE_TQP_D256_B2:\n'
+    '        case GGML_TYPE_TQP_D256_B4:\n'
     '            break;'
 )
 t = t.replace(switch_anchor, switch_replacement, 1)
