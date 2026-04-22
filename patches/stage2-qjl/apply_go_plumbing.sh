@@ -296,6 +296,16 @@ old_support = (
     '\treturn slices.Contains([]string{"q8_0", "q4_0", "tq3_0", "tq4p_d128", "tq4p_d256", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"}, cacheType)\n'
     '}\n'
 )
+old_support_pristine = (
+    '// SupportsKVCacheType checks if the requested cache type is supported\n'
+    'func (f GGML) SupportsKVCacheType(cacheType string) bool {\n'
+    '\tif cacheType == "" || cacheType == "f16" {\n'
+    '\t\treturn true\n'
+    '\t}\n'
+    '\n'
+    '\treturn slices.Contains([]string{"q8_0", "q4_0"}, cacheType)\n'
+    '}\n'
+)
 
 new_support = (
     '// tqp_kv_cache_head_dim_guard: constrain TurboQuant KV types to models\n'
@@ -332,11 +342,13 @@ new_support = (
     '}\n'
 )
 
-if old_support not in text:
+if old_support in text:
+    text = text.replace(old_support, new_support, 1)
+elif old_support_pristine in text:
+    text = text.replace(old_support_pristine, new_support, 1)
+else:
     print(f"ERROR: SupportsKVCacheType() block not found in {path}", file=sys.stderr)
     sys.exit(1)
-
-text = text.replace(old_support, new_support, 1)
 path.write_text(text)
 print(f"[+] patched SupportsKVCacheType() head-dim guard: {path}")
 PY
