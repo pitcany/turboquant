@@ -132,6 +132,7 @@ func GraphSize(kvCacheType string) int {
     fs_ggml_go = (ollama_dir / "fs" / "ggml" / "ggml.go").read_text(encoding="utf-8")
 
     assert backend_go.count("DTypeTQ4P_D128") == 1
+    assert backend_go.count("DTypeTQ4P_D256") == 1
     assert 'case "tq4p_d128":\n\t\treturn 69.0 / 128.0' in fs_ggml_go
     assert 'case "tq4p_d256":\n\t\treturn 133.0 / 256.0' in fs_ggml_go
     assert fs_ggml_go.count("TQ4P: KV cache memory estimate") == 1

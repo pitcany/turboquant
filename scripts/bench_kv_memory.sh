@@ -225,7 +225,7 @@ limit = float(sys.argv[6])
 delta_mb = large_mb - small_mb
 delta_ctx = large_ctx - small_ctx
 mb_per_token = delta_mb / delta_ctx
-passed = delta_mb > 0 and mb_per_token <= limit
+passed = delta_mb > 0 and mb_per_token >= expected * 0.5 and mb_per_token <= limit
 status = "PASS" if passed else "FAIL"
 
 print(f"{status} {delta_mb:.6f} {mb_per_token:.6f} {expected:.6f} {limit:.6f}")

@@ -2,16 +2,17 @@
 # Patch ollama's Go layer so tq4p_d128 / tq4p_d256 cache-type strings map
 # end-to-end to the correct GGML enum values instead of falling back to f16.
 #
-# Six sites need cases / hooks:
+# Eight patch sites (sections 1–8b):
 #   1. ml/backend.go              — DType constants (iota enum)
 #   2. ml/backend/ggml/ggml.go    — DType() C→Go and ggmlDType() Go→C
 #   3. runner/ollamarunner/cache.go — kvCacheTypeFromStr  string→ml.DType
 #   4. llama/llama.go              — kvCacheTypeFromStr  string→C.enum_ggml_type
-#   5. fs/ggml/ggml.go             — kvCacheBytesPerElement() bytes/element
+#   5. ml/backend/ggml/ggml.go    — Copy() op_params for TQ4P
+#   6. OLLAMA_TQP_ROTATION        — init hook
+#   7. fs/ggml/ggml.go            — kvCacheBytesPerElement() bytes/element
 #                                    estimator (searched dynamically)
-#   6. runner/ollamarunner/*.go + fs/ggml/ggml.go
-#                                  — diagnostic slog.Info hooks (searched
-#                                    dynamically)
+#  8a. runner/ollamarunner/*.go   — KV cache type slog.Info hook
+#  8b. fs/ggml/ggml.go            — KV memory estimate slog.Info hook
 #
 # Anchors are value-based (grep for known surrounding patterns), not
 # line-number based, so small upstream drift doesn't break this.
