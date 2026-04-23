@@ -256,23 +256,31 @@ echo "    $(echo "$INFERENCE_TEXT" | head -3 | sed 's/^/    /')"
 
 # ── (i) Success banner ─────────────────────────────────────────────────
 
-cat <<'BANNER'
+# Resolve bits-per-weight for the cache type.
+case "$CACHE_TYPE" in
+    tq4p_d64|tqp_d64_b3)   BPW="4.625" ;;
+    tqp_d64_b2)             BPW="4.125" ;;
+    tqp_d64_b4)             BPW="5.125" ;;
+    tq4p_d128|tqp_d128_b3)  BPW="4.25"  ;;
+    tqp_d128_b2)            BPW="4.0"   ;;
+    tqp_d128_b4)            BPW="4.5"   ;;
+    tq4p_d256|tqp_d256_b3)  BPW="4.16"  ;;
+    tqp_d256_b2)            BPW="4.0"   ;;
+    tqp_d256_b4)            BPW="4.33"  ;;
+    *)                       BPW="?"     ;;
+esac
 
+printf '
 ╔══════════════════════════════════════════════════════════════╗
 ║                    TQ4P IS LIVE                             ║
 ║                                                             ║
-║  KV cache type:  tq4p_d128 (4.25 bpw)                      ║
+║  KV cache type:  %-14s (%s bpw)%*s║
 ║  Algorithm:      Stage-1 Lloyd-Max + Stage-2 QJL            ║
 ║  Expected:       cosine similarity ≥ 0.92  (paper: 0.93)   ║
 ║                                                             ║
 ║  Allowlist + Go plumbing + ggml dispatch all aligned.       ║
 ╚══════════════════════════════════════════════════════════════╝
-BANNER
-
-# Customize banner for non-default cache type.
-if [[ "$CACHE_TYPE" != "tq4p_d128" ]]; then
-    echo "  (tested with cache type: $CACHE_TYPE)"
-fi
+' "$CACHE_TYPE" "$BPW" $((27 - ${#CACHE_TYPE} - ${#BPW})) ""
 
 echo "[+] log preserved at $LOG"
 exit 0

@@ -67,7 +67,7 @@ static void ggml_cuda_set_rows_tqp_impl(
 
     const uint8_t layer = TQP_EXTRACT_LAYER(layer_byte) % TQP_MAX_LAYERS;
     const uint8_t rot = TQP_EXTRACT_ROT(layer_byte);
-    const uint8_t byte_stored = TQP_LAYER_BYTE(layer, rot);
+    const uint8_t byte_stored = TQP_STORED_BYTE(layer, rot);
 
     const int64_t n_blocks_per_row = dst_stride_row / (int64_t)sizeof(Block);
     const int64_t n_total_blocks = n_rows * n_blocks_per_row;

@@ -581,8 +581,17 @@ extern "C" void ggml_cuda_op_tqp_vec_dot(
 
     uint8_t layer_byte = 0;
     {
+        // All block types share the same header layout; verify at compile time.
+        static_assert(offsetof(block_tqp_d64_b2,  layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d64_b2");
+        static_assert(offsetof(block_tqp_d64_b3,  layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d64_b3");
+        static_assert(offsetof(block_tqp_d64_b4,  layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d64_b4");
+        static_assert(offsetof(block_tqp_d128_b3, layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d128_b3");
+        static_assert(offsetof(block_tqp_d128_b4, layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d128_b4");
+        static_assert(offsetof(block_tqp_d256_b2, layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d256_b2");
+        static_assert(offsetof(block_tqp_d256_b3, layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d256_b3");
+        static_assert(offsetof(block_tqp_d256_b4, layer_idx) == offsetof(block_tqp_d128_b2, layer_idx), "layer_idx offset mismatch d256_b4");
+        constexpr size_t layer_byte_offset = offsetof(block_tqp_d128_b2, layer_idx);
         const uint8_t * first_block = (const uint8_t *)src0->data;
-        const size_t layer_byte_offset = offsetof(block_tqp_d128_b2, layer_idx);
         CUDA_CHECK(cudaMemcpyAsync(&layer_byte, first_block + layer_byte_offset, 1, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
