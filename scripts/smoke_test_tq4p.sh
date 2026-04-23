@@ -258,16 +258,16 @@ echo "    $(echo "$INFERENCE_TEXT" | head -3 | sed 's/^/    /')"
 
 # Resolve bits-per-weight for the cache type.
 case "$CACHE_TYPE" in
-    tq4p_d64|tqp_d64_b3)   BPW="4.625" ;;
-    tqp_d64_b2)             BPW="4.125" ;;
-    tqp_d64_b4)             BPW="5.125" ;;
-    tq4p_d128|tqp_d128_b3)  BPW="4.25"  ;;
-    tqp_d128_b2)            BPW="4.0"   ;;
-    tqp_d128_b4)            BPW="4.5"   ;;
-    tq4p_d256|tqp_d256_b3)  BPW="4.16"  ;;
-    tqp_d256_b2)            BPW="4.0"   ;;
-    tqp_d256_b4)            BPW="4.33"  ;;
-    *)                       BPW="?"     ;;
+    tq4p_d64|tqp_d64_b3)   BPW="4.625"  ;;
+    tqp_d64_b2)             BPW="3.625"  ;;
+    tqp_d64_b4)             BPW="5.625"  ;;
+    tq4p_d128|tqp_d128_b3)  BPW="4.25"   ;;
+    tqp_d128_b2)            BPW="3.3125" ;;
+    tqp_d128_b4)            BPW="5.3125" ;;
+    tq4p_d256|tqp_d256_b3)  BPW="4.16"   ;;
+    tqp_d256_b2)            BPW="3.16"   ;;
+    tqp_d256_b4)            BPW="5.16"   ;;
+    *)                       BPW="?"      ;;
 esac
 
 printf '
