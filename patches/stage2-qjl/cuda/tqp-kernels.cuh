@@ -229,11 +229,14 @@ __device__ static inline uint8_t tqp_bucketize(float x, const float * bounds) {
 }
 
 __device__ static inline float tqp_warp_reduce_sum(float val) {
-    val += __shfl_xor_sync(0xffffffffu, val, 16);
-    val += __shfl_xor_sync(0xffffffffu, val, 8);
-    val += __shfl_xor_sync(0xffffffffu, val, 4);
-    val += __shfl_xor_sync(0xffffffffu, val, 2);
-    val += __shfl_xor_sync(0xffffffffu, val, 1);
+    const unsigned mask = __activemask();
+    if (mask == 0xffffffffu) {
+        val += __shfl_xor_sync(mask, val, 16);
+    }
+    val += __shfl_xor_sync(mask, val, 8);
+    val += __shfl_xor_sync(mask, val, 4);
+    val += __shfl_xor_sync(mask, val, 2);
+    val += __shfl_xor_sync(mask, val, 1);
     return val;
 }
 
