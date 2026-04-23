@@ -54,8 +54,9 @@ repo's target set:
 | **Qwen 3.5 (Gated Attention)** | **256** |
 | DeepSeek V3 / R1 (MLA) | 128 (latent dim separate) |
 
-**Two types in this patch**:
+**Three legacy-alias types in this patch**:
 
+- `GGML_TYPE_TQ4P_D64` — covers `head_dim=64` models such as gpt-oss-20B.
 - `GGML_TYPE_TQ4P_D128` — primary target, covers Llama + Qwen2/3.
 - `GGML_TYPE_TQ4P_D256` — Qwen 3.5 coverage.
 
@@ -63,6 +64,18 @@ Both share the same source file via `#define TQP_D` parameterization. Only
 the Π and S constants differ (generated per-d from seeds).
 
 ## Byte layout (per vector, QK = head_dim)
+
+### TQ4P_D64 (37 B / 64 elements = 4.625 bpw)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | `orig_norm` (fp16) — `‖x‖` before unit normalization |
+| 2 | 2 | `res_d` (fp16) — `‖residual‖` in rotated space |
+| 4 | 1 | `layer_idx` — packed `(rotation << 7) | (layer & 0x1f)` |
+| 5 | 24 | `qs[24]` — 64 × 3-bit Lloyd-Max indices, bit-packed |
+| 29 | 8 | `qjl_signs[8]` — 64 × 1-bit QJL signs |
+
+Total: **37 B / 64 = 4.625 bpw**.
 
 ### TQ4P_D128 (52 B / 128 elements = 3.25 bpw)
 

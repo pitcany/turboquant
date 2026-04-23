@@ -177,9 +177,9 @@ Deliverables:
     TQP_DEFINE_D(D) invocation — block struct, quantize row, dequant
     row, vec_dot row, ggml dispatch wrappers, Q8_K wrappers.
 
-  - Actually add d=64 as a demonstration (common in small embedding
-    models). Regenerate constants, enum values, traits entries via
-    the hooks.
+  - Done: d=64 support added as a demonstration/common small-head path.
+    Regenerate constants, enum values, traits entries, CUDA dispatch,
+    and Go plumbing via the hooks.
 
   - Add test coverage for d=64 in test_tq_paper.py and
     test_c_vs_python.py (parametrize existing tests; they should

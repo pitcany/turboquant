@@ -39,7 +39,7 @@ FATTN_CU="$GGML/src/ggml-cuda/fattn.cu"
 MARKER="tq4p"
 
 # ---------- 1. enum ----------
-if grep -qi "$MARKER" "$GGML_H" 2>/dev/null; then
+if grep -q "GGML_TYPE_TQ4P_D64" "$GGML_H" 2>/dev/null && grep -q "GGML_TYPE_TQP_D64_B2" "$GGML_H" 2>/dev/null; then
     echo "[=] ggml.h already patched"
 else
     echo "[+] ggml.h: adding TQ4P + explicit TQP enum values"
@@ -50,8 +50,11 @@ t = p.read_text()
 # Strip any pre-existing TQ4P entries (idempotent re-patching).
 t = re.sub(r'\s*//.*TurboQuant paper-faithful.*\n', '', t)
 t = re.sub(r'\s*//.*See src/ggml-tq-paper\.h.*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQ4P_D64\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQ4P_D128\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQ4P_D256\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D64_B2\s*=\s*\d+,\s*\n', '', t)
+t = re.sub(r'\s*GGML_TYPE_TQP_D64_B4\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQP_D128_B2\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQP_D128_B4\s*=\s*\d+,\s*\n', '', t)
 t = re.sub(r'\s*GGML_TYPE_TQP_D256_B2\s*=\s*\d+,\s*\n', '', t)
@@ -64,26 +67,29 @@ insert = (
     "\n"
     "        // TurboQuant paper-faithful (Haar/WHT rotation + Lloyd-Max + QJL).\n"
     "        // See src/ggml-tq-paper.h. Added by patches/stage2-qjl.\n"
-    f"        GGML_TYPE_TQ4P_D128 = {n},\n"
-    f"        GGML_TYPE_TQ4P_D256 = {n+1},\n"
-    f"        GGML_TYPE_TQP_D128_B2 = {n+2},\n"
-    f"        GGML_TYPE_TQP_D128_B4 = {n+3},\n"
-    f"        GGML_TYPE_TQP_D256_B2 = {n+4},\n"
-    f"        GGML_TYPE_TQP_D256_B4 = {n+5},"
+    f"        GGML_TYPE_TQ4P_D64 = {n},\n"
+    f"        GGML_TYPE_TQ4P_D128 = {n+1},\n"
+    f"        GGML_TYPE_TQ4P_D256 = {n+2},\n"
+    f"        GGML_TYPE_TQP_D64_B2 = {n+3},\n"
+    f"        GGML_TYPE_TQP_D64_B4 = {n+4},\n"
+    f"        GGML_TYPE_TQP_D128_B2 = {n+5},\n"
+    f"        GGML_TYPE_TQP_D128_B4 = {n+6},\n"
+    f"        GGML_TYPE_TQP_D256_B2 = {n+7},\n"
+    f"        GGML_TYPE_TQP_D256_B4 = {n+8},"
 )
 t = t[:m.start()] + insert + re.sub(
     r"GGML_TYPE_COUNT\s*=\s*\d+,",
-    f"GGML_TYPE_COUNT   = {n+6},",
+    f"GGML_TYPE_COUNT   = {n+9},",
     t[m.start():],
     count=1,
 )
 p.write_text(t)
-print(f"[+] TQ4P_D128 = {n}, TQ4P_D256 = {n+1}, TQP_D128_B2 = {n+2}, TQP_D128_B4 = {n+3}, TQP_D256_B2 = {n+4}, TQP_D256_B4 = {n+5}, COUNT -> {n+6}")
+print(f"[+] TQ4P_D64 = {n}, TQ4P_D128 = {n+1}, TQ4P_D256 = {n+2}, TQP_D64_B2 = {n+3}, TQP_D64_B4 = {n+4}, TQP_D128_B2 = {n+5}, TQP_D128_B4 = {n+6}, TQP_D256_B2 = {n+7}, TQP_D256_B4 = {n+8}, COUNT -> {n+9}")
 PY
 fi
 
 # ---------- 2. ggml.c type_traits ----------
-if grep -q "$MARKER" "$GGML_C" 2>/dev/null; then
+if grep -q "GGML_TYPE_TQ4P_D64" "$GGML_C" 2>/dev/null && grep -q "GGML_TYPE_TQP_D64_B2" "$GGML_C" 2>/dev/null; then
     echo "[=] ggml.c already patched"
 else
     echo "[+] ggml.c: #include + type_traits entries"
@@ -96,7 +102,22 @@ t = p.read_text()
 m = re.search(r'^#include\s+"ggml-quants\.h"\s*\n', t, re.MULTILINE)
 if not m:
     sys.exit('ggml.c: could not find #include "ggml-quants.h" anchor')
-t = t[:m.end()] + '#include "ggml-tq-paper.h"\n' + t[m.end():]
+if '#include "ggml-tq-paper.h"\n' not in t:
+    t = t[:m.end()] + '#include "ggml-tq-paper.h"\n' + t[m.end():]
+
+entry_patterns = [
+    r'\s*\[GGML_TYPE_TQ4P_D64\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQ4P_D128\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQ4P_D256\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D64_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D64_B4\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D128_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D128_B4\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D256_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D256_B4\]\s*=\s*\{.*?\n\s*\},\n',
+]
+for pattern in entry_patterns:
+    t = re.sub(pattern, '', t, flags=re.S)
 
 # Find the type_traits array and insert entries before its closing `};`.
 arr_start = re.search(
@@ -120,6 +141,14 @@ if depth != 0:
 # Insert just before the closing '}'.
 close = i - 1
 entries = (
+    "    [GGML_TYPE_TQ4P_D64] = {\n"
+    "        .type_name                = \"tq4p_d64\",\n"
+    "        .blck_size                = QK_TQ4P_D64,\n"
+    "        .type_size                = sizeof(block_tq4p_d64),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d64,\n"
+    "        .from_float_ref           = ggml_quantize_row_tq4p_d64_default,\n"
+    "    },\n"
     "    [GGML_TYPE_TQ4P_D128] = {\n"
     "        .type_name                = \"tq4p_d128\",\n"
     "        .blck_size                = QK_TQ4P_D128,\n"
@@ -135,6 +164,22 @@ entries = (
     "        .is_quantized             = true,\n"
     "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tq4p_d256,\n"
     "        .from_float_ref           = ggml_quantize_row_tq4p_d256_default,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D64_B2] = {\n"
+    "        .type_name                = \"tqp_d64_b2\",\n"
+    "        .blck_size                = QK_TQP_D64,\n"
+    "        .type_size                = sizeof(block_tqp_d64_b2),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d64_b2,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d64_b2_default,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D64_B4] = {\n"
+    "        .type_name                = \"tqp_d64_b4\",\n"
+    "        .blck_size                = QK_TQP_D64,\n"
+    "        .type_size                = sizeof(block_tqp_d64_b4),\n"
+    "        .is_quantized             = true,\n"
+    "        .to_float                 = (ggml_to_float_t) ggml_dequantize_row_tqp_d64_b4,\n"
+    "        .from_float_ref           = ggml_quantize_row_tqp_d64_b4_default,\n"
     "    },\n"
     "    [GGML_TYPE_TQP_D128_B2] = {\n"
     "        .type_name                = \"tqp_d128_b2\",\n"
@@ -176,7 +221,7 @@ fi
 
 # ---------- 3. ggml-cpu.c type_traits_cpu ----------
 if [[ -f "$CPU_C" ]]; then
-    if grep -q "$MARKER" "$CPU_C" 2>/dev/null; then
+    if grep -q "GGML_TYPE_TQ4P_D64" "$CPU_C" 2>/dev/null && grep -q "GGML_TYPE_TQP_D64_B2" "$CPU_C" 2>/dev/null; then
         echo "[=] ggml-cpu.c already patched"
     else
         echo "[+] ggml-cpu.c: #include + type_traits_cpu entries"
@@ -191,7 +236,22 @@ m = (re.search(r'^#include\s+"ggml-quants\.h"\s*\n', t, re.MULTILINE)
      or re.search(r'^#include\s+"quants\.h"\s*\n', t, re.MULTILINE))
 if not m:
     sys.exit('ggml-cpu.c: could not find quants.h or ggml-quants.h anchor')
-t = t[:m.end()] + '#include "../ggml-tq-paper.h"\n' + t[m.end():]
+if '#include "../ggml-tq-paper.h"\n' not in t:
+    t = t[:m.end()] + '#include "../ggml-tq-paper.h"\n' + t[m.end():]
+
+entry_patterns = [
+    r'\s*\[GGML_TYPE_TQ4P_D64\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQ4P_D128\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQ4P_D256\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D64_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D64_B4\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D128_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D128_B4\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D256_B2\]\s*=\s*\{.*?\n\s*\},\n',
+    r'\s*\[GGML_TYPE_TQP_D256_B4\]\s*=\s*\{.*?\n\s*\},\n',
+]
+for pattern in entry_patterns:
+    t = re.sub(pattern, '', t, flags=re.S)
 
 arr_start = re.search(
     r"static\s+const\s+struct\s+ggml_type_traits_cpu\s+type_traits_cpu\s*\[[^\]]*\]\s*=\s*\{",
@@ -211,6 +271,14 @@ if depth != 0:
     sys.exit("ggml-cpu.c: unbalanced braces in type_traits_cpu array")
 close = i - 1
 entries = (
+    "    [GGML_TYPE_TQ4P_D64] = {\n"
+    "        .from_float               = ggml_quantize_row_tq4p_d64_default,\n"
+    "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d64_bf16,\n"
+    "        // .from_float_f16        = (ggml_from_float_t) ggml_quantize_row_tq4p_d64_f16,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d64_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
     "    [GGML_TYPE_TQ4P_D128] = {\n"
     "        .from_float               = ggml_quantize_row_tq4p_d128_default,\n"
     "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d128_bf16,\n"
@@ -224,6 +292,18 @@ entries = (
     "        // .from_float_bf16       = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_bf16,\n"
     "        // .from_float_f16        = (ggml_from_float_t) ggml_quantize_row_tq4p_d256_f16,\n"
     "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4p_d256_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D64_B2] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d64_b2_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d64_b2_f32,\n"
+    "        .vec_dot_type             = GGML_TYPE_F32,\n"
+    "        .nrows                    = 1,\n"
+    "    },\n"
+    "    [GGML_TYPE_TQP_D64_B4] = {\n"
+    "        .from_float               = ggml_quantize_row_tqp_d64_b4_default,\n"
+    "        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tqp_d64_b4_f32,\n"
     "        .vec_dot_type             = GGML_TYPE_F32,\n"
     "        .nrows                    = 1,\n"
     "    },\n"
@@ -329,7 +409,8 @@ insert_at = sig.end() + split_line.end()
 dispatch = (
     '\n'
     '    if (!split && (\n'
-    '            src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '            src0->type == GGML_TYPE_TQ4P_D64 || src0->type == GGML_TYPE_TQ4P_D128 || src0->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '            src0->type == GGML_TYPE_TQP_D64_B2 || src0->type == GGML_TYPE_TQP_D64_B4 ||\n'
     '            src0->type == GGML_TYPE_TQP_D128_B2 || src0->type == GGML_TYPE_TQP_D128_B4 ||\n'
     '            src0->type == GGML_TYPE_TQP_D256_B2 || src0->type == GGML_TYPE_TQP_D256_B4)) {\n'
     '        ggml_cuda_op_tqp_vec_dot(ctx, src0, src1, dst);\n'
@@ -359,44 +440,48 @@ vec_dot_decl = 'extern "C" void ggml_cuda_op_tqp_vec_dot('
 if vec_dot_decl not in t:
     sys.exit('ggml-cuda.cu: ggml_cuda_op_tqp_vec_dot declaration not found (hook 5 missing?)')
 
-quant_decl = (
-    '\nextern "C" void ggml_cuda_tqp_quantize_row_d128(\n'
+decls = [
+    'extern "C" void ggml_cuda_tqp_quantize_row_d64(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
-    'extern "C" void ggml_cuda_tqp_quantize_row_d256(\n'
+    '    cudaStream_t stream);\n',
+    'extern "C" void ggml_cuda_tqp_quantize_row_d64_b2(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
+    '    cudaStream_t stream);\n',
+    'extern "C" void ggml_cuda_tqp_quantize_row_d64_b4(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n',
+    'extern "C" void ggml_cuda_tqp_quantize_row_d128(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n',
     'extern "C" void ggml_cuda_tqp_quantize_row_d128_b2(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
+    '    cudaStream_t stream);\n',
     'extern "C" void ggml_cuda_tqp_quantize_row_d128_b4(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
+    '    cudaStream_t stream);\n',
+    'extern "C" void ggml_cuda_tqp_quantize_row_d256(\n'
+    '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
+    '    cudaStream_t stream);\n',
     'extern "C" void ggml_cuda_tqp_quantize_row_d256_b2(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
+    '    cudaStream_t stream);\n',
     'extern "C" void ggml_cuda_tqp_quantize_row_d256_b4(\n'
     '    const float * x, void * y, int64_t k, uint8_t layer_byte,\n'
-    '    cudaStream_t stream);\n'
-)
-idx = t.index(vec_dot_decl)
-# Insert before the vec_dot declaration
-t = t[:idx] + quant_decl + t[idx:]
-
-# Patch the GGML_OP_CPY case to intercept F32 → TQ4P_D128/D256 before
-# falling through to ggml_cuda_cpy. We replace the simple dispatch line
-# with a TQ4P-aware block that reads layer_byte from dst->op_params[0].
-old_cpy = 'case GGML_OP_CPY:\n            ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);\n            break;'
-if old_cpy not in t:
-    sys.exit('ggml-cuda.cu: GGML_OP_CPY dispatch not found')
+    '    cudaStream_t stream);\n',
+]
+missing = [decl for decl in decls if decl not in t]
+if missing:
+    idx = t.index(vec_dot_decl)
+    t = t[:idx] + '\n' + ''.join(missing) + t[idx:]
 
 new_cpy = (
     'case GGML_OP_CPY:\n'
     '            {\n'
-    '                const ggml_tensor * cpy_src = dst->src[0];\n'
+        '                const ggml_tensor * cpy_src = dst->src[0];\n'
     '                ggml_tensor * cpy_dst = dst->src[1];\n'
     '                const bool dst_tq4p = (\n'
-    '                    cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                    cpy_dst->type == GGML_TYPE_TQ4P_D64 || cpy_dst->type == GGML_TYPE_TQ4P_D128 || cpy_dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                    cpy_dst->type == GGML_TYPE_TQP_D64_B2 || cpy_dst->type == GGML_TYPE_TQP_D64_B4 ||\n'
     '                    cpy_dst->type == GGML_TYPE_TQP_D128_B2 || cpy_dst->type == GGML_TYPE_TQP_D128_B4 ||\n'
     '                    cpy_dst->type == GGML_TYPE_TQP_D256_B2 || cpy_dst->type == GGML_TYPE_TQP_D256_B4);\n'
     '                const bool src_f32  = (cpy_src->type == GGML_TYPE_F32);\n'
@@ -408,10 +493,16 @@ new_cpy = (
     '                    const float * src_d = (const float *)cpy_src->data;\n'
     '                    void * dst_d = cpy_dst->data;\n'
     '                    const int64_t ne = ggml_nelements(cpy_src);\n'
-    '                    if (cpy_dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '                    if (cpy_dst->type == GGML_TYPE_TQ4P_D64) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d64(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQ4P_D128) {\n'
     '                        ggml_cuda_tqp_quantize_row_d128(src_d, dst_d, ne, layer_byte, stream);\n'
     '                    } else if (cpy_dst->type == GGML_TYPE_TQ4P_D256) {\n'
     '                        ggml_cuda_tqp_quantize_row_d256(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D64_B2) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d64_b2(src_d, dst_d, ne, layer_byte, stream);\n'
+    '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D64_B4) {\n'
+    '                        ggml_cuda_tqp_quantize_row_d64_b4(src_d, dst_d, ne, layer_byte, stream);\n'
     '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D128_B2) {\n'
     '                        ggml_cuda_tqp_quantize_row_d128_b2(src_d, dst_d, ne, layer_byte, stream);\n'
     '                    } else if (cpy_dst->type == GGML_TYPE_TQP_D128_B4) {\n'
@@ -427,39 +518,63 @@ new_cpy = (
     '            }\n'
     '            break;'
 )
-t = t.replace(old_cpy, new_cpy, 1)
+cpy_patterns = [
+    r'case GGML_OP_CPY:\n            ggml_cuda_cpy\(ctx, dst->src\[0\], dst->src\[1\]\);\n            break;',
+    r'case GGML_OP_CPY:\n            \{\n                const ggml_tensor \* cpy_src = dst->src\[0\];\n                ggml_tensor \* cpy_dst = dst->src\[1\];\n                const bool dst_tq4p = \(cpy_dst->type == GGML_TYPE_TQ4P_D128 \|\| cpy_dst->type == GGML_TYPE_TQ4P_D256\);\n                const bool src_f32  = \(cpy_src->type == GGML_TYPE_F32\);\n                // BF16/F16 → TQ4P: upcast to fp32 on host, then quantize on device\.\n                // TODO: add device-side bf16/f16 load kernels for zero-copy path\.\n                if \(\(src_f32\) && dst_tq4p\) \{\n                    const uint8_t layer_byte = \(uint8_t\)\(dst->op_params\[0\] & 0xff\);\n                    cudaStream_t stream = ctx\.stream\(\);\n                    const float \* src_d = \(const float \*\)cpy_src->data;\n                    void \* dst_d = cpy_dst->data;\n                    const int64_t ne = ggml_nelements\(cpy_src\);\n                    if \(cpy_dst->type == GGML_TYPE_TQ4P_D128\) \{\n                        ggml_cuda_tqp_quantize_row_d128\(src_d, dst_d, ne, layer_byte, stream\);\n                    \} else \{\n                        ggml_cuda_tqp_quantize_row_d256\(src_d, dst_d, ne, layer_byte, stream\);\n                    \}\n                \} else \{\n                    ggml_cuda_cpy\(ctx, cpy_src, cpy_dst\);\n                \}\n            \}\n            break;'
+]
+for pattern in cpy_patterns:
+    t2, n = re.subn(pattern, new_cpy, t, count=1)
+    if n:
+        t = t2
+        break
+else:
+    sys.exit('ggml-cuda.cu: GGML_OP_CPY dispatch not found')
 
 # Also patch the supports_op query for GGML_OP_CPY to report F32→TQ4P
 # as supported. Find the last F32→IQ4_NL check in the CPY supports block
 # and append TQ4P entries.
-support_anchor = 'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n                    return true;\n                }'
-if support_anchor not in t:
-    print('WARNING: CPY supports_op anchor not found, skipping', file=sys.stderr)
+tq4p_support = (
+    'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D64) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D128) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D256) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D64_B2) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D64_B4) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B2) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B4) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B2) {\n'
+    '                    return true;\n'
+    '                }\n'
+    '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B4) {\n'
+    '                    return true;\n'
+    '                }'
+)
+support_patterns = [
+    'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n                    return true;\n                }',
+    'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n                    return true;\n                }\n                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D128) {\n                    return true;\n                }\n                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D256) {\n                    return true;\n                }',
+]
+for anchor in support_patterns:
+    if anchor in t:
+        t = t.replace(anchor, tq4p_support, 1)
+        break
 else:
-    tq4p_support = (
-        'if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D128) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ4P_D256) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B2) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D128_B4) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B2) {\n'
-        '                    return true;\n'
-        '                }\n'
-        '                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQP_D256_B4) {\n'
-        '                    return true;\n'
-        '                }'
-    )
-    t = t.replace(support_anchor, tq4p_support, 1)
+    print('WARNING: CPY supports_op anchor not found, skipping', file=sys.stderr)
 
 p.write_text(t)
 PY
@@ -503,15 +618,13 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
 
-# Anchor on BF16 which is the last type before "return true; default:".
-mulmat_anchor = '                    case GGML_TYPE_BF16:\n                        return true;\n                    default:\n                        return false;'
-if mulmat_anchor not in t:
-    print("ERROR: MUL_MAT supports_op anchor (BF16) not found", file=sys.stderr)
-    sys.exit(1)
 mulmat_new = (
     '                    case GGML_TYPE_BF16:\n'
+    '                    case GGML_TYPE_TQ4P_D64: // Hook 7: TQ4P MUL_MAT on GPU\n'
     '                    case GGML_TYPE_TQ4P_D128: // Hook 7: TQ4P MUL_MAT on GPU\n'
     '                    case GGML_TYPE_TQ4P_D256:\n'
+    '                    case GGML_TYPE_TQP_D64_B2:\n'
+    '                    case GGML_TYPE_TQP_D64_B4:\n'
     '                    case GGML_TYPE_TQP_D128_B2:\n'
     '                    case GGML_TYPE_TQP_D128_B4:\n'
     '                    case GGML_TYPE_TQP_D256_B2:\n'
@@ -520,7 +633,27 @@ mulmat_new = (
     '                    default:\n'
     '                        return false;'
 )
-t = t.replace(mulmat_anchor, mulmat_new, 1)
+
+mulmat_patterns = [
+    '                    case GGML_TYPE_BF16:\n'
+    '                        return true;\n'
+    '                    default:\n'
+    '                        return false;',
+    '                    case GGML_TYPE_BF16:\n'
+    '                    case GGML_TYPE_TQ4P_D128: // Hook 7: TQ4P MUL_MAT on GPU\n'
+    '                    case GGML_TYPE_TQ4P_D256:\n'
+    '                        return true;\n'
+    '                    default:\n'
+    '                        return false;',
+]
+
+for pattern in mulmat_patterns:
+    if pattern in t:
+        t = t.replace(pattern, mulmat_new, 1)
+        break
+else:
+    print("ERROR: MUL_MAT supports_op anchor (BF16) not found", file=sys.stderr)
+    sys.exit(1)
 
 p.write_text(t)
 print(f"[+] patched MUL_MAT supports_op: {p}")
@@ -540,18 +673,29 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
 
-anchor = 'op->type == GGML_TYPE_IQ4_NL) &&'
-if anchor not in t:
-    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
-    sys.exit(1)
 replacement = (
     'op->type == GGML_TYPE_IQ4_NL ||\n'
     '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
-    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                       op->type == GGML_TYPE_TQ4P_D64 || op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '                       op->type == GGML_TYPE_TQP_D64_B2 || op->type == GGML_TYPE_TQP_D64_B4 ||\n'
     '                       op->type == GGML_TYPE_TQP_D128_B2 || op->type == GGML_TYPE_TQP_D128_B4 ||\n'
     '                       op->type == GGML_TYPE_TQP_D256_B2 || op->type == GGML_TYPE_TQP_D256_B4) &&'
 )
-t = t.replace(anchor, replacement, 1)
+
+anchors = [
+    'op->type == GGML_TYPE_IQ4_NL) &&',
+    'op->type == GGML_TYPE_IQ4_NL ||\n'
+    '                       // TQ4P_D128 SET_ROWS — Hook 7\n'
+    '                       op->type == GGML_TYPE_TQ4P_D128 || op->type == GGML_TYPE_TQ4P_D256) &&',
+]
+
+for anchor in anchors:
+    if anchor in t:
+        t = t.replace(anchor, replacement, 1)
+        break
+else:
+    print("ERROR: SET_ROWS supports_op anchor (IQ4_NL) not found", file=sys.stderr)
+    sys.exit(1)
 
 p.write_text(t)
 print(f"[+] patched SET_ROWS supports_op: {p}")
@@ -576,47 +720,48 @@ include_anchor = '#include "set-rows.cuh"\n'
 if include_anchor not in t:
     print("ERROR: set-rows.cu include anchor not found", file=sys.stderr)
     sys.exit(1)
-decl_block = (
-    '#include "set-rows.cuh"\n'
-    '\n'
-    '// TQ4P SET_ROWS — Hook 7. Defined in tqp-set-rows.cu.\n'
+decls = [
+    'extern "C" void ggml_cuda_set_rows_tq4p_d64(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tq4p_d128(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tq4p_d256(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+    'extern "C" void ggml_cuda_set_rows_tqp_d64_b2(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+    'extern "C" void ggml_cuda_set_rows_tqp_d64_b4(\n'
+    '    const float *, const void *, void *, uint8_t, bool,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tqp_d128_b2(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tqp_d128_b4(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tqp_d256_b2(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void ggml_cuda_set_rows_tqp_d256_b4(\n'
     '    const float *, const void *, void *, uint8_t, bool,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
-)
-t = t.replace(include_anchor, decl_block, 1)
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+]
+missing = [decl for decl in decls if decl not in t]
+if missing:
+    insert = include_anchor + '\n// TQ4P SET_ROWS — Hook 7. Defined in tqp-set-rows.cu.\n' + ''.join(missing)
+    t = t.replace(include_anchor, insert, 1)
 
 # Intercept TQ4P before the existing I64/I32 dispatch.
-dispatch_anchor = (
-    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
-    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
-    '\n'
-    '    if (src1->type == GGML_TYPE_I64) {'
-)
-if dispatch_anchor not in t:
-    print("ERROR: ggml_cuda_op_set_rows dispatch anchor not found in set-rows.cu", file=sys.stderr)
-    sys.exit(1)
 dispatch_new = (
     '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
     '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
     '\n'
     '    // TQ4P_D128 SET_ROWS — Hook 7.\n'
-    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '    if (dst->type == GGML_TYPE_TQ4P_D64 || dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256 ||\n'
+    '            dst->type == GGML_TYPE_TQP_D64_B2 || dst->type == GGML_TYPE_TQP_D64_B4 ||\n'
     '            dst->type == GGML_TYPE_TQP_D128_B2 || dst->type == GGML_TYPE_TQP_D128_B4 ||\n'
     '            dst->type == GGML_TYPE_TQP_D256_B2 || dst->type == GGML_TYPE_TQP_D256_B4) {\n'
     '        const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
@@ -626,10 +771,16 @@ dispatch_new = (
     '        const int64_t n_rows = src0->ne[1];\n'
     '        const int64_t src0_stride = src0->nb[1] / sizeof(float);\n'
     '        const int64_t dst_stride = dst->nb[1];\n'
-    '        if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '        if (dst->type == GGML_TYPE_TQ4P_D64) {\n'
+    '            ggml_cuda_set_rows_tq4p_d64(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
     '            ggml_cuda_set_rows_tq4p_d128(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
     '        } else if (dst->type == GGML_TYPE_TQ4P_D256) {\n'
     '            ggml_cuda_set_rows_tq4p_d256(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQP_D64_B2) {\n'
+    '            ggml_cuda_set_rows_tqp_d64_b2(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else if (dst->type == GGML_TYPE_TQP_D64_B4) {\n'
+    '            ggml_cuda_set_rows_tqp_d64_b4(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
     '        } else if (dst->type == GGML_TYPE_TQP_D128_B2) {\n'
     '            ggml_cuda_set_rows_tqp_d128_b2(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
     '        } else if (dst->type == GGML_TYPE_TQP_D128_B4) {\n'
@@ -644,7 +795,42 @@ dispatch_new = (
     '\n'
     '    if (src1->type == GGML_TYPE_I64) {'
 )
-t = t.replace(dispatch_anchor, dispatch_new, 1)
+
+dispatch_anchors = [
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {',
+    '    GGML_ASSERT(src0->type == GGML_TYPE_F32);\n'
+    '    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);\n'
+    '\n'
+    '    // TQ4P_D128 SET_ROWS — Hook 7.\n'
+    '    if (dst->type == GGML_TYPE_TQ4P_D128 || dst->type == GGML_TYPE_TQ4P_D256) {\n'
+    '        const uint8_t layer_byte = (uint8_t)(dst->op_params[0] & 0xff);\n'
+    '        const float * src0_d = (const float *)src0->data;\n'
+    '        const bool idx_i64 = (src1->type == GGML_TYPE_I64);\n'
+    '        cudaStream_t stream = ctx.stream();\n'
+    '        const int64_t n_rows = src0->ne[1];\n'
+    '        const int64_t src0_stride = src0->nb[1] / sizeof(float);\n'
+    '        const int64_t dst_stride = dst->nb[1];\n'
+    '        if (dst->type == GGML_TYPE_TQ4P_D128) {\n'
+    '            ggml_cuda_set_rows_tq4p_d128(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        } else {\n'
+    '            ggml_cuda_set_rows_tq4p_d256(src0_d, src1->data, dst->data, layer_byte, idx_i64, n_rows, src0_stride, dst_stride, stream);\n'
+    '        }\n'
+    '        return;\n'
+    '    }\n'
+    '\n'
+    '    if (src1->type == GGML_TYPE_I64) {',
+]
+
+for dispatch_anchor in dispatch_anchors:
+    if dispatch_anchor in t:
+        t = t.replace(dispatch_anchor, dispatch_new, 1)
+        break
+else:
+    print("ERROR: ggml_cuda_op_set_rows dispatch anchor not found in set-rows.cu", file=sys.stderr)
+    sys.exit(1)
 p.write_text(t)
 print(f"[+] patched: {p}")
 PY
@@ -659,12 +845,10 @@ fi
 TQP_DEQUANT_IMPL="$GGML/src/ggml-cuda/tqp-dequantize.cu"
 
 if [[ -f "$CONVERT_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
-    if grep -q "dequantize_row_tqp_d128_b2_cuda" "$CONVERT_CU" 2>/dev/null; then
-        echo "[=] convert.cu TQ4P dequantize dispatch already patched"
-    else
-        echo "[+] patching convert.cu TQ4P dequantize dispatch"
-        python3 - "$CONVERT_CU" <<'PY'
+    echo "[+] patching convert.cu TQ4P dequantize dispatch"
+    python3 - "$CONVERT_CU" <<'PY'
 import pathlib
+import re
 import sys
 
 p = pathlib.Path(sys.argv[1])
@@ -675,58 +859,71 @@ if include_anchor not in t:
     print('ERROR: convert.cu include anchor not found', file=sys.stderr)
     sys.exit(1)
 
-decl = (
-    '#include "dequantize.cuh"\n'
-    '\n'
-    '// TQ4P flash-attention staging dequantizers - Hook 8.\n'
-    'extern "C" void dequantize_row_tq4p_d128_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tq4p_d256_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+decls = [
+    'extern "C" void dequantize_row_tq4p_d64_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d128_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d256_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d64_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tq4p_d64_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tq4p_d128_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tq4p_d256_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d128_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d128_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d256_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d256_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d128_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d128_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d256_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
-    'extern "C" void dequantize_row_tqp_d256_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d128_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d128_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d256_b2_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d256_b4_cuda(const void *, half *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d128_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d128_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d256_b2_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d256_b4_f32_cuda(const void *, float *, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b2_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+    'extern "C" void dequantize_row_tqp_d64_b4_nc_cuda(\n'
+    '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tqp_d128_b2_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tqp_d128_b4_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tqp_d256_b2_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
     'extern "C" void dequantize_row_tqp_d256_b4_nc_cuda(\n'
     '    const void *, half *, int64_t, int64_t, int64_t, int64_t,\n'
-    '    int64_t, int64_t, int64_t, cudaStream_t);\n'
-)
-t = t.replace(include_anchor, decl, 1)
+    '    int64_t, int64_t, int64_t, cudaStream_t);\n',
+]
+missing = [decl for decl in decls if decl not in t]
+if missing:
+    insert = include_anchor + '\n// TQ4P flash-attention staging dequantizers - Hook 8.\n' + ''.join(missing)
+    t = t.replace(include_anchor, insert, 1)
 
-fp16_anchor = (
-    '        case GGML_TYPE_MXFP4:\n'
-    '            return dequantize_row_mxfp4_cuda;\n'
-    '        case GGML_TYPE_F32:'
-)
-if fp16_anchor not in t:
-    print('ERROR: convert.cu ggml_get_to_fp16_cuda MXFP4 anchor not found', file=sys.stderr)
-    sys.exit(1)
 fp16_replacement = (
     '        case GGML_TYPE_MXFP4:\n'
     '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D64:\n'
+    '            return dequantize_row_tq4p_d64_cuda;\n'
     '        case GGML_TYPE_TQ4P_D128:\n'
     '            return dequantize_row_tq4p_d128_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B2:\n'
+    '            return dequantize_row_tqp_d64_b2_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B4:\n'
+    '            return dequantize_row_tqp_d64_b4_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B2:\n'
     '            return dequantize_row_tqp_d128_b2_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B4:\n'
@@ -737,23 +934,40 @@ fp16_replacement = (
     '            return dequantize_row_tqp_d256_b4_cuda;\n'
     '        case GGML_TYPE_F32:'
 )
-t = t.replace(fp16_anchor, fp16_replacement, 1)
-
-fp32_anchor = (
+fp16_anchors = [
     '        case GGML_TYPE_MXFP4:\n'
     '            return dequantize_row_mxfp4_cuda;\n'
-    '        case GGML_TYPE_F16:'
-)
-if fp32_anchor not in t:
-    print('ERROR: convert.cu ggml_get_to_fp32_cuda MXFP4 anchor not found', file=sys.stderr)
+    '        case GGML_TYPE_F32:',
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_cuda;\n'
+    '        case GGML_TYPE_F32:',
+    fp16_replacement,
+]
+for fp16_anchor in fp16_anchors:
+    if fp16_anchor in t:
+        t = t.replace(fp16_anchor, fp16_replacement, 1)
+        break
+else:
+    print('ERROR: convert.cu ggml_get_to_fp16_cuda MXFP4 anchor not found', file=sys.stderr)
     sys.exit(1)
+
 fp32_replacement = (
     '        case GGML_TYPE_MXFP4:\n'
     '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D64:\n'
+    '            return dequantize_row_tq4p_d64_f32_cuda;\n'
     '        case GGML_TYPE_TQ4P_D128:\n'
     '            return dequantize_row_tq4p_d128_f32_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B2:\n'
+    '            return dequantize_row_tqp_d64_b2_f32_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B4:\n'
+    '            return dequantize_row_tqp_d64_b4_f32_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B2:\n'
     '            return dequantize_row_tqp_d128_b2_f32_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B4:\n'
@@ -764,23 +978,52 @@ fp32_replacement = (
     '            return dequantize_row_tqp_d256_b4_f32_cuda;\n'
     '        case GGML_TYPE_F16:'
 )
-t = t.replace(fp32_anchor, fp32_replacement, 1)
-
-fp16_nc_anchor = (
-    '        case GGML_TYPE_Q8_0:\n'
-    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
-    '        case GGML_TYPE_BF16:'
-)
-if fp16_nc_anchor not in t:
-    print('ERROR: convert.cu ggml_get_to_fp16_nc_cuda Q8_0 anchor not found', file=sys.stderr)
+fp32_anchors = [
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_F16:',
+    '        case GGML_TYPE_MXFP4:\n'
+    '            return dequantize_row_mxfp4_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '            return dequantize_row_tq4p_d128_f32_cuda;\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            return dequantize_row_tq4p_d256_f32_cuda;\n'
+    '        case GGML_TYPE_F16:',
+    fp32_replacement,
+]
+for fp32_anchor in fp32_anchors:
+    if fp32_anchor in t:
+        t = t.replace(fp32_anchor, fp32_replacement, 1)
+        break
+else:
+    print('ERROR: convert.cu ggml_get_to_fp32_cuda MXFP4 anchor not found', file=sys.stderr)
     sys.exit(1)
-fp16_nc_replacement = (
+
+fp16_nc_function = (
+    'to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {\n'
+    '    switch (type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '            return convert_unary_cuda<float>;\n'
+    '        case GGML_TYPE_Q4_0:\n'
+    '            return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;\n'
+    '        case GGML_TYPE_Q4_1:\n'
+    '            return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;\n'
+    '        case GGML_TYPE_Q5_0:\n'
+    '            return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;\n'
+    '        case GGML_TYPE_Q5_1:\n'
+    '            return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;\n'
     '        case GGML_TYPE_Q8_0:\n'
     '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_TQ4P_D64:\n'
+    '            return dequantize_row_tq4p_d64_nc_cuda;\n'
     '        case GGML_TYPE_TQ4P_D128:\n'
     '            return dequantize_row_tq4p_d128_nc_cuda;\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
     '            return dequantize_row_tq4p_d256_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B2:\n'
+    '            return dequantize_row_tqp_d64_b2_nc_cuda;\n'
+    '        case GGML_TYPE_TQP_D64_B4:\n'
+    '            return dequantize_row_tqp_d64_b4_nc_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B2:\n'
     '            return dequantize_row_tqp_d128_b2_nc_cuda;\n'
     '        case GGML_TYPE_TQP_D128_B4:\n'
@@ -789,14 +1032,56 @@ fp16_nc_replacement = (
     '            return dequantize_row_tqp_d256_b2_nc_cuda;\n'
     '        case GGML_TYPE_TQP_D256_B4:\n'
     '            return dequantize_row_tqp_d256_b4_nc_cuda;\n'
-    '        case GGML_TYPE_BF16:'
+    '        case GGML_TYPE_BF16:\n'
+    '            return convert_unary_cuda<nv_bfloat16>;\n'
+    '        default:\n'
+    '            return nullptr;\n'
+    '    }\n'
+    '}\n'
 )
-t = t.replace(fp16_nc_anchor, fp16_nc_replacement, 1)
+fp16_nc_pattern = re.compile(
+    r'to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda\(ggml_type type\) \{\n.*?\n\}\n',
+    re.S,
+)
+t, count = fp16_nc_pattern.subn(fp16_nc_function, t, count=1)
+if count == 0:
+    print('ERROR: convert.cu ggml_get_to_fp16_nc_cuda function not found', file=sys.stderr)
+    sys.exit(1)
+
+fp32_nc_function = (
+    'to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {\n'
+    '    switch (type) {\n'
+    '        case GGML_TYPE_F16:\n'
+    '            return convert_unary_cuda<half, float>;\n'
+    '        case GGML_TYPE_Q4_0:\n'
+    '            return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;\n'
+    '        case GGML_TYPE_Q4_1:\n'
+    '            return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;\n'
+    '        case GGML_TYPE_Q5_0:\n'
+    '            return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;\n'
+    '        case GGML_TYPE_Q5_1:\n'
+    '            return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;\n'
+    '        case GGML_TYPE_Q8_0:\n'
+    '            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;\n'
+    '        case GGML_TYPE_BF16:\n'
+    '            return convert_unary_cuda<nv_bfloat16, float>;\n'
+    '        default:\n'
+    '            return nullptr;\n'
+    '    }\n'
+    '}\n'
+)
+fp32_nc_pattern = re.compile(
+    r'to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda\(ggml_type type\) \{\n.*?\n\}\n',
+    re.S,
+)
+t, count = fp32_nc_pattern.subn(fp32_nc_function, t, count=1)
+if count == 0:
+    print('ERROR: convert.cu ggml_get_to_fp32_nc_cuda function not found', file=sys.stderr)
+    sys.exit(1)
 
 p.write_text(t)
 print(f"[+] patched: {p}")
 PY
-    fi
 fi
 
 if [[ -f "$FATTN_CU" && -f "$TQP_DEQUANT_IMPL" ]]; then
@@ -821,10 +1106,12 @@ old_macro = (
 new_macro = (
     '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
     '    {                                                                                                            \\\n'
-    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D64 || K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '            || K->type == GGML_TYPE_TQP_D64_B2 || K->type == GGML_TYPE_TQP_D64_B4                           \\\n'
     '            || K->type == GGML_TYPE_TQP_D128_B2 || K->type == GGML_TYPE_TQP_D128_B4                           \\\n'
     '            || K->type == GGML_TYPE_TQP_D256_B2 || K->type == GGML_TYPE_TQP_D256_B4;                          \\\n'
-    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D64 || V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256             \\\n'
+    '            || V->type == GGML_TYPE_TQP_D64_B2 || V->type == GGML_TYPE_TQP_D64_B4                           \\\n'
     '            || V->type == GGML_TYPE_TQP_D128_B2 || V->type == GGML_TYPE_TQP_D128_B4                           \\\n'
     '            || V->type == GGML_TYPE_TQP_D256_B2 || V->type == GGML_TYPE_TQP_D256_B4;                          \\\n'
     '        const bool type_K_okay = K->type == (type_K)                                                            \\\n'
@@ -835,33 +1122,62 @@ new_macro = (
     '            || (type_V_tq4p && (type_V) == GGML_TYPE_F16);                                                       \\\n'
     '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n'
 )
-if old_macro not in t:
+old_macros = [
+    old_macro,
+    '#define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \\\n'
+    '    {                                                                                                            \\\n'
+    '        const bool type_K_tq4p = K->type == GGML_TYPE_TQ4P_D128 || K->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_V_tq4p = V->type == GGML_TYPE_TQ4P_D128 || V->type == GGML_TYPE_TQ4P_D256;               \\\n'
+    '        const bool type_K_okay = K->type == (type_K)                                                            \\\n'
+    '            || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_K_tq4p && (type_K) == GGML_TYPE_F16); /* TQ4P flash-attention staging */                    \\\n'
+    '        const bool type_V_okay = V->type == (type_V)                                                            \\\n'
+    '            || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16)                                           \\\n'
+    '            || (type_V_tq4p && (type_V) == GGML_TYPE_F16);                                                       \\\n'
+    '        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \\\n',
+]
+for candidate in old_macros:
+    if candidate in t:
+        t = t.replace(candidate, new_macro, 1)
+        break
+else:
     print('ERROR: fattn.cu FATTN_VEC_CASE anchor not found', file=sys.stderr)
     sys.exit(1)
-t = t.replace(old_macro, new_macro, 1)
 
-switch_anchor = (
-    '    switch (K->type) {\n'
-    '        case GGML_TYPE_F32:\n'
-    '        case GGML_TYPE_F16:\n'
-    '            break;'
-)
-if switch_anchor not in t:
-    print('ERROR: fattn.cu K->type switch anchor not found', file=sys.stderr)
-    sys.exit(1)
 switch_replacement = (
     '    switch (K->type) {\n'
     '        case GGML_TYPE_F32:\n'
     '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D64:\n'
     '        case GGML_TYPE_TQ4P_D128:\n'
     '        case GGML_TYPE_TQ4P_D256:\n'
+    '        case GGML_TYPE_TQP_D64_B2:\n'
+    '        case GGML_TYPE_TQP_D64_B4:\n'
     '        case GGML_TYPE_TQP_D128_B2:\n'
     '        case GGML_TYPE_TQP_D128_B4:\n'
     '        case GGML_TYPE_TQP_D256_B2:\n'
     '        case GGML_TYPE_TQP_D256_B4:\n'
     '            break;'
 )
-t = t.replace(switch_anchor, switch_replacement, 1)
+switch_anchors = [
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '            break;',
+    '    switch (K->type) {\n'
+    '        case GGML_TYPE_F32:\n'
+    '        case GGML_TYPE_F16:\n'
+    '        case GGML_TYPE_TQ4P_D128:\n'
+    '        case GGML_TYPE_TQ4P_D256:\n'
+    '            break;',
+]
+for switch_anchor in switch_anchors:
+    if switch_anchor in t:
+        t = t.replace(switch_anchor, switch_replacement, 1)
+        break
+else:
+    print('ERROR: fattn.cu K->type switch anchor not found', file=sys.stderr)
+    sys.exit(1)
 
 # V->type switch: upstream fattn.cu no longer has a separate V->type switch.
 # Instead it requires K->type == V->type (unless GGML_CUDA_FA_ALL_QUANTS).

@@ -22,11 +22,13 @@
 # Usage:
 #   scripts/smoke_test_tq4p.sh
 #   scripts/smoke_test_tq4p.sh --cache-type tq4p_d256
+#   scripts/smoke_test_tq4p.sh --model qwen3.5:4b-q8_0
 
 set -euo pipefail
 
 CACHE_TYPE="${CACHE_TYPE:-tq4p_d128}"
 OLLAMA_BIN="${OLLAMA_BIN:-$HOME/.local/src/ollama-tq/ollama/ollama}"
+MODEL="${MODEL:-}"
 LOG="/tmp/ollama-tq4p.log"
 PORT=11434
 TIMEOUT=30
@@ -35,6 +37,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --cache-type=*) CACHE_TYPE="${1#*=}"; shift ;;
         --cache-type)   CACHE_TYPE="${2:?--cache-type requires a value}"; shift 2 ;;
+        --model=*)      MODEL="${1#*=}"; shift ;;
+        --model)        MODEL="${2:?--model requires a value}"; shift 2 ;;
         -h|--help)      sed -n '2,28p' "$0"; exit 0 ;;
         *)              echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -139,26 +143,28 @@ echo "[+] server is up (PID $OLLAMA_PID)"
 
 # ── (f) Run inference ──────────────────────────────────────────────────
 
-# Discover a small generative model the user has already pulled.
-# Skip embedding models (can't generate text) and cloud models (no local weights).
-MODEL=""
-MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
+if [[ -z "$MODEL" ]]; then
+    # Discover a small generative model the user has already pulled.
+    # Skip embedding models (can't generate text) and cloud models (no local weights).
+    MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
 
-if [[ -n "$MODEL_LIST" ]]; then
-    # awk fields: $1=name $2=id $3=size_num $4=size_unit (GB/MB).
-    # Convert to MB, sort numerically, pick smallest generative model.
-    MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
-        | grep -viE 'embed|rerank' \
-        | awk '$3+0 > 0 {
-            mb = ($4 == "GB") ? $3 * 1024 : $3;
-            printf "%012.1f %s\n", mb, $1
-        }' \
-        | sort -n | head -1 | awk '{print $2}')
+    if [[ -n "$MODEL_LIST" ]]; then
+        # awk fields: $1=name $2=id $3=size_num $4=size_unit (GB/MB).
+        # Convert to MB, sort numerically, pick smallest generative model.
+        MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
+            | grep -viE 'embed|rerank' \
+            | awk '$3+0 > 0 {
+                mb = ($4 == "GB") ? $3 * 1024 : $3;
+                printf "%012.1f %s\n", mb, $1
+            }' \
+            | sort -n | head -1 | awk '{print $2}')
+    fi
 fi
 
 if [[ -z "$MODEL" ]]; then
     echo "ERROR: no generative (non-embedding) local models found." >&2
     echo "  Pull a small model first: ollama pull qwen2.5:3b" >&2
+    echo "  Or pass one explicitly: scripts/smoke_test_tq4p.sh --model qwen3.5:4b-q8_0" >&2
     exit 1
 fi
 echo "[+] using model: $MODEL"
@@ -250,23 +256,31 @@ echo "    $(echo "$INFERENCE_TEXT" | head -3 | sed 's/^/    /')"
 
 # ── (i) Success banner ─────────────────────────────────────────────────
 
-cat <<'BANNER'
+# Resolve bits-per-weight for the cache type.
+case "$CACHE_TYPE" in
+    tq4p_d64|tqp_d64_b3)   BPW="4.625" ;;
+    tqp_d64_b2)             BPW="4.125" ;;
+    tqp_d64_b4)             BPW="5.125" ;;
+    tq4p_d128|tqp_d128_b3)  BPW="4.25"  ;;
+    tqp_d128_b2)            BPW="4.0"   ;;
+    tqp_d128_b4)            BPW="4.5"   ;;
+    tq4p_d256|tqp_d256_b3)  BPW="4.16"  ;;
+    tqp_d256_b2)            BPW="4.0"   ;;
+    tqp_d256_b4)            BPW="4.33"  ;;
+    *)                       BPW="?"     ;;
+esac
 
+printf '
 ╔══════════════════════════════════════════════════════════════╗
 ║                    TQ4P IS LIVE                             ║
 ║                                                             ║
-║  KV cache type:  tq4p_d128 (4.25 bpw)                      ║
+║  KV cache type:  %-14s (%s bpw)%*s║
 ║  Algorithm:      Stage-1 Lloyd-Max + Stage-2 QJL            ║
 ║  Expected:       cosine similarity ≥ 0.92  (paper: 0.93)   ║
 ║                                                             ║
 ║  Allowlist + Go plumbing + ggml dispatch all aligned.       ║
 ╚══════════════════════════════════════════════════════════════╝
-BANNER
-
-# Customize banner for non-default cache type.
-if [[ "$CACHE_TYPE" != "tq4p_d128" ]]; then
-    echo "  (tested with cache type: $CACHE_TYPE)"
-fi
+' "$CACHE_TYPE" "$BPW" $((27 - ${#CACHE_TYPE} - ${#BPW})) ""
 
 echo "[+] log preserved at $LOG"
 exit 0

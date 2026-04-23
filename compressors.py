@@ -12,7 +12,10 @@ import math
 
 import torch
 
-from turboquant import TurboQuantMSE, TurboQuantProd
+try:
+    from .turboquant import TurboQuantMSE, TurboQuantProd
+except ImportError:  # Support direct module imports from the repo root.
+    from turboquant import TurboQuantMSE, TurboQuantProd
 
 _NORM_EPS = 1e-8
 _FLOAT_STORAGE_DTYPES = {

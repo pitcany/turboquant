@@ -17,9 +17,9 @@ survives small drift.
 
 | File | Kind | What |
 |---|---|---|
-| `ggml/include/ggml.h` | additive | 2 enum values, bump `GGML_TYPE_COUNT` |
-| `ggml/src/ggml.c` | additive | 2 entries in backend-agnostic `type_traits` table |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | additive | 2 entries in `type_traits_cpu` dispatch table |
+| `ggml/include/ggml.h` | additive | 9 enum values, bump `GGML_TYPE_COUNT` |
+| `ggml/src/ggml.c` | additive | 9 entries in backend-agnostic `type_traits` table |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | additive | 9 entries in `type_traits_cpu` dispatch table |
 | `ggml/src/CMakeLists.txt` | additive | 1 source file added |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | additive | CUDA dispatch for TQ4P vec_dot |
 
@@ -43,13 +43,20 @@ Replace with:
 
         // TurboQuant paper-faithful (Stage 1 Lloyd-Max + Stage 2 QJL).
         // See ggml/src/ggml-tq-paper.h.
-        GGML_TYPE_TQ4P_D128 = 47,
-        GGML_TYPE_TQ4P_D256 = 48,
+        GGML_TYPE_TQ4P_D64  = 47,
+        GGML_TYPE_TQ4P_D128 = 48,
+        GGML_TYPE_TQ4P_D256 = 49,
+        GGML_TYPE_TQP_D64_B2 = 50,
+        GGML_TYPE_TQP_D64_B4 = 51,
+        GGML_TYPE_TQP_D128_B2 = 52,
+        GGML_TYPE_TQP_D128_B4 = 53,
+        GGML_TYPE_TQP_D256_B2 = 54,
+        GGML_TYPE_TQP_D256_B4 = 55,
 
-        GGML_TYPE_COUNT   = 49,
+        GGML_TYPE_COUNT   = 56,
 ```
 
-If other types have been added upstream and 47/48 are now taken, bump to
+If other types have been added upstream and 47+ are now taken, bump to
 the next free values and update steps 2 and 3 accordingly.
 
 ## 2. `ggml/src/ggml.c` — backend-agnostic `type_traits` table

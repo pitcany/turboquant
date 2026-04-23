@@ -58,7 +58,7 @@ def _block_cls(d: int, bits: int):
     return Block
 
 
-BLOCK_CLASSES = {(d, bits): _block_cls(d, bits) for d in (128, 256) for bits in BITS}
+BLOCK_CLASSES = {(d, bits): _block_cls(d, bits) for d in (64, 128, 256) for bits in BITS}
 
 
 class block_q8k_compat(ctypes.Structure):
@@ -155,7 +155,7 @@ def _cuda_legacy_name(kind: str, d: int) -> str:
 CPU = {}
 CUDA = {}
 
-for d in (128, 256):
+for d in (64, 128, 256):
     for bits in BITS:
         block_cls = BLOCK_CLASSES[(d, bits)]
         CPU[(d, bits, "quantize")] = _declare(
@@ -241,7 +241,7 @@ for d in (128, 256):
             [ctypes.c_void_p, ctypes.POINTER(block_cls), ctypes.POINTER(ctypes.c_float), ctypes.c_int64],
         )
 
-for d in (128, 256):
+for d in (64, 128, 256):
     legacy_block = BLOCK_CLASSES[(d, 3)]
     CPU[(d, 3, "legacy_quantize")] = _declare(
         cpu,
@@ -327,7 +327,7 @@ for d in (128, 256):
     )
 
 
-@pytest.fixture(scope="module", params=[128, 256])
+@pytest.fixture(scope="module", params=[64, 128, 256])
 def d(request):
     return request.param
 
@@ -556,21 +556,26 @@ def test_q8k_cuda_vs_cpu(d, bits, vectors, layer_idx, rotation):
     blocks = BlockArray(*[_cpu_quantize(d, bits, k.float().numpy().copy(), layer_byte) for k in keys])
     q8k = _quantize_q8k(query_vec.float().numpy())
 
-    cpu_out = (ctypes.c_float * len(keys))()
-    cuda_out = (ctypes.c_float * len(keys))()
+    for start in range(0, len(keys), n_tqp_per_q8k):
+        block_slice = ctypes.cast(
+            ctypes.byref(blocks, start * ctypes.sizeof(block_cls)),
+            ctypes.POINTER(block_cls),
+        )
+        cuda_out = (ctypes.c_float * n_tqp_per_q8k)()
+        cpu_out = ctypes.c_float(0.0)
 
-    CPU[(d, bits, "vec_dot_q8k")](
-        len(keys),
-        cpu_out,
-        ctypes.sizeof(ctypes.c_float),
-        q8k,
-        ctypes.sizeof(block_q8k_compat),
-        blocks,
-        ctypes.sizeof(block_cls),
-        d,
-    )
-    err = CUDA[(d, bits, "vec_dot_q8k")](q8k, blocks, cuda_out, len(keys))
-    assert err == 0
+        CPU[(d, bits, "vec_dot_q8k")](
+            Q8_QK,
+            ctypes.byref(cpu_out),
+            ctypes.sizeof(ctypes.c_float),
+            block_slice,
+            ctypes.sizeof(block_cls),
+            q8k,
+            ctypes.sizeof(block_q8k_compat),
+            1,
+        )
+        err = CUDA[(d, bits, "vec_dot_q8k")](q8k, block_slice, cuda_out, n_tqp_per_q8k)
+        assert err == 0
 
-    max_abs = max(abs(a - b) for a, b in zip(list(cpu_out), list(cuda_out)))
-    assert max_abs < 1e-4
+        cuda_total = sum(cuda_out)
+        assert abs(cpu_out.value - cuda_total) < 1e-4

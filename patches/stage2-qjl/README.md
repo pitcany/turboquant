@@ -7,6 +7,7 @@ vendored `ml/backend/ggml/ggml/`). Nothing existing is modified in place.
 
 | Type | head_dim | Covers | Block size | bpw |
 |---|---|---|---|---|
+| `GGML_TYPE_TQ4P_D64` | 64 | gpt-oss-20B and other `head_dim=64` models | 37 B / 64 | 4.625 |
 | `GGML_TYPE_TQ4P_D128` | 128 | Llama 3.x, Qwen 2.5, Qwen 3 | 69 B / 128 | 4.3125 |
 | `GGML_TYPE_TQ4P_D256` | 256 | Qwen 3.5 gated attention | 133 B / 256 | ~4.16 |
 
@@ -73,7 +74,7 @@ What the build script does on the ollama tree:
 5. Runs [`apply_go_plumbing.sh`](apply_go_plumbing.sh) and
    [`../../scripts/patch_ollama_kv_types.sh`](../../scripts/patch_ollama_kv_types.sh) —
    widens ollama's KV-cache-type allowlist and threads
-   `tq4p_d128` / `tq4p_d256` through four Go sites (`ml/backend.go`,
+   `tq4p_d64` / `tq4p_d128` / `tq4p_d256` through four Go sites (`ml/backend.go`,
    `ml/backend/ggml/ggml.go`, `runner/ollamarunner/cache.go`,
    `llama/llama.go`) so the cache-type string maps end-to-end to the
    correct GGML enum instead of silently falling back to f16.
@@ -103,8 +104,8 @@ patches/stage2-qjl/
 ├── c/
 │   ├── ggml-tq-paper.h                # public API
 │   ├── ggml-tq-paper.c                # CPU quant/dequant/prepare_query/vec_dot
-│   ├── tqp_centroids_d{128,256}.h     # Lloyd-Max codebook (generated)
-│   └── tqp_constants_d{128,256}.h     # σ + S per-layer (generated)
+│   ├── tqp_centroids_d{64,128,256}.h  # Lloyd-Max codebook (generated)
+│   └── tqp_constants_d{64,128,256}.h  # σ + S per-layer (generated)
 └── cuda/
     ├── PLAN.md                        # kernel design (WHT variant)
     ├── CUDA_IMPL_PLAN.md              # historical impl notes
@@ -127,9 +128,9 @@ load the same bits the C headers contain. `c/libggml_tq_paper.so` and
   and is ~5–10× slower than the fork's existing `TQ3_0` vec_dot.
 - **Ollama wiring is end-to-end**: KV-cache-type allowlist
   (`scripts/patch_ollama_kv_types.sh`) + four-site Go DType plumbing
-  (`apply_go_plumbing.sh`) + CUDA dispatch hook. `OLLAMA_KV_CACHE_TYPE=tq4p_d128`
-  and `OLLAMA_KV_CACHE_TYPE=tq4p_d256` both resolve to the real GGML
-  enum instead of falling back to f16.
+  (`apply_go_plumbing.sh`) + CUDA dispatch hook. `OLLAMA_KV_CACHE_TYPE=tq4p_d64`,
+  `OLLAMA_KV_CACHE_TYPE=tq4p_d128`, and `OLLAMA_KV_CACHE_TYPE=tq4p_d256`
+  all resolve to the real GGML enum instead of falling back to f16.
 - **Per-layer σ, Π and S + runtime rotation pick** — the block header
   byte packs `(rotation << 7) | (layer & 0x1f)`. The 32 pre-generated
   per-layer constants (seeds 42+i / 43+i) are selected at quant and

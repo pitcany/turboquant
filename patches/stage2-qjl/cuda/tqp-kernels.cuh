@@ -5,9 +5,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#define QK_TQP_D64 64
 #define QK_TQP_D128 128
 #define QK_TQP_D256 256
 
+#define QK_TQ4P_D64 QK_TQP_D64
 #define QK_TQ4P_D128 QK_TQP_D128
 #define QK_TQ4P_D256 QK_TQP_D256
 
@@ -35,6 +37,30 @@
 #define TQP_EXTRACT_EXPLICIT(byte)   ((uint8_t)(((byte) >> 6) & 1u))
 
 #pragma pack(push, 1)
+typedef struct {
+    uint16_t orig_norm;
+    uint16_t res_d;
+    uint8_t  layer_idx;
+    uint8_t  qs[TQP_QS_BYTES(QK_TQP_D64, 2)];
+    uint8_t  qjl_signs[TQP_SIGN_BYTES(QK_TQP_D64)];
+} block_tqp_d64_b2;
+
+typedef struct {
+    uint16_t orig_norm;
+    uint16_t res_d;
+    uint8_t  layer_idx;
+    uint8_t  qs[TQP_QS_BYTES(QK_TQP_D64, 3)];
+    uint8_t  qjl_signs[TQP_SIGN_BYTES(QK_TQP_D64)];
+} block_tqp_d64_b3;
+
+typedef struct {
+    uint16_t orig_norm;
+    uint16_t res_d;
+    uint8_t  layer_idx;
+    uint8_t  qs[TQP_QS_BYTES(QK_TQP_D64, 4)];
+    uint8_t  qjl_signs[TQP_SIGN_BYTES(QK_TQP_D64)];
+} block_tqp_d64_b4;
+
 typedef struct {
     uint16_t orig_norm;
     uint16_t res_d;
@@ -84,21 +110,29 @@ typedef struct {
 } block_tqp_d256_b4;
 #pragma pack(pop)
 
+typedef block_tqp_d64_b3 block_tq4p_d64;
 typedef block_tqp_d128_b3 block_tq4p_d128;
 typedef block_tqp_d256_b3 block_tq4p_d256;
 
+static_assert(sizeof(block_tqp_d64_b2) == TQP_BLOCK_SIZE(QK_TQP_D64, 2), "block_tqp_d64_b2 size");
+static_assert(sizeof(block_tqp_d64_b3) == TQP_BLOCK_SIZE(QK_TQP_D64, 3), "block_tqp_d64_b3 size");
+static_assert(sizeof(block_tqp_d64_b4) == TQP_BLOCK_SIZE(QK_TQP_D64, 4), "block_tqp_d64_b4 size");
 static_assert(sizeof(block_tqp_d128_b2) == TQP_BLOCK_SIZE(QK_TQP_D128, 2), "block_tqp_d128_b2 size");
 static_assert(sizeof(block_tqp_d128_b3) == TQP_BLOCK_SIZE(QK_TQP_D128, 3), "block_tqp_d128_b3 size");
 static_assert(sizeof(block_tqp_d128_b4) == TQP_BLOCK_SIZE(QK_TQP_D128, 4), "block_tqp_d128_b4 size");
 static_assert(sizeof(block_tqp_d256_b2) == TQP_BLOCK_SIZE(QK_TQP_D256, 2), "block_tqp_d256_b2 size");
 static_assert(sizeof(block_tqp_d256_b3) == TQP_BLOCK_SIZE(QK_TQP_D256, 3), "block_tqp_d256_b3 size");
 static_assert(sizeof(block_tqp_d256_b4) == TQP_BLOCK_SIZE(QK_TQP_D256, 4), "block_tqp_d256_b4 size");
+static_assert(sizeof(block_tq4p_d64) == 37, "block_tq4p_d64 size");
 static_assert(sizeof(block_tq4p_d128) == 69, "block_tq4p_d128 size");
 static_assert(sizeof(block_tq4p_d256) == 133, "block_tq4p_d256 size");
 
 template<int D, int BITS>
 struct tqp_cuda_block;
 
+template<> struct tqp_cuda_block<QK_TQP_D64, 2> { using type = block_tqp_d64_b2; };
+template<> struct tqp_cuda_block<QK_TQP_D64, 3> { using type = block_tqp_d64_b3; };
+template<> struct tqp_cuda_block<QK_TQP_D64, 4> { using type = block_tqp_d64_b4; };
 template<> struct tqp_cuda_block<QK_TQP_D128, 2> { using type = block_tqp_d128_b2; };
 template<> struct tqp_cuda_block<QK_TQP_D128, 3> { using type = block_tqp_d128_b3; };
 template<> struct tqp_cuda_block<QK_TQP_D128, 4> { using type = block_tqp_d128_b4; };
@@ -195,11 +229,14 @@ __device__ static inline uint8_t tqp_bucketize(float x, const float * bounds) {
 }
 
 __device__ static inline float tqp_warp_reduce_sum(float val) {
-    val += __shfl_xor_sync(0xffffffffu, val, 16);
-    val += __shfl_xor_sync(0xffffffffu, val, 8);
-    val += __shfl_xor_sync(0xffffffffu, val, 4);
-    val += __shfl_xor_sync(0xffffffffu, val, 2);
-    val += __shfl_xor_sync(0xffffffffu, val, 1);
+    const unsigned mask = __activemask();
+    if (mask == 0xffffffffu) {
+        val += __shfl_xor_sync(mask, val, 16);
+    }
+    val += __shfl_xor_sync(mask, val, 8);
+    val += __shfl_xor_sync(mask, val, 4);
+    val += __shfl_xor_sync(mask, val, 2);
+    val += __shfl_xor_sync(mask, val, 1);
     return val;
 }
 
@@ -248,7 +285,7 @@ __device__ static inline void tqp_quantize_block_device(
         const float * __restrict__ s,
         const float * __restrict__ centroids,
         const float * __restrict__ bounds) {
-    static_assert(D == QK_TQP_D128 || D == QK_TQP_D256, "unsupported TQP CUDA head dim");
+    static_assert(D == QK_TQP_D64 || D == QK_TQP_D128 || D == QK_TQP_D256, "unsupported TQP CUDA head dim");
     static_assert(BITS >= 2 && BITS <= 4, "unsupported TQP CUDA bits");
     static_assert((D % 32) == 0, "head dim must align to warp width");
 
