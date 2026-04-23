@@ -12,12 +12,16 @@
 
 #include "tqp-kernels.cuh"
 
+#include "tqp_centroids_d64_b2.h"
+#include "tqp_centroids_d64_b3.h"
+#include "tqp_centroids_d64_b4.h"
 #include "tqp_centroids_d128_b2.h"
 #include "tqp_centroids_d128_b3.h"
 #include "tqp_centroids_d128_b4.h"
 #include "tqp_centroids_d256_b2.h"
 #include "tqp_centroids_d256_b3.h"
 #include "tqp_centroids_d256_b4.h"
+#include "tqp_constants_d64.h"
 #include "tqp_constants_d128.h"
 #include "tqp_constants_d256.h"
 
@@ -32,18 +36,25 @@ inline constexpr int TQP_CUDA_BITS_MAX = 4;
 inline constexpr int TQP_CUDA_BITS_VARIANTS = TQP_CUDA_BITS_MAX - TQP_CUDA_BITS_MIN + 1;
 
 struct TqpDeviceState {
+    float * pi_d64 = nullptr;
+    float * s_d64 = nullptr;
     float * pi_d128 = nullptr;
     float * s_d128 = nullptr;
     float * pi_d256 = nullptr;
     float * s_d256 = nullptr;
+    float * sigma_d64 = nullptr; // [TQP_MAX_LAYERS][QK_TQP_D64]
     float * sigma_d128 = nullptr; // [TQP_MAX_LAYERS][QK_TQP_D128]
     float * sigma_d256 = nullptr; // [TQP_MAX_LAYERS][QK_TQP_D256]
+    std::array<float *, TQP_CUDA_BITS_VARIANTS> centroids_d64{};
+    std::array<float *, TQP_CUDA_BITS_VARIANTS> boundaries_d64{};
     std::array<float *, TQP_CUDA_BITS_VARIANTS> centroids_d128{};
     std::array<float *, TQP_CUDA_BITS_VARIANTS> boundaries_d128{};
     std::array<float *, TQP_CUDA_BITS_VARIANTS> centroids_d256{};
     std::array<float *, TQP_CUDA_BITS_VARIANTS> boundaries_d256{};
+    bool init_common_d64 = false;
     bool init_common_d128 = false;
     bool init_common_d256 = false;
+    std::array<bool, TQP_CUDA_BITS_VARIANTS> init_bits_d64{};
     std::array<bool, TQP_CUDA_BITS_VARIANTS> init_bits_d128{};
     std::array<bool, TQP_CUDA_BITS_VARIANTS> init_bits_d256{};
 };
@@ -69,6 +80,13 @@ static inline size_t tqp_cuda_boundary_count(int bits) {
 
 static inline const float * tqp_cuda_host_centroids(int head_dim, int bits) {
     switch (head_dim) {
+        case QK_TQP_D64:
+            switch (bits) {
+                case 2: return TQP_CENTROIDS_D64_B2;
+                case 3: return TQP_CENTROIDS_D64_B3;
+                case 4: return TQP_CENTROIDS_D64_B4;
+            }
+            break;
         case QK_TQP_D128:
             switch (bits) {
                 case 2: return TQP_CENTROIDS_D128_B2;
@@ -89,6 +107,13 @@ static inline const float * tqp_cuda_host_centroids(int head_dim, int bits) {
 
 static inline const float * tqp_cuda_host_boundaries(int head_dim, int bits) {
     switch (head_dim) {
+        case QK_TQP_D64:
+            switch (bits) {
+                case 2: return TQP_BOUNDARIES_D64_B2;
+                case 3: return TQP_BOUNDARIES_D64_B3;
+                case 4: return TQP_BOUNDARIES_D64_B4;
+            }
+            break;
         case QK_TQP_D128:
             switch (bits) {
                 case 2: return TQP_BOUNDARIES_D128_B2;
@@ -132,6 +157,7 @@ static inline float * tqp_cuda_centroids_ptr(const TqpDeviceState * state, int h
         return nullptr;
     }
     switch (head_dim) {
+        case QK_TQP_D64: return state->centroids_d64[(size_t)slot];
         case QK_TQP_D128: return state->centroids_d128[(size_t)slot];
         case QK_TQP_D256: return state->centroids_d256[(size_t)slot];
         default: return nullptr;
@@ -144,6 +170,7 @@ static inline float * tqp_cuda_boundaries_ptr(const TqpDeviceState * state, int 
         return nullptr;
     }
     switch (head_dim) {
+        case QK_TQP_D64: return state->boundaries_d64[(size_t)slot];
         case QK_TQP_D128: return state->boundaries_d128[(size_t)slot];
         case QK_TQP_D256: return state->boundaries_d256[(size_t)slot];
         default: return nullptr;
@@ -154,21 +181,72 @@ static inline float * tqp_cuda_pi_ptr(const TqpDeviceState * state, int head_dim
     if (!state) {
         return nullptr;
     }
-    return head_dim == QK_TQP_D128 ? state->pi_d128 : head_dim == QK_TQP_D256 ? state->pi_d256 : nullptr;
+    return head_dim == QK_TQP_D64 ? state->pi_d64 : head_dim == QK_TQP_D128 ? state->pi_d128 : head_dim == QK_TQP_D256 ? state->pi_d256 : nullptr;
 }
 
 static inline float * tqp_cuda_s_ptr(const TqpDeviceState * state, int head_dim) {
     if (!state) {
         return nullptr;
     }
-    return head_dim == QK_TQP_D128 ? state->s_d128 : head_dim == QK_TQP_D256 ? state->s_d256 : nullptr;
+    return head_dim == QK_TQP_D64 ? state->s_d64 : head_dim == QK_TQP_D128 ? state->s_d128 : head_dim == QK_TQP_D256 ? state->s_d256 : nullptr;
 }
 
 static inline float * tqp_cuda_sigma_ptr(const TqpDeviceState * state, int head_dim) {
     if (!state) {
         return nullptr;
     }
-    return head_dim == QK_TQP_D128 ? state->sigma_d128 : head_dim == QK_TQP_D256 ? state->sigma_d256 : nullptr;
+    return head_dim == QK_TQP_D64 ? state->sigma_d64 : head_dim == QK_TQP_D128 ? state->sigma_d128 : head_dim == QK_TQP_D256 ? state->sigma_d256 : nullptr;
+}
+
+static inline cudaError_t tqp_cuda_init_common_d64(TqpDeviceState & state) {
+    if (state.init_common_d64) {
+        return cudaSuccess;
+    }
+
+    float * pi = nullptr;
+    float * s = nullptr;
+    float * sigma = nullptr;
+    cudaError_t err = cudaMalloc((void **)&pi, sizeof(TQP_PI_D64));
+    if (err != cudaSuccess) return err;
+    err = cudaMalloc((void **)&s, sizeof(TQP_S_D64));
+    if (err != cudaSuccess) {
+        cudaFree(pi);
+        return err;
+    }
+    err = cudaMalloc((void **)&sigma, sizeof(TQP_SIGMA_D64));
+    if (err != cudaSuccess) {
+        cudaFree(s);
+        cudaFree(pi);
+        return err;
+    }
+
+    err = cudaMemcpy(pi, TQP_PI_D64, sizeof(TQP_PI_D64), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(sigma);
+        cudaFree(s);
+        cudaFree(pi);
+        return err;
+    }
+    err = cudaMemcpy(s, TQP_S_D64, sizeof(TQP_S_D64), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(sigma);
+        cudaFree(s);
+        cudaFree(pi);
+        return err;
+    }
+    err = cudaMemcpy(sigma, TQP_SIGMA_D64, sizeof(TQP_SIGMA_D64), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(sigma);
+        cudaFree(s);
+        cudaFree(pi);
+        return err;
+    }
+
+    state.pi_d64 = pi;
+    state.s_d64 = s;
+    state.sigma_d64 = sigma;
+    state.init_common_d64 = true;
+    return cudaSuccess;
 }
 
 static inline cudaError_t tqp_cuda_init_common_d128(TqpDeviceState & state) {
@@ -270,6 +348,58 @@ static inline cudaError_t tqp_cuda_init_common_d256(TqpDeviceState & state) {
     state.s_d256 = s;
     state.sigma_d256 = sigma;
     state.init_common_d256 = true;
+    return cudaSuccess;
+}
+
+static inline cudaError_t tqp_cuda_init_bits_d64(TqpDeviceState & state, int bits) {
+    const int slot = tqp_cuda_bits_slot(bits);
+    if (slot < 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (state.init_bits_d64[(size_t)slot]) {
+        return cudaSuccess;
+    }
+
+    const float * host_centroids = tqp_cuda_host_centroids(QK_TQP_D64, bits);
+    const float * host_boundaries = tqp_cuda_host_boundaries(QK_TQP_D64, bits);
+    if (!host_centroids || !host_boundaries) {
+        return cudaErrorInvalidValue;
+    }
+
+    float * centroids = nullptr;
+    float * boundaries = nullptr;
+    cudaError_t err = cudaMalloc((void **)&centroids, tqp_cuda_centroid_count(bits) * sizeof(float));
+    if (err != cudaSuccess) return err;
+    err = cudaMalloc((void **)&boundaries, tqp_cuda_boundary_count(bits) * sizeof(float));
+    if (err != cudaSuccess) {
+        cudaFree(centroids);
+        return err;
+    }
+
+    err = cudaMemcpy(
+        centroids,
+        host_centroids,
+        tqp_cuda_centroid_count(bits) * sizeof(float),
+        cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(boundaries);
+        cudaFree(centroids);
+        return err;
+    }
+    err = cudaMemcpy(
+        boundaries,
+        host_boundaries,
+        tqp_cuda_boundary_count(bits) * sizeof(float),
+        cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(boundaries);
+        cudaFree(centroids);
+        return err;
+    }
+
+    state.centroids_d64[(size_t)slot] = centroids;
+    state.boundaries_d64[(size_t)slot] = boundaries;
+    state.init_bits_d64[(size_t)slot] = true;
     return cudaSuccess;
 }
 
@@ -389,6 +519,10 @@ static inline cudaError_t tqp_cuda_init(int head_dim, int bits) {
     TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
 
     switch (head_dim) {
+        case QK_TQP_D64:
+            err = tqp_cuda_init_common_d64(state);
+            if (err != cudaSuccess) return err;
+            return tqp_cuda_init_bits_d64(state, bits);
         case QK_TQP_D128:
             err = tqp_cuda_init_common_d128(state);
             if (err != cudaSuccess) return err;
@@ -411,6 +545,9 @@ static inline void tqp_cuda_cleanup() {
     std::lock_guard<std::mutex> lock(g_tqp_init_mutex);
     TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
 
+    if (state.pi_d64) cudaFree(state.pi_d64);
+    if (state.s_d64) cudaFree(state.s_d64);
+    if (state.sigma_d64) cudaFree(state.sigma_d64);
     if (state.pi_d128) cudaFree(state.pi_d128);
     if (state.s_d128) cudaFree(state.s_d128);
     if (state.sigma_d128) cudaFree(state.sigma_d128);
@@ -419,6 +556,8 @@ static inline void tqp_cuda_cleanup() {
     if (state.sigma_d256) cudaFree(state.sigma_d256);
 
     for (size_t i = 0; i < TQP_CUDA_BITS_VARIANTS; ++i) {
+        if (state.centroids_d64[i]) cudaFree(state.centroids_d64[i]);
+        if (state.boundaries_d64[i]) cudaFree(state.boundaries_d64[i]);
         if (state.centroids_d128[i]) cudaFree(state.centroids_d128[i]);
         if (state.boundaries_d128[i]) cudaFree(state.boundaries_d128[i]);
         if (state.centroids_d256[i]) cudaFree(state.centroids_d256[i]);
@@ -435,10 +574,10 @@ static inline void tqp_cuda_cleanup_all() {
     std::lock_guard<std::mutex> lock(g_tqp_init_mutex);
     for (int device_id = 0; device_id < TQP_MAX_CUDA_DEVICES; ++device_id) {
         TqpDeviceState & state = g_tqp_devices[(size_t)device_id];
-        if (!state.init_common_d128 && !state.init_common_d256) {
+        if (!state.init_common_d64 && !state.init_common_d128 && !state.init_common_d256) {
             bool has_bits = false;
             for (size_t i = 0; i < TQP_CUDA_BITS_VARIANTS; ++i) {
-                has_bits = has_bits || state.init_bits_d128[i] || state.init_bits_d256[i];
+                has_bits = has_bits || state.init_bits_d64[i] || state.init_bits_d128[i] || state.init_bits_d256[i];
             }
             if (!has_bits) {
                 continue;
@@ -449,6 +588,9 @@ static inline void tqp_cuda_cleanup_all() {
             continue;
         }
 
+        if (state.pi_d64) cudaFree(state.pi_d64);
+        if (state.s_d64) cudaFree(state.s_d64);
+        if (state.sigma_d64) cudaFree(state.sigma_d64);
         if (state.pi_d128) cudaFree(state.pi_d128);
         if (state.s_d128) cudaFree(state.s_d128);
         if (state.sigma_d128) cudaFree(state.sigma_d128);
@@ -457,6 +599,8 @@ static inline void tqp_cuda_cleanup_all() {
         if (state.sigma_d256) cudaFree(state.sigma_d256);
 
         for (size_t i = 0; i < TQP_CUDA_BITS_VARIANTS; ++i) {
+            if (state.centroids_d64[i]) cudaFree(state.centroids_d64[i]);
+            if (state.boundaries_d64[i]) cudaFree(state.boundaries_d64[i]);
             if (state.centroids_d128[i]) cudaFree(state.centroids_d128[i]);
             if (state.boundaries_d128[i]) cudaFree(state.boundaries_d128[i]);
             if (state.centroids_d256[i]) cudaFree(state.centroids_d256[i]);

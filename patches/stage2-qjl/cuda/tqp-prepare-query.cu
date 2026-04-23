@@ -228,6 +228,9 @@ static int tqp_cuda_prepare_query_host(
             QK_TQP_D##D, q_host, Sq_host, q_rot_host, layer_byte, ggml_cuda_tqp_prepare_query_d##D##_b##BITS);               \
     }
 
+TQP_DEFINE_PREPARE_QUERY(64, 2)
+TQP_DEFINE_PREPARE_QUERY(64, 3)
+TQP_DEFINE_PREPARE_QUERY(64, 4)
 TQP_DEFINE_PREPARE_QUERY(128, 2)
 TQP_DEFINE_PREPARE_QUERY(128, 3)
 TQP_DEFINE_PREPARE_QUERY(128, 4)
@@ -237,6 +240,11 @@ TQP_DEFINE_PREPARE_QUERY(256, 4)
 
 #undef TQP_DEFINE_PREPARE_QUERY
 
+extern "C" void ggml_cuda_tqp_prepare_query_d64(
+        const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream) {
+    ggml_cuda_tqp_prepare_query_d64_b3(q, Sq, q_rot, layer_byte, stream);
+}
+
 extern "C" void ggml_cuda_tqp_prepare_query_d128(
         const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream) {
     ggml_cuda_tqp_prepare_query_d128_b3(q, Sq, q_rot, layer_byte, stream);
@@ -245,6 +253,16 @@ extern "C" void ggml_cuda_tqp_prepare_query_d128(
 extern "C" void ggml_cuda_tqp_prepare_query_d256(
         const float * q, float * Sq, float * q_rot, uint8_t layer_byte, cudaStream_t stream) {
     ggml_cuda_tqp_prepare_query_d256_b3(q, Sq, q_rot, layer_byte, stream);
+}
+
+extern "C" void ggml_cuda_tqp_prepare_query_batch_d64(
+        const float * q, float * Sq, float * q_rot,
+        int64_t ne11, int64_t ne12, int64_t ne13,
+        int64_t s11, int64_t s12, int64_t s13,
+        uint8_t layer_byte,
+        cudaStream_t stream) {
+    ggml_cuda_tqp_prepare_query_batch_d64_b3(
+        q, Sq, q_rot, ne11, ne12, ne13, s11, s12, s13, layer_byte, stream);
 }
 
 extern "C" void ggml_cuda_tqp_prepare_query_batch_d128(
@@ -265,6 +283,11 @@ extern "C" void ggml_cuda_tqp_prepare_query_batch_d256(
         cudaStream_t stream) {
     ggml_cuda_tqp_prepare_query_batch_d256_b3(
         q, Sq, q_rot, ne11, ne12, ne13, s11, s12, s13, layer_byte, stream);
+}
+
+extern "C" int tqp_cuda_prepare_query_d64(
+        const float * q_host, float * Sq_host, float * q_rot_host, uint8_t layer_byte) {
+    return tqp_cuda_prepare_query_d64_b3(q_host, Sq_host, q_rot_host, layer_byte);
 }
 
 extern "C" int tqp_cuda_prepare_query_d128(

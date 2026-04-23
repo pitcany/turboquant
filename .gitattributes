@@ -1,0 +1,4 @@
+patches/stage2-qjl/c/tqp_constants.pt filter=lfs diff=lfs merge=lfs -text
+patches/stage2-qjl/c/tqp_constants_d64.h filter=lfs diff=lfs merge=lfs -text
+patches/stage2-qjl/c/tqp_constants_d128.h filter=lfs diff=lfs merge=lfs -text
+patches/stage2-qjl/c/tqp_constants_d256.h filter=lfs diff=lfs merge=lfs -text

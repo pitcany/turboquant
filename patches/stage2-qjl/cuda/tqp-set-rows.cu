@@ -113,6 +113,9 @@ static void ggml_cuda_set_rows_tqp_impl(
             src0_d, src1_d, dst_d, layer_byte, idx_i64, n_rows, src0_stride_row, dst_stride_row, stream);                      \
     }
 
+TQP_DEFINE_SET_ROWS(64, 2, block_tqp_d64_b2)
+TQP_DEFINE_SET_ROWS(64, 3, block_tqp_d64_b3)
+TQP_DEFINE_SET_ROWS(64, 4, block_tqp_d64_b4)
 TQP_DEFINE_SET_ROWS(128, 2, block_tqp_d128_b2)
 TQP_DEFINE_SET_ROWS(128, 3, block_tqp_d128_b3)
 TQP_DEFINE_SET_ROWS(128, 4, block_tqp_d128_b4)
@@ -121,6 +124,15 @@ TQP_DEFINE_SET_ROWS(256, 3, block_tqp_d256_b3)
 TQP_DEFINE_SET_ROWS(256, 4, block_tqp_d256_b4)
 
 #undef TQP_DEFINE_SET_ROWS
+
+extern "C" void ggml_cuda_set_rows_tq4p_d64(
+        const float * src0_d, const void * src1_d, void * dst_d,
+        uint8_t layer_byte, bool idx_i64,
+        int64_t n_rows, int64_t src0_stride_row, int64_t dst_stride_row,
+        cudaStream_t stream) {
+    ggml_cuda_set_rows_tqp_d64_b3(
+        src0_d, src1_d, dst_d, layer_byte, idx_i64, n_rows, src0_stride_row, dst_stride_row, stream);
+}
 
 extern "C" void ggml_cuda_set_rows_tq4p_d128(
         const float * src0_d, const void * src1_d, void * dst_d,

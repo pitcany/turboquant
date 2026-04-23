@@ -44,7 +44,7 @@ from lloyd_max import LloydMaxCodebook
 from turboquant import generate_qjl_matrix, generate_rotation_matrix
 
 
-DEFAULT_DIMS = (128, 256)
+DEFAULT_DIMS = (64, 128, 256)
 DEFAULT_BITS = (2, 3, 4)
 LEGACY_ALIAS_BITS = 3
 MAX_LAYERS = 32
@@ -230,7 +230,7 @@ def main() -> None:
         type=str,
         default=None,
         help="Comma-separated head dims to generate, e.g. '64,128,256'. "
-             "Default: 128,256",
+             "Default: 64,128,256",
     )
     parser.add_argument(
         "--bits",

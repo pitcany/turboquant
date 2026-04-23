@@ -22,11 +22,13 @@
 # Usage:
 #   scripts/smoke_test_tq4p.sh
 #   scripts/smoke_test_tq4p.sh --cache-type tq4p_d256
+#   scripts/smoke_test_tq4p.sh --model qwen3.5:4b-q8_0
 
 set -euo pipefail
 
 CACHE_TYPE="${CACHE_TYPE:-tq4p_d128}"
 OLLAMA_BIN="${OLLAMA_BIN:-$HOME/.local/src/ollama-tq/ollama/ollama}"
+MODEL="${MODEL:-}"
 LOG="/tmp/ollama-tq4p.log"
 PORT=11434
 TIMEOUT=30
@@ -35,6 +37,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --cache-type=*) CACHE_TYPE="${1#*=}"; shift ;;
         --cache-type)   CACHE_TYPE="${2:?--cache-type requires a value}"; shift 2 ;;
+        --model=*)      MODEL="${1#*=}"; shift ;;
+        --model)        MODEL="${2:?--model requires a value}"; shift 2 ;;
         -h|--help)      sed -n '2,28p' "$0"; exit 0 ;;
         *)              echo "unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -139,26 +143,28 @@ echo "[+] server is up (PID $OLLAMA_PID)"
 
 # ── (f) Run inference ──────────────────────────────────────────────────
 
-# Discover a small generative model the user has already pulled.
-# Skip embedding models (can't generate text) and cloud models (no local weights).
-MODEL=""
-MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
+if [[ -z "$MODEL" ]]; then
+    # Discover a small generative model the user has already pulled.
+    # Skip embedding models (can't generate text) and cloud models (no local weights).
+    MODEL_LIST=$("$OLLAMA_BIN" list 2>/dev/null || true)
 
-if [[ -n "$MODEL_LIST" ]]; then
-    # awk fields: $1=name $2=id $3=size_num $4=size_unit (GB/MB).
-    # Convert to MB, sort numerically, pick smallest generative model.
-    MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
-        | grep -viE 'embed|rerank' \
-        | awk '$3+0 > 0 {
-            mb = ($4 == "GB") ? $3 * 1024 : $3;
-            printf "%012.1f %s\n", mb, $1
-        }' \
-        | sort -n | head -1 | awk '{print $2}')
+    if [[ -n "$MODEL_LIST" ]]; then
+        # awk fields: $1=name $2=id $3=size_num $4=size_unit (GB/MB).
+        # Convert to MB, sort numerically, pick smallest generative model.
+        MODEL=$(echo "$MODEL_LIST" | tail -n +2 \
+            | grep -viE 'embed|rerank' \
+            | awk '$3+0 > 0 {
+                mb = ($4 == "GB") ? $3 * 1024 : $3;
+                printf "%012.1f %s\n", mb, $1
+            }' \
+            | sort -n | head -1 | awk '{print $2}')
+    fi
 fi
 
 if [[ -z "$MODEL" ]]; then
     echo "ERROR: no generative (non-embedding) local models found." >&2
     echo "  Pull a small model first: ollama pull qwen2.5:3b" >&2
+    echo "  Or pass one explicitly: scripts/smoke_test_tq4p.sh --model qwen3.5:4b-q8_0" >&2
     exit 1
 fi
 echo "[+] using model: $MODEL"

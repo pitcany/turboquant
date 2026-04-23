@@ -12,7 +12,10 @@ import torch.nn as nn
 import math
 from typing import Optional
 
-from lloyd_max import LloydMaxCodebook
+try:
+    from .lloyd_max import LloydMaxCodebook
+except ImportError:  # Support direct module imports from the repo root.
+    from lloyd_max import LloydMaxCodebook
 
 _NORM_EPS = 1e-8
 

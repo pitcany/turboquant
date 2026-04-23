@@ -235,6 +235,9 @@ static int tqp_cuda_dequantize_row_host(
             QK_TQP_D##D, x_host, y_host, k, dequantize_row_tqp_d##D##_b##BITS##_u16_cuda);                                      \
     }
 
+TQP_DEFINE_DEQUANTIZE(64, 2, block_tqp_d64_b2)
+TQP_DEFINE_DEQUANTIZE(64, 3, block_tqp_d64_b3)
+TQP_DEFINE_DEQUANTIZE(64, 4, block_tqp_d64_b4)
 TQP_DEFINE_DEQUANTIZE(128, 2, block_tqp_d128_b2)
 TQP_DEFINE_DEQUANTIZE(128, 3, block_tqp_d128_b3)
 TQP_DEFINE_DEQUANTIZE(128, 4, block_tqp_d128_b4)
@@ -244,6 +247,10 @@ TQP_DEFINE_DEQUANTIZE(256, 4, block_tqp_d256_b4)
 
 #undef TQP_DEFINE_DEQUANTIZE
 
+extern "C" void dequantize_row_tq4p_d64_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d64_b3_cuda(x, y, k, stream);
+}
+
 extern "C" void dequantize_row_tq4p_d128_cuda(const void * x, half * y, int64_t k, cudaStream_t stream) {
     dequantize_row_tqp_d128_b3_cuda(x, y, k, stream);
 }
@@ -252,12 +259,24 @@ extern "C" void dequantize_row_tq4p_d256_cuda(const void * x, half * y, int64_t 
     dequantize_row_tqp_d256_b3_cuda(x, y, k, stream);
 }
 
+extern "C" void dequantize_row_tq4p_d64_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
+    dequantize_row_tqp_d64_b3_f32_cuda(x, y, k, stream);
+}
+
 extern "C" void dequantize_row_tq4p_d128_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
     dequantize_row_tqp_d128_b3_f32_cuda(x, y, k, stream);
 }
 
 extern "C" void dequantize_row_tq4p_d256_f32_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
     dequantize_row_tqp_d256_b3_f32_cuda(x, y, k, stream);
+}
+
+extern "C" void dequantize_row_tq4p_d64_nc_cuda(
+        const void * x, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    dequantize_row_tqp_d64_b3_nc_cuda(x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
 }
 
 extern "C" void dequantize_row_tq4p_d128_nc_cuda(
@@ -276,12 +295,20 @@ extern "C" void dequantize_row_tq4p_d256_nc_cuda(
     dequantize_row_tqp_d256_b3_nc_cuda(x, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
 }
 
+extern "C" int tqp_cuda_dequantize_row_d64_f32(const block_tq4p_d64 * x_host, float * y_host, int64_t k) {
+    return tqp_cuda_dequantize_row_d64_b3_f32(x_host, y_host, k);
+}
+
 extern "C" int tqp_cuda_dequantize_row_d128_f32(const block_tq4p_d128 * x_host, float * y_host, int64_t k) {
     return tqp_cuda_dequantize_row_d128_b3_f32(x_host, y_host, k);
 }
 
 extern "C" int tqp_cuda_dequantize_row_d256_f32(const block_tq4p_d256 * x_host, float * y_host, int64_t k) {
     return tqp_cuda_dequantize_row_d256_b3_f32(x_host, y_host, k);
+}
+
+extern "C" int tqp_cuda_dequantize_row_d64_f16(const block_tq4p_d64 * x_host, uint16_t * y_host, int64_t k) {
+    return tqp_cuda_dequantize_row_d64_b3_f16(x_host, y_host, k);
 }
 
 extern "C" int tqp_cuda_dequantize_row_d128_f16(const block_tq4p_d128 * x_host, uint16_t * y_host, int64_t k) {

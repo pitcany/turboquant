@@ -159,6 +159,9 @@ static int tqp_cuda_quantize_row_host(
             QK_TQP_D##D, x_host, y_host, k, layer_byte, ggml_cuda_tqp_quantize_row_d##D##_b##BITS);                            \
     }
 
+TQP_DEFINE_QUANTIZE(64, 2)
+TQP_DEFINE_QUANTIZE(64, 3)
+TQP_DEFINE_QUANTIZE(64, 4)
 TQP_DEFINE_QUANTIZE(128, 2)
 TQP_DEFINE_QUANTIZE(128, 3)
 TQP_DEFINE_QUANTIZE(128, 4)
@@ -168,6 +171,11 @@ TQP_DEFINE_QUANTIZE(256, 4)
 
 #undef TQP_DEFINE_QUANTIZE
 
+extern "C" void ggml_cuda_tqp_quantize_row_d64(
+        const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
+    ggml_cuda_tqp_quantize_row_d64_b3(x, y, k, layer_byte, stream);
+}
+
 extern "C" void ggml_cuda_tqp_quantize_row_d128(
         const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
     ggml_cuda_tqp_quantize_row_d128_b3(x, y, k, layer_byte, stream);
@@ -176,6 +184,11 @@ extern "C" void ggml_cuda_tqp_quantize_row_d128(
 extern "C" void ggml_cuda_tqp_quantize_row_d256(
         const float * x, void * y, int64_t k, uint8_t layer_byte, cudaStream_t stream) {
     ggml_cuda_tqp_quantize_row_d256_b3(x, y, k, layer_byte, stream);
+}
+
+extern "C" int tqp_cuda_quantize_row_d64(
+        const float * x_host, void * y_host, int64_t k, uint8_t layer_byte) {
+    return tqp_cuda_quantize_row_d64_b3(x_host, y_host, k, layer_byte);
 }
 
 extern "C" int tqp_cuda_quantize_row_d128(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Patch ollama's Go layer so tq4p_d128 / tq4p_d256 cache-type strings map
+# Patch ollama's Go layer so TurboQuant KV cache-type strings map
 # end-to-end to the correct GGML enum values instead of falling back to f16.
 #
 # Eight patch sites (sections 1–8b):
@@ -95,11 +95,24 @@ PY
 
 BACKEND_GO="$OLLAMA_DIR/ml/backend.go"
 info "patching DType constants in $BACKEND_GO"
-patch_file "$BACKEND_GO" "$MARKER" - "$BACKEND_GO" <<'PY'
+python3 - "$BACKEND_GO" <<'PY'
 import sys, pathlib, re
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
+
+for name in [
+    "DTypeTQ4P_D64",
+    "DTypeTQ4P_D128",
+    "DTypeTQ4P_D256",
+    "DTypeTQP_D64_B2",
+    "DTypeTQP_D64_B4",
+    "DTypeTQP_D128_B2",
+    "DTypeTQP_D128_B4",
+    "DTypeTQP_D256_B2",
+    "DTypeTQP_D256_B4",
+]:
+    text = re.sub(rf'^\t{name}\r?\n', '', text, flags=re.MULTILINE)
 
 # Anchor: the DTypeMXFP4 line inside a const ( ... ) iota block.
 # We insert our two types right after it.
@@ -112,8 +125,11 @@ if anchor not in text:
     sys.exit(1)
 
 insertion = (
+    "\tDTypeTQ4P_D64\n"
     "\tDTypeTQ4P_D128\n"
     "\tDTypeTQ4P_D256\n"
+    "\tDTypeTQP_D64_B2\n"
+    "\tDTypeTQP_D64_B4\n"
     "\tDTypeTQP_D128_B2\n"
     "\tDTypeTQP_D128_B4\n"
     "\tDTypeTQP_D256_B2\n"
@@ -129,25 +145,39 @@ PY
 GGML_GO="$OLLAMA_DIR/ml/backend/ggml/ggml.go"
 FS_GGML_GO="$OLLAMA_DIR/fs/ggml/ggml.go"
 info "patching DType() and ggmlDType() in $GGML_GO"
-patch_file "$GGML_GO" "$MARKER" - "$GGML_GO" <<'PY'
-import sys, pathlib
+python3 - "$GGML_GO" <<'PY'
+import pathlib
+import re
+import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 
-# --- DType() method: C enum → ml.DType ---
-# Anchor: "case C.GGML_TYPE_MXFP4:\n\t\treturn ml.DTypeMXFP4\n"
-# Insert TQ4P cases right after it, before the default.
-anchor_dtype = "case C.GGML_TYPE_MXFP4:\n\t\treturn ml.DTypeMXFP4\n"
-if anchor_dtype not in text:
-    print(f"ERROR: DType() anchor not found in {path}", file=sys.stderr)
-    sys.exit(1)
-
-insert_dtype = (
+dtype_function = (
+    "func (t *Tensor) DType() ml.DType {\n"
+    "\tswitch t.t._type {\n"
+    "\tcase C.GGML_TYPE_F32:\n"
+    "\t\treturn ml.DTypeF32\n"
+    "\tcase C.GGML_TYPE_F16:\n"
+    "\t\treturn ml.DTypeF16\n"
+    "\tcase C.GGML_TYPE_Q8_0:\n"
+    "\t\treturn ml.DTypeQ80\n"
+    "\tcase C.GGML_TYPE_Q4_0:\n"
+    "\t\treturn ml.DTypeQ40\n"
+    "\tcase C.GGML_TYPE_I32:\n"
+    "\t\treturn ml.DTypeI32\n"
+    "\tcase C.GGML_TYPE_MXFP4:\n"
+    "\t\treturn ml.DTypeMXFP4\n"
+    "\tcase C.GGML_TYPE_TQ4P_D64:\n"
+    "\t\treturn ml.DTypeTQ4P_D64\n"
     "\tcase C.GGML_TYPE_TQ4P_D128:\n"
     "\t\treturn ml.DTypeTQ4P_D128\n"
     "\tcase C.GGML_TYPE_TQ4P_D256:\n"
     "\t\treturn ml.DTypeTQ4P_D256\n"
+    "\tcase C.GGML_TYPE_TQP_D64_B2:\n"
+    "\t\treturn ml.DTypeTQP_D64_B2\n"
+    "\tcase C.GGML_TYPE_TQP_D64_B4:\n"
+    "\t\treturn ml.DTypeTQP_D64_B4\n"
     "\tcase C.GGML_TYPE_TQP_D128_B2:\n"
     "\t\treturn ml.DTypeTQP_D128_B2\n"
     "\tcase C.GGML_TYPE_TQP_D128_B4:\n"
@@ -156,21 +186,42 @@ insert_dtype = (
     "\t\treturn ml.DTypeTQP_D256_B2\n"
     "\tcase C.GGML_TYPE_TQP_D256_B4:\n"
     "\t\treturn ml.DTypeTQP_D256_B4\n"
+    "\tdefault:\n"
+    "\t\treturn ml.DTypeOther\n"
+    "\t}\n"
+    "}\n"
 )
-text = text.replace(anchor_dtype, anchor_dtype + insert_dtype, 1)
-
-# --- ggmlDType() function: ml.DType → C enum ---
-# Anchor: "case ml.DTypeMXFP4:\n\t\treturn C.GGML_TYPE_MXFP4\n"
-anchor_ggml = "case ml.DTypeMXFP4:\n\t\treturn C.GGML_TYPE_MXFP4\n"
-if anchor_ggml not in text:
-    print(f"ERROR: ggmlDType() anchor not found in {path}", file=sys.stderr)
+dtype_pattern = re.compile(r'func \(t \*Tensor\) DType\(\) ml\.DType \{\n.*?\n\}\n', re.S)
+text, count = dtype_pattern.subn(dtype_function, text, count=1)
+if count == 0:
+    print(f"ERROR: DType() function not found in {path}", file=sys.stderr)
     sys.exit(1)
 
-insert_ggml = (
+ggml_dtype_function = (
+    "func ggmlDType(dtype ml.DType) uint32 {\n"
+    "\tswitch dtype {\n"
+    "\tcase ml.DTypeF32:\n"
+    "\t\treturn C.GGML_TYPE_F32\n"
+    "\tcase ml.DTypeF16:\n"
+    "\t\treturn C.GGML_TYPE_F16\n"
+    "\tcase ml.DTypeQ80:\n"
+    "\t\treturn C.GGML_TYPE_Q8_0\n"
+    "\tcase ml.DTypeQ40:\n"
+    "\t\treturn C.GGML_TYPE_Q4_0\n"
+    "\tcase ml.DTypeI32:\n"
+    "\t\treturn C.GGML_TYPE_I32\n"
+    "\tcase ml.DTypeMXFP4:\n"
+    "\t\treturn C.GGML_TYPE_MXFP4\n"
+    "\tcase ml.DTypeTQ4P_D64:\n"
+    "\t\treturn C.GGML_TYPE_TQ4P_D64\n"
     "\tcase ml.DTypeTQ4P_D128:\n"
     "\t\treturn C.GGML_TYPE_TQ4P_D128\n"
     "\tcase ml.DTypeTQ4P_D256:\n"
     "\t\treturn C.GGML_TYPE_TQ4P_D256\n"
+    "\tcase ml.DTypeTQP_D64_B2:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D64_B2\n"
+    "\tcase ml.DTypeTQP_D64_B4:\n"
+    "\t\treturn C.GGML_TYPE_TQP_D64_B4\n"
     "\tcase ml.DTypeTQP_D128_B2:\n"
     "\t\treturn C.GGML_TYPE_TQP_D128_B2\n"
     "\tcase ml.DTypeTQP_D128_B4:\n"
@@ -179,8 +230,16 @@ insert_ggml = (
     "\t\treturn C.GGML_TYPE_TQP_D256_B2\n"
     "\tcase ml.DTypeTQP_D256_B4:\n"
     "\t\treturn C.GGML_TYPE_TQP_D256_B4\n"
+    "\tdefault:\n"
+    "\t\tpanic(\"unsupported dtype\")\n"
+    "\t}\n"
+    "}\n"
 )
-text = text.replace(anchor_ggml, anchor_ggml + insert_ggml, 1)
+ggml_dtype_pattern = re.compile(r'func ggmlDType\(dtype ml\.DType\) uint32 \{\n.*?\n\}\n', re.S)
+text, count = ggml_dtype_pattern.subn(ggml_dtype_function, text, count=1)
+if count == 0:
+    print(f"ERROR: ggmlDType() function not found in {path}", file=sys.stderr)
+    sys.exit(1)
 
 path.write_text(text)
 print(f"[+] patched: {path}")
@@ -204,10 +263,16 @@ if anchor not in text:
     sys.exit(1)
 
 insert = (
+    '\tcase "tq4p_d64":\n'
+    '\t\treturn ml.DTypeTQ4P_D64\n'
     '\tcase "tq4p_d128":\n'
     '\t\treturn ml.DTypeTQ4P_D128\n'
     '\tcase "tq4p_d256":\n'
     '\t\treturn ml.DTypeTQ4P_D256\n'
+    '\tcase "tqp_d64_b2":\n'
+    '\t\treturn ml.DTypeTQP_D64_B2\n'
+    '\tcase "tqp_d64_b4":\n'
+    '\t\treturn ml.DTypeTQP_D64_B4\n'
     '\tcase "tqp_d128_b2":\n'
     '\t\treturn ml.DTypeTQP_D128_B2\n'
     '\tcase "tqp_d128_b4":\n'
@@ -239,10 +304,16 @@ if anchor not in text:
     sys.exit(1)
 
 insert = (
+    '\tcase "tq4p_d64":\n'
+    '\t\treturn C.GGML_TYPE_TQ4P_D64\n'
     '\tcase "tq4p_d128":\n'
     '\t\treturn C.GGML_TYPE_TQ4P_D128\n'
     '\tcase "tq4p_d256":\n'
     '\t\treturn C.GGML_TYPE_TQ4P_D256\n'
+    '\tcase "tqp_d64_b2":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D64_B2\n'
+    '\tcase "tqp_d64_b4":\n'
+    '\t\treturn C.GGML_TYPE_TQP_D64_B4\n'
     '\tcase "tqp_d128_b2":\n'
     '\t\treturn C.GGML_TYPE_TQP_D128_B2\n'
     '\tcase "tqp_d128_b4":\n'
@@ -284,7 +355,8 @@ new_body = (
     '\tc := ctx.(*Context)\n'
     '\tif c.layer >= 0 {\n'
     '\t\tdstType := t2.(*Tensor).t._type\n'
-    '\t\tif dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 ||\n'
+    '\t\tif dstType == C.GGML_TYPE_TQ4P_D64 || dstType == C.GGML_TYPE_TQ4P_D128 || dstType == C.GGML_TYPE_TQ4P_D256 ||\n'
+    '\t\t\tdstType == C.GGML_TYPE_TQP_D64_B2 || dstType == C.GGML_TYPE_TQP_D64_B4 ||\n'
     '\t\t\tdstType == C.GGML_TYPE_TQP_D128_B2 || dstType == C.GGML_TYPE_TQP_D128_B4 ||\n'
     '\t\t\tdstType == C.GGML_TYPE_TQP_D256_B2 || dstType == C.GGML_TYPE_TQP_D256_B4 {\n'
     '\t\t\tresult.op_params[0] = C.int32_t(c.layer & 0x1f)\n'
@@ -312,7 +384,9 @@ PY
 MARKER_KV_SUPPORT='tqp_kv_cache_head_dim_guard'
 info "patching SupportsKVCacheType() head-dim guard in $FS_GGML_GO"
 patch_file "$FS_GGML_GO" "$MARKER_KV_SUPPORT" - "$FS_GGML_GO" <<'PY'
-import sys, pathlib
+import pathlib
+import re
+import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
@@ -337,12 +411,27 @@ old_support_pristine = (
     '\treturn slices.Contains([]string{"q8_0", "q4_0"}, cacheType)\n'
     '}\n'
 )
+old_support_patterns = [
+    re.compile(
+        r'// SupportsKVCacheType checks if the requested cache type is supported\n'
+        r'func \(f GGML\) SupportsKVCacheType\(cacheType string\) bool \{\n'
+        r'\tif cacheType == "" \|\| cacheType == "f16" \{\n'
+        r'\t\treturn true\n'
+        r'\t\}\n'
+        r'\n'
+        r'\treturn slices\.Contains\(\[\]string\{.*?\}, cacheType\)\n'
+        r'\}\n',
+        re.S,
+    ),
+]
 
 new_support = (
     '// tqp_kv_cache_head_dim_guard: constrain TurboQuant KV types to models\n'
     '// whose resolved key/value head lengths match the requested block size.\n'
     'func kvCacheTypeHeadDim(cacheType string) (uint64, bool) {\n'
     '\tswitch cacheType {\n'
+    '\tcase "tq4p_d64", "tqp_d64_b2", "tqp_d64_b4":\n'
+    '\t\treturn 64, true\n'
     '\tcase "tq4p_d128", "tqp_d128_b2", "tqp_d128_b4":\n'
     '\t\treturn 128, true\n'
     '\tcase "tq4p_d256", "tqp_d256_b2", "tqp_d256_b4":\n'
@@ -358,7 +447,7 @@ new_support = (
     '\t\treturn true\n'
     '\t}\n'
     '\n'
-    '\tif !slices.Contains([]string{"q8_0", "q4_0", "tq3_0", "tq4p_d128", "tq4p_d256", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"}, cacheType) {\n'
+    '\tif !slices.Contains([]string{"q8_0", "q4_0", "tq3_0", "tq4p_d64", "tq4p_d128", "tq4p_d256", "tqp_d64_b2", "tqp_d64_b4", "tqp_d128_b2", "tqp_d128_b4", "tqp_d256_b2", "tqp_d256_b4"}, cacheType) {\n'
     '\t\treturn false\n'
     '\t}\n'
     '\n'
@@ -378,8 +467,13 @@ if old_support in text:
 elif old_support_pristine in text:
     text = text.replace(old_support_pristine, new_support, 1)
 else:
-    print(f"ERROR: SupportsKVCacheType() block not found in {path}", file=sys.stderr)
-    sys.exit(1)
+    for pattern in old_support_patterns:
+        text, count = pattern.subn(new_support, text, count=1)
+        if count:
+            break
+    else:
+        print(f"ERROR: SupportsKVCacheType() block not found in {path}", file=sys.stderr)
+        sys.exit(1)
 path.write_text(text)
 print(f"[+] patched SupportsKVCacheType() head-dim guard: {path}")
 PY
@@ -482,10 +576,24 @@ indent = default_match.group("indent")
 case_indent = indent
 return_indent = indent + "\t"
 insert = (
+    f'{case_indent}case "tq4p_d64":\n'
+    f'{return_indent}return 37.0 / 64.0\n'
+    f'{case_indent}case "tqp_d64_b2":\n'
+    f'{return_indent}return 29.0 / 64.0\n'
+    f'{case_indent}case "tqp_d64_b4":\n'
+    f'{return_indent}return 45.0 / 64.0\n'
     f'{case_indent}case "tq4p_d128":\n'
     f'{return_indent}return 69.0 / 128.0\n'
     f'{case_indent}case "tq4p_d256":\n'
     f'{return_indent}return 133.0 / 256.0\n'
+    f'{case_indent}case "tqp_d128_b2":\n'
+    f'{return_indent}return 53.0 / 128.0\n'
+    f'{case_indent}case "tqp_d128_b4":\n'
+    f'{return_indent}return 85.0 / 128.0\n'
+    f'{case_indent}case "tqp_d256_b2":\n'
+    f'{return_indent}return 101.0 / 256.0\n'
+    f'{case_indent}case "tqp_d256_b4":\n'
+    f'{return_indent}return 165.0 / 256.0\n'
 )
 
 body = body[:default_match.start()] + insert + body[default_match.start():]
@@ -618,12 +726,26 @@ PY
 echo
 echo "Go plumbing complete. The following cache-type strings now resolve"
 echo "to their correct GGML types instead of falling back to f16:"
-echo "  tq4p_d128 → GGML_TYPE_TQ4P_D128 (enum 40)"
-echo "  tq4p_d256 → GGML_TYPE_TQ4P_D256 (enum 41)"
+echo "  tq4p_d64    → GGML_TYPE_TQ4P_D64"
+echo "  tq4p_d128   → GGML_TYPE_TQ4P_D128"
+echo "  tq4p_d256   → GGML_TYPE_TQ4P_D256"
+echo "  tqp_d64_b2  → GGML_TYPE_TQP_D64_B2"
+echo "  tqp_d64_b4  → GGML_TYPE_TQP_D64_B4"
+echo "  tqp_d128_b2 → GGML_TYPE_TQP_D128_B2"
+echo "  tqp_d128_b4 → GGML_TYPE_TQP_D128_B4"
+echo "  tqp_d256_b2 → GGML_TYPE_TQP_D256_B2"
+echo "  tqp_d256_b4 → GGML_TYPE_TQP_D256_B4"
 echo
 echo "kvCacheBytesPerElement() now reports the correct TQ4P byte rates:"
-echo "  tq4p_d128 → 69/128 bytes per element"
-echo "  tq4p_d256 → 133/256 bytes per element"
+echo "  tq4p_d64    → 37/64 bytes per element"
+echo "  tqp_d64_b2  → 29/64 bytes per element"
+echo "  tqp_d64_b4  → 45/64 bytes per element"
+echo "  tq4p_d128   → 69/128 bytes per element"
+echo "  tqp_d128_b2 → 53/128 bytes per element"
+echo "  tqp_d128_b4 → 85/128 bytes per element"
+echo "  tq4p_d256   → 133/256 bytes per element"
+echo "  tqp_d256_b2 → 101/256 bytes per element"
+echo "  tqp_d256_b4 → 165/256 bytes per element"
 echo
 echo "Debug logging now emits:"
 echo "  TQ4P: KV cache type configured"
