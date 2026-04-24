@@ -1297,13 +1297,15 @@ def _tq_decode_stage1(
     num_kv_splits: int,
     use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # The Triton kernel currently hardcodes 2-bit key / 4-bit value unpacking.
-    # For other bit-widths, fall back to the generic torch path.
+    # The Triton kernel hardcodes 2-bit key / 4-bit value unpacking and
+    # assumes qjl_dim == head_dim (vectorized QJL unpack indexes bytes via
+    # offs_d // 8, which overruns kq_len when qjl_dim < head_dim).
     triton_compatible = (
         layout.key_mse_bits == 2
         and layout.val_mse_bits <= 4
         and len(key_centroids) == 4
         and len(val_centroids) == 8
+        and layout.kq_len * 8 == layout.head_dim
     )
     if use_triton and triton_compatible and TRITON_AVAILABLE and comp_bytes.is_cuda and q_rot.is_cuda:
         return _stage1_triton(
