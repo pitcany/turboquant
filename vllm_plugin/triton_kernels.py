@@ -98,11 +98,16 @@ def _stage2_torch(
     partial_acc: torch.Tensor,
     partial_lse: torch.Tensor,
     val_pi: torch.Tensor,
+    rotation: str = "haar",
+    val_sigma: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     max_lse = partial_lse.amax(dim=0, keepdim=True)
     weights = torch.exp(partial_lse - max_lse)
     denom = weights.sum(dim=0)
     merged_rot = (partial_acc * weights.unsqueeze(-1)).sum(dim=0) / denom.unsqueeze(-1)
+    if rotation == "wht":
+        from turboquant import wht_unrotate
+        return wht_unrotate(merged_rot.float(), val_sigma)
     return merged_rot @ val_pi.float()
 
 
@@ -621,7 +626,13 @@ def _tq_decode_stage2(
     val_pi: torch.Tensor,
     *,
     use_triton: bool = True,
+    rotation: str = "haar",
+    val_sigma: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    if use_triton and TRITON_AVAILABLE and partial_acc.is_cuda:
+    # The Triton stage2 kernel hardcodes Pi as a dense matrix multiply,
+    # so WHT must use the torch path.
+    if rotation == "haar" and use_triton and TRITON_AVAILABLE and partial_acc.is_cuda:
         return _stage2_triton(partial_acc, partial_lse, val_pi)
-    return _stage2_torch(partial_acc, partial_lse, val_pi)
+    return _stage2_torch(
+        partial_acc, partial_lse, val_pi,
+        rotation=rotation, val_sigma=val_sigma)

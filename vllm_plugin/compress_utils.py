@@ -43,6 +43,9 @@ def initialize_quantizers(
         "val_pi": val_q.Pi.half(),
         "val_centroids": val_q.centroids.half(),
         "s_t": key_q.S.T.half(),
+        "rotation": rotation,
+        "key_sigma": getattr(key_q.mse, "sigma", None),
+        "val_sigma": getattr(val_q, "sigma", None),
     }
 
 

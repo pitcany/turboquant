@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 import torch.nn.functional as F
 
-from turboquant import TurboQuantProd, TurboQuantMSE
+from turboquant import TurboQuantProd, TurboQuantMSE, wht_rotate, wht_unrotate
 from vllm_plugin.compress_utils import initialize_quantizers, store_compressed_kv
 from vllm_plugin.config import TurboQuantConfig
 from vllm_plugin.triton_wrapper import turboquant_decode_attention
@@ -440,6 +440,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._val_Pi = quantizers["val_pi"]
         self._val_centroids = quantizers["val_centroids"]
         self._S_T = quantizers["s_t"]
+        self._key_sigma = quantizers["key_sigma"]
+        self._val_sigma = quantizers["val_sigma"]
 
     # ── forward ──────────────────────────────────────────────────────
 
@@ -557,6 +559,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 pos_offset=pos_offset,
                 num_kv_splits=self._num_kv_splits,
                 use_triton=True,
+                rotation=self._rotation,
+                key_sigma=self._key_sigma,
+                val_sigma=self._val_sigma,
             )
             if output.dim() == 3:
                 output[out_offset:out_offset + 1] = out.to(output.dtype)
@@ -586,9 +591,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
         # ── Dequantize ALL heads in FP16 ──
         # codebook lookup + inverse rotation, all in half precision
         k_rotated = self._key_centroids[km_idx.reshape(-1, hd)]   # (S*nkh, D)
-        k_mse = (k_rotated @ self._key_Pi).reshape(S, nkh, hd)   # inverse rotation
+        if self._rotation == "wht":
+            k_mse = wht_unrotate(k_rotated.float(), self._key_sigma).half().reshape(S, nkh, hd)
+        else:
+            k_mse = (k_rotated @ self._key_Pi).reshape(S, nkh, hd)
         v_rotated = self._val_centroids[vm_idx.reshape(-1, hd)]
-        v_full = (v_rotated @ self._val_Pi).reshape(S, nkh, hd)
+        if self._rotation == "wht":
+            v_full = wht_unrotate(v_rotated.float(), self._val_sigma).half().reshape(S, nkh, hd)
+        else:
+            v_full = (v_rotated @ self._val_Pi).reshape(S, nkh, hd)
         v_full = v_full * v_norm.half().unsqueeze(-1)
 
         # ── Batched attention scores via einsum ──

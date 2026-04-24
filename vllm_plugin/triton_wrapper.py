@@ -9,11 +9,12 @@ PyTorch path.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
 
+from turboquant import wht_rotate, wht_unrotate
 from vllm_plugin.triton_kernels import _tq_decode_stage1, _tq_decode_stage2
 
 if TYPE_CHECKING:
@@ -24,11 +25,17 @@ def prerotate_queries(
     queries: torch.Tensor,
     key_pi_t: torch.Tensor,
     s_t: torch.Tensor,
+    rotation: str = "haar",
+    key_sigma: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return rotated queries and QJL sketches for the decode kernels."""
 
     q_float = queries.float()
-    return q_float @ key_pi_t.float(), q_float @ s_t.float()
+    if rotation == "wht":
+        q_rot = wht_rotate(q_float, key_sigma)
+    else:
+        q_rot = q_float @ key_pi_t.float()
+    return q_rot, q_float @ s_t.float()
 
 
 def turboquant_decode_attention_pytorch(
@@ -114,14 +121,11 @@ def turboquant_decode_attention(
     pos_offset: int,
     num_kv_splits: int = 8,
     use_triton: bool = False,
+    rotation: str = "haar",
+    key_sigma: Optional[torch.Tensor] = None,
+    val_sigma: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Decode wrapper.
-
-    ``use_triton`` is reserved for the future specialized kernel path. The
-    current implementation always executes the split-KV contract in torch,
-    which keeps the entry point stable and exercises the same integration
-    surface.
-    """
+    """Decode wrapper with WHT/Haar rotation support."""
 
     del key_pi, causal, pos_offset
 
@@ -131,7 +135,8 @@ def turboquant_decode_attention(
     num_kv_heads = comp_bytes.shape[1]
     head_dim = layout.head_dim
     q_view = queries.reshape(1, num_kv_heads, heads_per_kv, head_dim)
-    q_rot, q_sketch = prerotate_queries(q_view, key_pi_t, s_t)
+    q_rot, q_sketch = prerotate_queries(
+        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
 
     partial_acc, partial_lse = _tq_decode_stage1(
         q_rot.squeeze(0),
@@ -145,6 +150,8 @@ def turboquant_decode_attention(
         num_kv_splits=num_kv_splits,
         use_triton=use_triton,
     )
-    out = _tq_decode_stage2(partial_acc, partial_lse, val_pi, use_triton=use_triton)
+    out = _tq_decode_stage2(
+        partial_acc, partial_lse, val_pi, use_triton=use_triton,
+        rotation=rotation, val_sigma=val_sigma)
     return out.reshape(1, num_kv_heads * heads_per_kv, head_dim).to(
         dtype=queries.dtype)
