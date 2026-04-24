@@ -38,6 +38,56 @@ def generate_rotation_matrix(d: int, seed: Optional[int] = None, device: str = "
     return Q.to(device)
 
 
+def generate_sign_vector(d: int, seed: Optional[int] = None, device: str = "cpu") -> torch.Tensor:
+    """Generate a random ±1 sign vector for the randomized Hadamard transform."""
+    gen = torch.Generator(device="cpu")
+    if seed is not None:
+        gen.manual_seed(seed)
+    return (2 * torch.randint(0, 2, (d,), generator=gen) - 1).float().to(device)
+
+
+def fwht_inplace(x: torch.Tensor) -> torch.Tensor:
+    """In-place Fast Walsh-Hadamard Transform along the last dimension.
+
+    Operates on the unnormalized transform (multiply by 1/sqrt(d) after).
+    Requires the last dimension to be a power of 2.
+    """
+    d = x.shape[-1]
+    h = 1
+    while h < d:
+        # Butterfly: pairs at stride h
+        x_even = x[..., 0::2 * h].clone()
+        x_odd = x[..., h::2 * h].clone()
+        # For the general case, we need to interleave properly.
+        # Reshape approach: group into blocks of 2h, split into first h and last h
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, d)
+        n = x_flat.shape[0]
+        for i in range(0, d, 2 * h):
+            a = x_flat[:, i:i + h].clone()
+            b = x_flat[:, i + h:i + 2 * h].clone()
+            x_flat[:, i:i + h] = a + b
+            x_flat[:, i + h:i + 2 * h] = a - b
+        x = x_flat.reshape(orig_shape)
+        h <<= 1
+    return x
+
+
+def wht_rotate(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """Apply randomized Hadamard rotation: y = (1/sqrt(d)) * WHT(sigma * x)."""
+    d = x.shape[-1]
+    y = x * sigma
+    y = fwht_inplace(y)
+    return y * (1.0 / math.sqrt(d))
+
+
+def wht_unrotate(y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """Inverse randomized Hadamard rotation: x = sigma * (1/sqrt(d)) * WHT(y)."""
+    d = y.shape[-1]
+    x = fwht_inplace(y.clone())
+    return sigma * x * (1.0 / math.sqrt(d))
+
+
 def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: Optional[int] = None, device: str = "cpu") -> torch.Tensor:
     """
     Generate the random projection matrix S for QJL.
@@ -57,16 +107,29 @@ class TurboQuantMSE(nn.Module):
     """
     Stage 1: MSE-optimal quantizer.
     Randomly rotates, then applies per-coordinate Lloyd-Max quantization.
+
+    Supports two rotation modes:
+      - "haar": Dense random orthogonal matrix (O(d²) per vector)
+      - "wht":  Randomized Walsh-Hadamard Transform (O(d log d) per vector)
     """
 
-    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu") -> None:
+    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu",
+                 rotation: str = "haar") -> None:
         super().__init__()
         self.d = d
         self.bits = bits
         self.device = device
+        self.rotation = rotation
 
-        # Precompute rotation matrix
-        self.register_buffer("Pi", generate_rotation_matrix(d, seed=seed, device=device))
+        if rotation == "haar":
+            self.register_buffer("Pi", generate_rotation_matrix(d, seed=seed, device=device))
+        elif rotation == "wht":
+            self.register_buffer("sigma", generate_sign_vector(d, seed=seed, device=device))
+            # Store a dummy Pi for code that reads Pi.shape (e.g. vLLM plugin).
+            # This is never used for actual rotation when rotation=="wht".
+            self.register_buffer("Pi", torch.eye(d, device=device))
+        else:
+            raise ValueError(f"rotation must be 'haar' or 'wht', got {rotation!r}")
 
         # Precompute Lloyd-Max codebook
         self.codebook = LloydMaxCodebook(d, bits)
@@ -74,12 +137,15 @@ class TurboQuantMSE(nn.Module):
         self.register_buffer("boundaries", self.codebook.boundaries.to(device))
 
     def rotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply random rotation: y = Pi @ x."""
-        # x: (batch, d) or (d,)
+        """Apply random rotation."""
+        if self.rotation == "wht":
+            return wht_rotate(x, self.sigma)
         return x @ self.Pi.T
 
     def unrotate(self, y: torch.Tensor) -> torch.Tensor:
-        """Undo rotation: x = Pi^T @ y."""
+        """Undo rotation."""
+        if self.rotation == "wht":
+            return wht_unrotate(y, self.sigma)
         return y @ self.Pi
 
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
@@ -111,7 +177,8 @@ class TurboQuantProd(nn.Module):
     Effective: ~b bits per dimension (the QJL bit replaces one MSE bit)
     """
 
-    def __init__(self, d: int, bits: int, qjl_dim: Optional[int] = None, seed: int = 42, device: str = "cpu") -> None:
+    def __init__(self, d: int, bits: int, qjl_dim: Optional[int] = None, seed: int = 42,
+                 device: str = "cpu", rotation: str = "haar") -> None:
         """
         Args:
             d: vector dimension
@@ -119,6 +186,7 @@ class TurboQuantProd(nn.Module):
             qjl_dim: projection dimension for QJL (default = d)
             seed: random seed for reproducibility
             device: torch device
+            rotation: "haar" (dense, O(d²)) or "wht" (Walsh-Hadamard, O(d log d))
         """
         super().__init__()
         self.d = d
@@ -126,9 +194,10 @@ class TurboQuantProd(nn.Module):
         self.mse_bits = max(bits - 1, 1)
         self.qjl_dim = qjl_dim or d
         self.device = device
+        self.rotation = rotation
 
         # Stage 1: MSE quantizer with (bits-1) bits
-        self.mse = TurboQuantMSE(d, self.mse_bits, seed=seed, device=device)
+        self.mse = TurboQuantMSE(d, self.mse_bits, seed=seed, device=device, rotation=rotation)
 
         # Stage 2: QJL projection matrix
         self.register_buffer("S", generate_qjl_matrix(d, m=self.qjl_dim, seed=seed + 1, device=device))

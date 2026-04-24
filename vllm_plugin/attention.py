@@ -404,6 +404,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._b_mse = cfg.b_mse
         self._b_qjl = cfg.b_qjl
         self._b_total = cfg.b_total
+        self._rotation = cfg.rotation
         self._heads_per_kv = self.num_heads // self.num_kv_heads
 
         self._layout = _CompressedLayout(
@@ -428,6 +429,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             self._b_total,
             self.layer_idx,
             device,
+            rotation=self._rotation,
         )
         self._key_q = quantizers["key_q"]
         self._val_q = quantizers["val_q"]

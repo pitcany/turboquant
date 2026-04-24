@@ -50,6 +50,7 @@ class TurboQuantConfig:
         flush_interval:  How often (in tokens) raw buffer is flushed to TQ.
         b_mse:           Bits per coordinate for the PolarQuant stage.
         b_qjl:           Bits per coordinate for the QJL stage.
+        rotation:        Rotation type: "haar" (dense, O(d²)) or "wht" (O(d log d)).
         device:          Torch device string for compression operations.
     """
 
@@ -61,6 +62,7 @@ class TurboQuantConfig:
     flush_interval: int = 128
     b_mse: int = 2
     b_qjl: int = 1
+    rotation: str = "wht"
     device: str = "cuda"
 
     # ------------------------------------------------------------------
@@ -89,6 +91,7 @@ class TurboQuantConfig:
         self.flush_interval = _env_int("TQ_FLUSH_INTERVAL", self.flush_interval)
         self.b_mse = _env_int("TQ_B_MSE", self.b_mse)
         self.b_qjl = _env_int("TQ_B_QJL", self.b_qjl)
+        self.rotation = _env_str("TQ_ROTATION", self.rotation)
         self.device = _env_str("TQ_DEVICE", self.device)
 
         # --- Validation ---
@@ -119,6 +122,10 @@ class TurboQuantConfig:
         if self.head_dim not in (64, 128, 256):
             raise ValueError(
                 f"head_dim ({self.head_dim}) must be 64, 128, or 256"
+            )
+        if self.rotation not in ("haar", "wht"):
+            raise ValueError(
+                f"rotation ({self.rotation!r}) must be 'haar' or 'wht'"
             )
 
     # ------------------------------------------------------------------

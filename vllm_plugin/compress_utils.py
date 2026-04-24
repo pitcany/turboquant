@@ -19,18 +19,21 @@ def initialize_quantizers(
     total_bits: int,
     layer_idx: int,
     device: torch.device,
+    rotation: str = "wht",
 ) -> dict[str, torch.Tensor | TurboQuantProd | TurboQuantMSE]:
     key_q = TurboQuantProd(
         head_size,
         total_bits,
         seed=layer_idx * 1000,
         device=str(device),
+        rotation=rotation,
     )
     val_q = TurboQuantMSE(
         head_size,
         total_bits,
         seed=layer_idx * 1000 + 500,
         device=str(device),
+        rotation=rotation,
     )
     return {
         "key_q": key_q,
