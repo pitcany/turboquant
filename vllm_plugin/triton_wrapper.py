@@ -32,12 +32,15 @@ def prerotate_queries(
     s_t: torch.Tensor,
     rotation: str = "haar",
     key_sigma: Optional[torch.Tensor] = None,
+    *,
+    use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return rotated queries and QJL sketches for the decode kernels."""
 
     # Fast path: fused Triton kernel for WHT rotation + QJL sketch
     if (
-        rotation == "wht"
+        use_triton
+        and rotation == "wht"
         and key_sigma is not None
         and TRITON_AVAILABLE
         and queries.is_cuda
@@ -100,7 +103,13 @@ def turboquant_decode_attention_pytorch(
 
     q_view = queries.reshape(q_len, num_kv_heads, heads_per_kv, head_dim)
     q_rot, q_sketch = prerotate_queries(
-        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
+        q_view,
+        key_pi_t,
+        s_t,
+        rotation=rotation,
+        key_sigma=key_sigma,
+        use_triton=False,
+    )
 
     mse_scores = torch.einsum("qghd,sgd->qghs", q_rot, k_rot.float())
     qjl_scores = torch.einsum("qghd,sgd->qghs", q_sketch, k_signs.float())
@@ -159,7 +168,13 @@ def turboquant_decode_attention(
     head_dim = layout.head_dim
     q_view = queries.reshape(1, num_kv_heads, heads_per_kv, head_dim)
     q_rot, q_sketch = prerotate_queries(
-        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
+        q_view,
+        key_pi_t,
+        s_t,
+        rotation=rotation,
+        key_sigma=key_sigma,
+        use_triton=use_triton,
+    )
 
     partial_acc, partial_lse = _tq_decode_stage1(
         q_rot.squeeze(0),
