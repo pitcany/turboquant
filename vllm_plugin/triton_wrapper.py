@@ -39,7 +39,9 @@ def prerotate_queries(
 
     head_dim = queries.shape[-1]
     qjl_dim = s_t.shape[-1]
-    # Fast path: fused Triton kernel for WHT rotation + QJL sketch
+    # Fast path: fused Triton kernel for WHT rotation + QJL sketch.
+    # Requires qjl_dim == head_dim (kernel allocates sketch at head_dim width)
+    # and head_dim <= 256 (FWHT butterfly is unrolled to 8 steps max).
     if (
         use_triton
         and rotation == "wht"
@@ -47,6 +49,7 @@ def prerotate_queries(
         and TRITON_AVAILABLE
         and queries.is_cuda
         and qjl_dim == head_dim
+        and head_dim <= 256
     ):
         from vllm_plugin.triton_kernels import _prerotate_triton
 

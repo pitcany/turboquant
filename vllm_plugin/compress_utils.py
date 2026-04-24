@@ -58,6 +58,7 @@ def _can_fuse(key: torch.Tensor, key_q: TurboQuantProd) -> bool:
         and key_q.rotation == "wht"
         and key_q.qjl_dim == key_q.d
         and key_q.mse.bits == 2
+        and key_q.d <= 256  # FWHT unrolled to 8 butterfly steps max
     )
 
 
