@@ -252,63 +252,48 @@ if _HAS_TRITON:
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
         has_tokens = split_kv_end > split_kv_start
 
-        if has_tokens:
-            offs_km = tl.arange(0, KM_BYTES)
-            offs_kq = tl.arange(0, KQ_BYTES)
-            offs_vm = tl.arange(0, VM_BYTES)
+        # Vectorized address mappings: map each head dimension to its
+        # packed byte offset and bit-shift within that byte.
+        km_byte = offs_d // 4           # 2-bit key: 4 indices per byte
+        km_shift = (offs_d % 4) * 2
+        kq_byte = offs_d // 8           # 1-bit QJL: 8 signs per byte
+        kq_shift = offs_d % 8
+        vm_byte = offs_d // 2           # 4-bit value: 2 indices per byte
+        vm_shift = (offs_d % 2) * 4
 
+        if has_tokens:
             for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
                 offs_n = start_n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < split_kv_end
+                mask_nd = mask_n[:, None] & mask_d[None, :]
 
+                # ── Key MSE: vectorized unpack → single dot product ──
+                # Load the packed byte for each (token, dim) pair directly.
+                # Adjacent dims share a byte (4 dims/byte); L1 handles
+                # the duplicate reads.
                 km_ptrs = (
                     COMP_BYTES
                     + offs_n[:, None] * stride_comp_s
                     + kv_head * stride_comp_h
-                    + (KM_OFF + offs_km)[None, :]
+                    + KM_OFF + km_byte[None, :]
                 )
-                packed_km = tl.load(
-                    km_ptrs,
-                    mask=mask_n[:, None],
-                    other=0,
-                )
+                packed_km = tl.load(km_ptrs, mask=mask_nd, other=0)
+                k_idx = ((packed_km >> km_shift[None, :]) & 0x3).to(tl.int32)
+                k_vals = _lookup_4(k_idx, c0, c1, c2, c3).to(tl.float32)
+                score_mse = tl.sum(k_vals * q_rot[None, :], axis=1)
 
-                score_mse = tl.zeros([BLOCK_N], dtype=tl.float32)
-                for shift_idx in range(4):
-                    q_coords = offs_km * 4 + shift_idx
-                    q_vals = tl.load(
-                        Q_ROT + kv_head * stride_qrot_h + q_group * stride_qrot_g + q_coords,
-                        mask=q_coords < HEAD_DIM,
-                        other=0.0,
-                    ).to(tl.float32)
-                    idx = ((packed_km >> (shift_idx * 2)) & 0x3).to(tl.int32)
-                    vals = _lookup_4(idx, c0, c1, c2, c3).to(tl.float32)
-                    score_mse += tl.sum(vals * q_vals[None, :], axis=1)
-
-                qq_ptrs = (
+                # ── QJL: vectorized unpack → single dot product ──
+                kq_ptrs = (
                     COMP_BYTES
                     + offs_n[:, None] * stride_comp_s
                     + kv_head * stride_comp_h
-                    + (KQ_OFF + offs_kq)[None, :]
+                    + KQ_OFF + kq_byte[None, :]
                 )
-                packed_qjl = tl.load(
-                    qq_ptrs,
-                    mask=mask_n[:, None],
-                    other=0,
-                )
+                packed_qjl = tl.load(kq_ptrs, mask=mask_nd, other=0)
+                signs = ((packed_qjl >> kq_shift[None, :]) & 1).to(tl.float32) * 2.0 - 1.0
+                score_qjl = tl.sum(signs * q_sketch[None, :], axis=1)
 
-                score_qjl = tl.zeros([BLOCK_N], dtype=tl.float32)
-                for bit_idx in range(8):
-                    q_coords = offs_kq * 8 + bit_idx
-                    q_vals = tl.load(
-                        Q_SKETCH + kv_head * stride_qsk_h + q_group * stride_qsk_g + q_coords,
-                        mask=q_coords < HEAD_DIM,
-                        other=0.0,
-                    ).to(tl.float32)
-                    bits = ((packed_qjl >> bit_idx) & 1).to(tl.float32)
-                    signs = bits * 2.0 - 1.0
-                    score_qjl += tl.sum(signs * q_vals[None, :], axis=1)
-
+                # ── Norms ──
                 residual_norm = tl.load(
                     COMP_FP16
                     + offs_n * stride_compfp_s
@@ -330,17 +315,21 @@ if _HAS_TRITON:
                 scores = scores * sm_scale
                 scores = tl.where(mask_n, scores, -float("inf"))
 
+                # ── Values: vectorized unpack (no scatter!) ──
+                # Same strategy as keys: load the packed byte for each
+                # (token, dim) directly, extract the 4-bit nibble, lookup.
                 vm_ptrs = (
                     COMP_BYTES
                     + offs_n[:, None] * stride_comp_s
                     + kv_head * stride_comp_h
-                    + (VM_OFF + offs_vm)[None, :]
+                    + VM_OFF + vm_byte[None, :]
                 )
-                packed_vm = tl.load(
-                    vm_ptrs,
-                    mask=mask_n[:, None],
-                    other=0,
-                )
+                packed_vm = tl.load(vm_ptrs, mask=mask_nd, other=0)
+                v_idx = ((packed_vm >> vm_shift[None, :]) & 0xF).to(tl.int32)
+                v_vals = _lookup_8(
+                    v_idx, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+                ).to(tl.float32)
+
                 value_norm = tl.load(
                     COMP_FP16
                     + offs_n * stride_compfp_s
@@ -349,29 +338,15 @@ if _HAS_TRITON:
                     mask=mask_n,
                     other=0.0,
                 ).to(tl.float32)
+                v_vals *= value_norm[:, None]
 
+                # ── Online softmax + direct accumulation ──
                 n_e_max = tl.maximum(tl.max(scores, axis=0), e_max)
                 re_scale = tl.exp(e_max - n_e_max)
                 p = tl.exp(scores - n_e_max)
                 p = tl.where(mask_n, p, 0.0)
 
-                acc *= re_scale
-
-                block_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-                for nibble_idx in range(2):
-                    coords = offs_vm * 2 + nibble_idx
-                    idx = ((packed_vm >> (nibble_idx * 4)) & 0xF).to(tl.int32)
-                    vals = _lookup_8(idx, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7).to(
-                        tl.float32)
-                    vals *= value_norm[:, None]
-                    updates = tl.sum(p[:, None] * vals, axis=0)
-                    coord_mask = coords[:, None] == offs_d[None, :]
-                    block_acc += tl.sum(
-                        tl.where(coord_mask, updates[:, None], 0.0),
-                        axis=0,
-                    )
-
-                acc += block_acc
+                acc = acc * re_scale + tl.sum(p[:, None] * v_vals, axis=0)
                 e_sum = e_sum * re_scale + tl.sum(p, axis=0)
                 e_max = n_e_max
 
