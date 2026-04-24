@@ -1413,6 +1413,41 @@ def _fused_compress_triton(
     }
 
 
+def _fused_compress_pack_triton(
+    key_flat: torch.Tensor,
+    val_flat: torch.Tensor,
+    key_sigma: torch.Tensor,
+    val_sigma: torch.Tensor,
+    key_boundaries: torch.Tensor,
+    key_centroids: torch.Tensor,
+    val_boundaries: torch.Tensor,
+    s_matrix: torch.Tensor,
+    layout: "_CompressedLayout",
+) -> torch.Tensor:
+    """Launch fused compress and pack the result into bytes."""
+    raw = _fused_compress_triton(
+        key_flat,
+        val_flat,
+        key_sigma=key_sigma,
+        val_sigma=val_sigma,
+        key_boundaries=key_boundaries,
+        key_centroids=key_centroids,
+        val_boundaries=val_boundaries,
+        s_matrix=s_matrix,
+        head_dim=layout.head_dim,
+        qjl_dim=s_matrix.shape[0],
+    )
+    return _pack_triton(
+        raw["key_mse_indices"],
+        raw["qjl_signs"],
+        raw["key_residual_norm"],
+        raw["key_norm"],
+        raw["val_mse_indices"],
+        raw["val_norm"],
+        layout,
+    )
+
+
 def _stage1_triton(
     q_rot: torch.Tensor,
     q_sketch: torch.Tensor,
