@@ -129,7 +129,7 @@ def _compress_fused(
     val_q: TurboQuantMSE,
 ) -> torch.Tensor:
     """Fused Triton compress path — single kernel launch for all compute."""
-    from vllm_plugin.triton_kernels import _fused_compress_triton
+    from vllm_plugin.triton_kernels import _fused_compress_triton, _pack_triton
 
     raw = _fused_compress_triton(
         k_flat,
@@ -144,11 +144,12 @@ def _compress_fused(
         qjl_dim=key_q.qjl_dim,
     )
 
-    return layout.pack(
+    return _pack_triton(
         raw["key_mse_indices"],
         raw["qjl_signs"],
         raw["key_residual_norm"],
         raw["key_norm"],
         raw["val_mse_indices"],
         raw["val_norm"],
+        layout,
     )
