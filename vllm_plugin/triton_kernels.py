@@ -113,6 +113,35 @@ def _stage2_torch(
 
 if _HAS_TRITON:
 
+    # ═══════════════════════════════════════════════════════════════════
+    # FWHT helpers
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_fwht_full(x, BLOCK_D: tl.constexpr):
+        """Full in-register Fast Walsh-Hadamard Transform (unrolled butterfly)."""
+        if BLOCK_D >= 2:
+            x = _tq_fwht_step(x, 1, BLOCK_D)
+        if BLOCK_D >= 4:
+            x = _tq_fwht_step(x, 2, BLOCK_D)
+        if BLOCK_D >= 8:
+            x = _tq_fwht_step(x, 4, BLOCK_D)
+        if BLOCK_D >= 16:
+            x = _tq_fwht_step(x, 8, BLOCK_D)
+        if BLOCK_D >= 32:
+            x = _tq_fwht_step(x, 16, BLOCK_D)
+        if BLOCK_D >= 64:
+            x = _tq_fwht_step(x, 32, BLOCK_D)
+        if BLOCK_D >= 128:
+            x = _tq_fwht_step(x, 64, BLOCK_D)
+        if BLOCK_D >= 256:
+            x = _tq_fwht_step(x, 128, BLOCK_D)
+        return x
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Decode kernels
+    # ═══════════════════════════════════════════════════════════════════
+
     @triton.jit
     def _lookup_4(idx, c0, c1, c2, c3):
         return tl.where(idx == 0, c0,
@@ -702,6 +731,197 @@ if _HAS_TRITON:
         out_base = (OUT + req_id * stride_out_r
                     + kv_head * stride_out_h + q_group * stride_out_g)
         tl.store(out_base + offs_d, result, mask=mask_d)
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Fused KV compression kernel
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_fused_compress_kernel(
+        # Inputs — flattened (N, D) vectors
+        KEY, VALUE,
+        # WHT sign vectors
+        KEY_SIGMA, VAL_SIGMA,
+        # Quantizer tables (small 1-D arrays)
+        KEY_BOUNDARIES, KEY_CENTROIDS, VAL_BOUNDARIES,
+        # QJL projection matrix (QJL_DIM, D)
+        S_MATRIX,
+        # Outputs — raw indices / signs / norms
+        KEY_MSE_OUT, QJL_SIGNS_OUT,
+        KEY_RNORM_OUT, KEY_NORM_OUT,
+        VAL_MSE_OUT, VAL_NORM_OUT,
+        # Strides
+        stride_kv,            # row stride for KEY / VALUE
+        stride_s,             # row stride for S_MATRIX
+        stride_idx,           # row stride for KEY_MSE_OUT / VAL_MSE_OUT
+        stride_qjl,          # row stride for QJL_SIGNS_OUT
+        # Scalar
+        NUM_ROWS,
+        # Constexpr
+        HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        QJL_DIM: tl.constexpr,
+        BLOCK_QJL: tl.constexpr,
+        NUM_KEY_BOUNDS: tl.constexpr,
+        NUM_VAL_BOUNDS: tl.constexpr,
+    ):
+        """Fused WHT-rotate + MSE-quantize + QJL-project + sign for KV compression.
+
+        Each program handles one row = one (token, kv_head) pair.
+        Replaces ~1500 CUDA kernel launches (Python-loop FWHT) with one Triton launch.
+        """
+        pid = tl.program_id(0)
+        if pid >= NUM_ROWS:
+            return
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
+        rsqrt_d = 1.0 / tl.sqrt(float(HEAD_DIM))
+
+        # ── Load key & value ───────────────────────────────────────────
+        key = tl.load(
+            KEY + pid * stride_kv + offs_d, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+        val = tl.load(
+            VALUE + pid * stride_kv + offs_d, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        # ── Compute norms & normalize ──────────────────────────────────
+        k_norm = tl.sqrt(tl.sum(key * key, axis=0))
+        k_norm = tl.maximum(k_norm, 1e-8)
+        v_norm = tl.sqrt(tl.sum(val * val, axis=0))
+        v_norm = tl.maximum(v_norm, 1e-8)
+        key_unit = key / k_norm
+        val_unit = val / v_norm
+
+        # ── Load WHT sign vectors ──────────────────────────────────────
+        sigma_k = tl.load(
+            KEY_SIGMA + offs_d, mask=mask_d, other=1.0,
+        ).to(tl.float32)
+        sigma_v = tl.load(
+            VAL_SIGMA + offs_d, mask=mask_d, other=1.0,
+        ).to(tl.float32)
+
+        # ── Key: WHT forward rotation ──────────────────────────────────
+        key_rot = _tq_fwht_full(key_unit * sigma_k, BLOCK_D) * rsqrt_d
+
+        # ── Key: MSE bucketize ─────────────────────────────────────────
+        k_idx = tl.zeros([BLOCK_D], dtype=tl.int32)
+        for i in range(NUM_KEY_BOUNDS):
+            b = tl.load(KEY_BOUNDARIES + i).to(tl.float32)
+            k_idx += (key_rot > b).to(tl.int32)
+
+        # ── Key: centroid dequant (rotated space) ──────────────────────
+        k_hat_rot = tl.load(
+            KEY_CENTROIDS + k_idx, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        # ── Key: WHT inverse rotation of dequantized ──────────────────
+        k_hat = sigma_k * _tq_fwht_full(k_hat_rot, BLOCK_D) * rsqrt_d
+
+        # ── Residual & its norm ────────────────────────────────────────
+        residual = key_unit - k_hat
+        r_norm = tl.sqrt(tl.sum(residual * residual, axis=0))
+        r_norm = tl.maximum(r_norm, 1e-8)
+
+        # ── QJL projection: sign(residual @ S^T) ──────────────────────
+        qjl_offs = tl.arange(0, BLOCK_QJL)
+        for j_start in range(0, QJL_DIM, BLOCK_QJL):
+            j = j_start + qjl_offs
+            j_mask = j < QJL_DIM
+            s_block = tl.load(
+                S_MATRIX + j[:, None] * stride_s + offs_d[None, :],
+                mask=j_mask[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            dots = tl.sum(s_block * residual[None, :], axis=1)
+            signs = tl.where(dots >= 0, 1.0, -1.0)
+            tl.store(
+                QJL_SIGNS_OUT + pid * stride_qjl + j, signs, mask=j_mask,
+            )
+
+        # ── Value: WHT forward rotation ────────────────────────────────
+        val_rot = _tq_fwht_full(val_unit * sigma_v, BLOCK_D) * rsqrt_d
+
+        # ── Value: MSE bucketize ───────────────────────────────────────
+        v_idx = tl.zeros([BLOCK_D], dtype=tl.int32)
+        for i in range(NUM_VAL_BOUNDS):
+            b = tl.load(VAL_BOUNDARIES + i).to(tl.float32)
+            v_idx += (val_rot > b).to(tl.int32)
+
+        # ── Store all outputs ──────────────────────────────────────────
+        tl.store(KEY_MSE_OUT + pid * stride_idx + offs_d, k_idx, mask=mask_d)
+        tl.store(KEY_RNORM_OUT + pid, r_norm)
+        tl.store(KEY_NORM_OUT + pid, k_norm)
+        tl.store(VAL_MSE_OUT + pid * stride_idx + offs_d, v_idx, mask=mask_d)
+        tl.store(VAL_NORM_OUT + pid, v_norm)
+
+
+def _fused_compress_triton(
+    key_flat: torch.Tensor,
+    val_flat: torch.Tensor,
+    key_sigma: torch.Tensor,
+    val_sigma: torch.Tensor,
+    key_boundaries: torch.Tensor,
+    key_centroids: torch.Tensor,
+    val_boundaries: torch.Tensor,
+    s_matrix: torch.Tensor,
+    head_dim: int,
+    qjl_dim: int,
+) -> dict[str, torch.Tensor]:
+    """Launch the fused compress kernel; return raw indices/signs/norms."""
+    num_rows = key_flat.shape[0]
+    device = key_flat.device
+    block_d = triton.next_power_of_2(head_dim)
+    block_qjl = min(16, triton.next_power_of_2(qjl_dim))
+
+    key_f = key_flat.float().contiguous()
+    val_f = val_flat.float().contiguous()
+    key_sigma_f = key_sigma.float().contiguous()
+    val_sigma_f = val_sigma.float().contiguous()
+    key_bounds_f = key_boundaries.float().contiguous()
+    key_cents_f = key_centroids.float().contiguous()
+    val_bounds_f = val_boundaries.float().contiguous()
+    s_f = s_matrix.float().contiguous()
+
+    key_mse_out = torch.empty((num_rows, head_dim), dtype=torch.int32, device=device)
+    qjl_signs_out = torch.empty((num_rows, qjl_dim), dtype=torch.float32, device=device)
+    key_rnorm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
+    key_norm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
+    val_mse_out = torch.empty((num_rows, head_dim), dtype=torch.int32, device=device)
+    val_norm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
+
+    grid = (num_rows,)
+    _tq_fused_compress_kernel[grid](
+        key_f, val_f,
+        key_sigma_f, val_sigma_f,
+        key_bounds_f, key_cents_f, val_bounds_f,
+        s_f,
+        key_mse_out, qjl_signs_out,
+        key_rnorm_out, key_norm_out,
+        val_mse_out, val_norm_out,
+        key_f.stride(0), s_f.stride(0),
+        key_mse_out.stride(0), qjl_signs_out.stride(0),
+        num_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        QJL_DIM=qjl_dim,
+        BLOCK_QJL=block_qjl,
+        NUM_KEY_BOUNDS=len(key_bounds_f),
+        NUM_VAL_BOUNDS=len(val_bounds_f),
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return {
+        "key_mse_indices": key_mse_out.long(),
+        "qjl_signs": qjl_signs_out,
+        "key_residual_norm": key_rnorm_out,
+        "key_norm": key_norm_out,
+        "val_mse_indices": val_mse_out.long(),
+        "val_norm": val_norm_out,
+    }
 
 
 def _stage1_triton(
