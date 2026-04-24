@@ -1753,7 +1753,8 @@ def _fused_decode_triton(
             dtype=torch.float32, device=kv_cache.device)
     block_d = triton.next_power_of_2(head_dim)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    # Always use BLOCK_N=64 for CUDAGraph safety — no .item() call.
+    block_n = 64
 
     # Two typed views of the same contiguous memory
     kv_fp16 = kv_cache.contiguous()

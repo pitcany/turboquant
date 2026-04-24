@@ -79,7 +79,7 @@ def wht_rotate(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
 def wht_unrotate(y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Inverse randomized Hadamard rotation: x = sigma * (1/sqrt(d)) * WHT(y)."""
     d = y.shape[-1]
-    x = fwht(y.clone())
+    x = fwht(y)
     return sigma * x * (1.0 / math.sqrt(d))
 
 
