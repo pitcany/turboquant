@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 import torch.nn.functional as F
 
-from turboquant import TurboQuantProd, TurboQuantMSE
+from turboquant import TurboQuantProd, TurboQuantMSE, wht_unrotate
 from vllm_plugin.attention import (
     _CompressedLayout,
     _compressed_fp16_elems,
@@ -128,6 +128,7 @@ class HybridTQAttentionImpl(AttentionImpl):
         self._b_mse = cfg.b_mse
         self._b_qjl = cfg.b_qjl
         self._b_total = cfg.b_total
+        self._rotation = cfg.rotation
         self._heads_per_kv = self.num_heads // self.num_kv_heads
 
         self._layout = _CompressedLayout(
@@ -145,6 +146,7 @@ class HybridTQAttentionImpl(AttentionImpl):
             self._b_total,
             self.layer_idx,
             device,
+            rotation=self._rotation,
         )
         self._key_q = quantizers["key_q"]
         self._val_q = quantizers["val_q"]
@@ -155,6 +157,8 @@ class HybridTQAttentionImpl(AttentionImpl):
         self._val_Pi = quantizers["val_pi"]
         self._val_centroids = quantizers["val_centroids"]
         self._S_T = quantizers["s_t"]
+        self._key_sigma = quantizers["key_sigma"]
+        self._val_sigma = quantizers["val_sigma"]
 
     def forward(
         self,
@@ -259,12 +263,20 @@ class HybridTQAttentionImpl(AttentionImpl):
 
         # Dequantize keys: codebook lookup → inverse rotation → scale by norm
         k_rotated = self._key_centroids[km_idx.reshape(-1, hd)]  # (S*nkh, D)
-        k_deq = (k_rotated @ self._key_Pi).reshape(seq_len, nkh, hd)  # inverse rotation
+        if self._rotation == "wht":
+            k_deq = wht_unrotate(k_rotated.float(), self._key_sigma).half()
+        else:
+            k_deq = k_rotated @ self._key_Pi
+        k_deq = k_deq.reshape(seq_len, nkh, hd)  # inverse rotation
         k_deq = k_deq * k_norm.half().reshape(seq_len, nkh, 1)
 
         # Dequantize values: codebook lookup → inverse rotation → scale by norm
         v_rotated = self._val_centroids[vm_idx.reshape(-1, hd)]
-        v_deq = (v_rotated @ self._val_Pi).reshape(seq_len, nkh, hd)
+        if self._rotation == "wht":
+            v_deq = wht_unrotate(v_rotated.float(), self._val_sigma).half()
+        else:
+            v_deq = v_rotated @ self._val_Pi
+        v_deq = v_deq.reshape(seq_len, nkh, hd)
         v_deq = v_deq * v_norm.half().reshape(seq_len, nkh, 1)
 
         return k_deq, v_deq
