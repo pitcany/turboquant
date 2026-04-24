@@ -149,10 +149,14 @@ class TurboQuantConfig:
 
     @property
     def compression_ratio(self) -> float:
-        """Approximate compression ratio vs FP16."""
-        fp16_bits = self.head_dim * 16
-        tq_bits = self.head_dim * self.b_mse + 16 + self.head_dim * 1 + 16
-        return fp16_bits / tq_bits
+        """Approximate compression ratio vs FP16 (K+V combined)."""
+        fp16_bits = self.head_dim * 16 * 2  # K + V in FP16
+        # Keys: b_mse bits/coord + 1 bit/coord QJL signs + 2×fp16 norms
+        key_bits = self.head_dim * self.b_mse + self.head_dim * self.b_qjl + 16 + 16
+        # Values: 4-bit packing if val_bits <= 4, else exact + fp16 norm
+        val_pack_bits = 4 if self.b_total <= 4 else self.b_total
+        val_bits = self.head_dim * val_pack_bits + 16
+        return fp16_bits / (key_bits + val_bits)
 
     def summary(self) -> str:
         """Human-readable one-line summary."""

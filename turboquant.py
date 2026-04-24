@@ -55,11 +55,6 @@ def fwht_inplace(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
     h = 1
     while h < d:
-        # Butterfly: pairs at stride h
-        x_even = x[..., 0::2 * h].clone()
-        x_odd = x[..., h::2 * h].clone()
-        # For the general case, we need to interleave properly.
-        # Reshape approach: group into blocks of 2h, split into first h and last h
         orig_shape = x.shape
         x_flat = x.reshape(-1, d)
         n = x_flat.shape[0]

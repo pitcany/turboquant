@@ -390,6 +390,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.logits_soft_cap = logits_soft_cap
 
         # Deterministic seed per layer
         self.layer_idx = TurboQuantAttentionImpl._layer_counter
@@ -554,7 +555,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 s_t=self._key_q.S.T,
                 heads_per_kv=self._heads_per_kv,
                 qjl_dim=self._key_q.qjl_dim,
-                sm_scale=1.0 / math.sqrt(self.head_size),
+                sm_scale=self.scale,
                 causal=causal,
                 pos_offset=pos_offset,
                 num_kv_splits=self._num_kv_splits,
@@ -619,7 +620,11 @@ class TurboQuantAttentionImpl(AttentionImpl):
         t2 = corr * t2_raw * k_rnorm.half().permute(1, 0)[None, :, None, :]
 
         scores = (t1 + t2) * k_norm.half().permute(1, 0)[None, :, None, :]
-        scores = scores / math.sqrt(hd)                        # (Q, nkh, hpkv, S)
+        scores = scores * self.scale                           # (Q, nkh, hpkv, S)
+
+        # Logit soft capping (Gemma-style)
+        if self.logits_soft_cap is not None:
+            scores = scores.float().tanh() * self.logits_soft_cap
 
         # Causal mask
         if causal and Q > 1:
