@@ -350,10 +350,18 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     Stores ~4× less KV cache memory than FP16 by packing compressed
     indices and norms into the cache tensor directly.
+
+    CUDAGraph support: the fused decode path uses Triton kernels with
+    pre-computed grids and no Python-level data-dependent branching,
+    making it safe for CUDAGraph capture.  During capture, KV storage
+    is skipped (key/value are None) and the fused decode kernel runs
+    with the captured seq_lens/block_table buffers that vLLM updates
+    in-place between replays.
     """
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = True
+    use_cudagraph: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16, torch.bfloat16,
     ]
@@ -534,12 +542,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 dtype=query.dtype, device=device)
 
         # 1) Compress and store new KV tokens
+        #    During CUDAGraph replay key/value are None — skip storage.
         if key is not None and value is not None:
             self._store_compressed(
                 key[:N], value[:N], kv_cache,
                 attn_metadata.slot_mapping[:N], block_size)
 
         # 2) Fused decode fast-path (all requests are single-token decode)
+        #    This path is CUDAGraph-safe: no .item() calls, no Python
+        #    branching on tensor values, deterministic kernel grid.
         if attn_metadata.max_query_len == 1 and self._use_triton:
             fused = self._fused_decode(
                 query[:N], kv_cache, attn_metadata, output)
@@ -547,6 +558,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 return fused
 
         # 3) Compute attention per request (prefill / fallback)
+        #    NOT CUDAGraph-safe (uses .item()).  Only reached during
+        #    prefill or when fused decode is unavailable.
         for ri in range(num_reqs):
             qs = attn_metadata.query_start_loc[ri].item()
             qe = attn_metadata.query_start_loc[ri + 1].item()

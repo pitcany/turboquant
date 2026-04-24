@@ -863,6 +863,204 @@ if _HAS_TRITON:
 
 
     # ═══════════════════════════════════════════════════════════════════
+    # Fused decode with inline prerotation + full-vector scoring
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_fused_decode_prerot_kernel(
+        # Raw queries + prerotation materials
+        Q_RAW, SIGMA, S_T,
+        # KV cache views
+        KV_U8, KV_FP16,
+        # Indirection
+        BLOCK_TABLE, SEQ_LENS,
+        # Unrotation
+        VAL_SIGMA, VAL_PI,
+        # Output
+        OUT,
+        # Strides
+        stride_qraw_r, stride_qraw_h, stride_qraw_g,
+        stride_st_row, stride_st_col,
+        stride_u8_b, stride_u8_t, stride_u8_h,
+        stride_fp16_b, stride_fp16_t, stride_fp16_h,
+        stride_bt_r,
+        stride_vp_row, stride_vp_col,
+        stride_out_r, stride_out_h, stride_out_g,
+        # Scalars
+        qjl_corr, sm_scale,
+        c0, c1, c2, c3,
+        vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+        # Constexprs
+        HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        CACHE_BLOCK_SIZE: tl.constexpr,
+        USE_WHT: tl.constexpr,
+        TILE_K: tl.constexpr,
+        KM_OFF: tl.constexpr,
+        KQ_OFF: tl.constexpr,
+        KR_FP16_OFF: tl.constexpr,
+        KN_FP16_OFF: tl.constexpr,
+        VM_OFF: tl.constexpr,
+        VN_FP16_OFF: tl.constexpr,
+    ):
+        """Fused decode with inline WHT prerotation and full-vector scoring.
+
+        Eliminates the separate prerotate kernel launch and all intermediate
+        q_rot/q_sketch tensors.  Uses dimension-mapped byte offsets for scoring
+        (each dim directly maps to its packed byte + shift) instead of the
+        byte-level loop, which naturally supports register-held queries.
+        """
+        req_id = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        q_group = tl.program_id(2)
+
+        seq_len = tl.load(SEQ_LENS + req_id).to(tl.int32)
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
+
+        # ── Inline prerotation ──────────────────────────────────────
+        qraw_base = (Q_RAW + req_id * stride_qraw_r
+                     + kv_head * stride_qraw_h + q_group * stride_qraw_g)
+        q_raw = tl.load(
+            qraw_base + offs_d, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        sigma = tl.load(SIGMA + offs_d, mask=mask_d, other=1.0).to(tl.float32)
+        q_rot = _tq_fwht_full(q_raw * sigma, BLOCK_D)
+        q_rot = q_rot * (1.0 / tl.sqrt(float(HEAD_DIM)))
+
+        q_sketch = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for k_start in range(0, HEAD_DIM, TILE_K):
+            k_offs = k_start + tl.arange(0, TILE_K)
+            k_mask = k_offs < HEAD_DIM
+            q_chunk = tl.load(
+                qraw_base + k_offs, mask=k_mask, other=0.0,
+            ).to(tl.float32)
+            st_chunk = tl.load(
+                S_T + k_offs[:, None] * stride_st_row
+                + offs_d[None, :] * stride_st_col,
+                mask=k_mask[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            q_sketch += tl.sum(q_chunk[:, None] * st_chunk, axis=0)
+
+        # ── Precompute dimension-to-byte mapping ────────────────────
+        km_byte = (offs_d // 4).to(tl.int64)
+        km_shift = (offs_d % 4) * 2
+        kq_byte = (offs_d // 8).to(tl.int64)
+        kq_shift = offs_d % 8
+        vm_byte = (offs_d // 2).to(tl.int64)
+        vm_shift = (offs_d % 2) * 4
+
+        # ── Online-softmax accumulators ─────────────────────────────
+        e_max = -float("inf")
+        e_sum = 0.0
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        for start_n in range(0, seq_len, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < seq_len
+            mask_nd = mask_n[:, None] & mask_d[None, :]
+
+            # Block-table indirection
+            blk_indices = (offs_n // CACHE_BLOCK_SIZE).to(tl.int32)
+            tok_offsets = (offs_n % CACHE_BLOCK_SIZE).to(tl.int64)
+            block_ids = tl.load(
+                BLOCK_TABLE + req_id * stride_bt_r + blk_indices,
+                mask=mask_n, other=0,
+            ).to(tl.int64)
+
+            u8_bases = (block_ids * stride_u8_b
+                        + tok_offsets * stride_u8_t
+                        + kv_head * stride_u8_h)
+            fp16_bases = (block_ids * stride_fp16_b
+                          + tok_offsets * stride_fp16_t
+                          + kv_head * stride_fp16_h)
+
+            # ── MSE scoring (full-vector) ───────────────────────────
+            km_ptrs = (KV_U8 + u8_bases[:, None]
+                       + KM_OFF + km_byte[None, :])
+            packed_km = tl.load(km_ptrs, mask=mask_nd, other=0)
+            k_idx = ((packed_km >> km_shift[None, :]) & 0x3).to(tl.int32)
+            k_vals = _lookup_4(k_idx, c0, c1, c2, c3).to(tl.float32)
+            score_mse = tl.sum(k_vals * q_rot[None, :], axis=1)
+
+            # ── QJL scoring (full-vector) ───────────────────────────
+            kq_ptrs = (KV_U8 + u8_bases[:, None]
+                       + KQ_OFF + kq_byte[None, :])
+            packed_qjl = tl.load(kq_ptrs, mask=mask_nd, other=0)
+            signs = ((packed_qjl >> kq_shift[None, :]) & 1).to(
+                tl.float32) * 2.0 - 1.0
+            score_qjl = tl.sum(signs * q_sketch[None, :], axis=1)
+
+            # ── Norms ───────────────────────────────────────────────
+            residual_norm = tl.load(
+                KV_FP16 + fp16_bases + KR_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+            key_norm = tl.load(
+                KV_FP16 + fp16_bases + KN_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+
+            scores = ((score_mse + qjl_corr * score_qjl * residual_norm)
+                      * key_norm * sm_scale)
+            scores = tl.where(mask_n, scores, -float("inf"))
+
+            # ── Online softmax ──────────────────────────────────────
+            n_e_max = tl.maximum(tl.max(scores, axis=0), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(scores - n_e_max)
+            p = tl.where(mask_n, p, 0.0)
+            acc *= re_scale
+
+            # ── Value accumulation (full-vector) ────────────────────
+            vm_ptrs = (KV_U8 + u8_bases[:, None]
+                       + VM_OFF + vm_byte[None, :])
+            packed_vm = tl.load(vm_ptrs, mask=mask_nd, other=0)
+            v_idx = ((packed_vm >> vm_shift[None, :]) & 0xF).to(tl.int32)
+            v_vals = _lookup_8(
+                v_idx, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+            ).to(tl.float32)
+            value_norm = tl.load(
+                KV_FP16 + fp16_bases + VN_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+            v_vals *= value_norm[:, None]
+            acc += tl.sum(p[:, None] * v_vals, axis=0)
+
+            e_sum = e_sum * re_scale + tl.sum(p, axis=0)
+            e_max = n_e_max
+
+        # ── Normalise ───────────────────────────────────────────────
+        safe_denom = tl.where(e_sum > 0, e_sum, 1.0)
+        result = tl.where(mask_d, acc / safe_denom, 0.0)
+
+        # ── Unrotation ──────────────────────────────────────────────
+        if USE_WHT:
+            transformed = _tq_fwht_full(result, BLOCK_D)
+            rsqrt_d = 1.0 / tl.sqrt(float(HEAD_DIM))
+            val_sig = tl.load(
+                VAL_SIGMA + offs_d, mask=mask_d, other=1.0,
+            ).to(tl.float32)
+            result = val_sig * transformed * rsqrt_d
+        else:
+            val_pi = tl.load(
+                VAL_PI
+                + offs_d[:, None] * stride_vp_row
+                + offs_d[None, :] * stride_vp_col,
+                mask=mask_d[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            result = tl.sum(result[:, None] * val_pi, axis=0)
+
+        out_base = (OUT + req_id * stride_out_r
+                    + kv_head * stride_out_h + q_group * stride_out_g)
+        tl.store(out_base + offs_d, result, mask=mask_d)
+
+    # ═══════════════════════════════════════════════════════════════════
     # Fused KV compression kernel
     # ═══════════════════════════════════════════════════════════════════
 
@@ -985,6 +1183,168 @@ if _HAS_TRITON:
         tl.store(KEY_NORM_OUT + pid, k_norm)
         tl.store(VAL_MSE_OUT + pid * stride_idx + offs_d, v_idx, mask=mask_d)
         tl.store(VAL_NORM_OUT + pid, v_norm)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Fused compress + pack kernel (single kernel from raw K/V to bytes)
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_fused_compress_pack_kernel(
+        KEY, VALUE,
+        KEY_SIGMA, VAL_SIGMA,
+        KEY_BOUNDARIES, KEY_CENTROIDS, VAL_BOUNDARIES,
+        S_MATRIX,
+        OUT,
+        stride_kv,
+        stride_s,
+        stride_out,
+        NUM_ROWS,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        QJL_DIM: tl.constexpr,
+        BLOCK_QJL: tl.constexpr,
+        NUM_KEY_BOUNDS: tl.constexpr,
+        NUM_VAL_BOUNDS: tl.constexpr,
+        KM_OFF: tl.constexpr,
+        KM_BYTES: tl.constexpr,
+        KQ_OFF: tl.constexpr,
+        KQ_BYTES: tl.constexpr,
+        KR_OFF: tl.constexpr,
+        KN_OFF: tl.constexpr,
+        VM_OFF: tl.constexpr,
+        VM_BYTES: tl.constexpr,
+        VN_OFF: tl.constexpr,
+    ):
+        """Fused compress + pack: raw K/V to packed bytes in one kernel.
+
+        Eliminates the separate pack kernel and all intermediate index/sign/norm
+        tensors.  Same compute as _tq_fused_compress_kernel but packs output
+        bytes inline using broadcast-gather from register vectors.
+        """
+        pid = tl.program_id(0)
+        if pid >= NUM_ROWS:
+            return
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
+        rsqrt_d = 1.0 / tl.sqrt(float(HEAD_DIM))
+
+        # ── Load key & value ───────────────────────────────────────
+        key = tl.load(
+            KEY + pid * stride_kv + offs_d, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+        val = tl.load(
+            VALUE + pid * stride_kv + offs_d, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        # ── Norms ─────────────────────────────────────────────────
+        k_norm = tl.sqrt(tl.sum(key * key, axis=0))
+        k_norm = tl.maximum(k_norm, 1e-8)
+        v_norm = tl.sqrt(tl.sum(val * val, axis=0))
+        v_norm = tl.maximum(v_norm, 1e-8)
+        key_unit = key / k_norm
+        val_unit = val / v_norm
+
+        # ── WHT rotation ──────────────────────────────────────────
+        sigma_k = tl.load(
+            KEY_SIGMA + offs_d, mask=mask_d, other=1.0,
+        ).to(tl.float32)
+        sigma_v = tl.load(
+            VAL_SIGMA + offs_d, mask=mask_d, other=1.0,
+        ).to(tl.float32)
+        key_rot = _tq_fwht_full(key_unit * sigma_k, BLOCK_D) * rsqrt_d
+        val_rot = _tq_fwht_full(val_unit * sigma_v, BLOCK_D) * rsqrt_d
+
+        # ── Key MSE bucketize ─────────────────────────────────────
+        k_idx = tl.zeros([BLOCK_D], dtype=tl.int32)
+        for i in range(NUM_KEY_BOUNDS):
+            b = tl.load(KEY_BOUNDARIES + i).to(tl.float32)
+            k_idx += (key_rot > b).to(tl.int32)
+
+        # ── Key: centroid dequant + inverse rotate for residual ───
+        k_hat_rot = tl.load(
+            KEY_CENTROIDS + k_idx, mask=mask_d, other=0.0,
+        ).to(tl.float32)
+        k_hat = sigma_k * _tq_fwht_full(k_hat_rot, BLOCK_D) * rsqrt_d
+        residual = key_unit - k_hat
+        r_norm = tl.sqrt(tl.sum(residual * residual, axis=0))
+        r_norm = tl.maximum(r_norm, 1e-8)
+
+        # ── Value MSE bucketize ───────────────────────────────────
+        v_idx = tl.zeros([BLOCK_D], dtype=tl.int32)
+        for i in range(NUM_VAL_BOUNDS):
+            b = tl.load(VAL_BOUNDARIES + i).to(tl.float32)
+            v_idx += (val_rot > b).to(tl.int32)
+
+        # ═══════════════════════════════════════════════════════════
+        # Inline packing — write packed bytes directly to OUT
+        # ═══════════════════════════════════════════════════════════
+
+        out_row = OUT + pid * stride_out
+
+        # ── Key MSE: 2-bit pack (4 indices → 1 byte) ─────────────
+        offs_km = tl.arange(0, KM_BYTES)
+        packed_km = tl.zeros([KM_BYTES], dtype=tl.int32)
+        for s in tl.static_range(4):
+            d = offs_km * 4 + s
+            idx_at_d = tl.sum(
+                tl.where(
+                    offs_d[None, :] == d[:, None],
+                    k_idx[None, :], 0,
+                ),
+                axis=1,
+            )
+            packed_km |= (idx_at_d & 0x3) << (s * 2)
+        tl.store(out_row + KM_OFF + offs_km, packed_km.to(tl.uint8))
+
+        # ── QJL signs: compute + 1-bit pack inline ───────────────
+        offs_kq = tl.arange(0, KQ_BYTES)
+        packed_qjl = tl.zeros([KQ_BYTES], dtype=tl.int32)
+        for bit in tl.static_range(8):
+            j = offs_kq * 8 + bit
+            j_mask = j < QJL_DIM
+            s_rows = tl.load(
+                S_MATRIX + j[:, None] * stride_s + offs_d[None, :],
+                mask=j_mask[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            dots = tl.sum(s_rows * residual[None, :], axis=1)
+            is_positive = (dots >= 0).to(tl.int32)
+            packed_qjl |= tl.where(j_mask, is_positive, 0) << bit
+        tl.store(out_row + KQ_OFF + offs_kq, packed_qjl.to(tl.uint8))
+
+        # ── Key residual norm (fp16) ──────────────────────────────
+        tl.store(
+            (out_row + KR_OFF).to(tl.pointer_type(tl.float16)),
+            r_norm.to(tl.float16),
+        )
+
+        # ── Key original norm (fp16) ──────────────────────────────
+        tl.store(
+            (out_row + KN_OFF).to(tl.pointer_type(tl.float16)),
+            k_norm.to(tl.float16),
+        )
+
+        # ── Value MSE: 4-bit pack (2 indices → 1 byte) ───────────
+        offs_vm = tl.arange(0, VM_BYTES)
+        packed_vm = tl.zeros([VM_BYTES], dtype=tl.int32)
+        for s in tl.static_range(2):
+            d = offs_vm * 2 + s
+            idx_at_d = tl.sum(
+                tl.where(
+                    offs_d[None, :] == d[:, None],
+                    v_idx[None, :], 0,
+                ),
+                axis=1,
+            )
+            packed_vm |= (idx_at_d & 0xF) << (s * 4)
+        tl.store(out_row + VM_OFF + offs_vm, packed_vm.to(tl.uint8))
+
+        # ── Value norm (fp16) ─────────────────────────────────────
+        tl.store(
+            (out_row + VN_OFF).to(tl.pointer_type(tl.float16)),
+            v_norm.to(tl.float16),
+        )
 
 
 def _fused_compress_triton(
@@ -1511,3 +1871,216 @@ def _tq_fused_decode(
         sm_scale=sm_scale,
         rotation=rotation,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fused decode with inline prerotation — no intermediate tensors
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _fused_decode_prerot_triton(
+    q_raw: torch.Tensor,
+    sigma: torch.Tensor,
+    s_t: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: "_CompressedLayout",
+    *,
+    key_centroids: torch.Tensor,
+    val_centroids: torch.Tensor,
+    val_pi: torch.Tensor,
+    val_sigma: "torch.Tensor | None",
+    qjl_corr: float,
+    sm_scale: float,
+    rotation: str = "wht",
+) -> torch.Tensor:
+    """Launch fused decode with inline prerotation — zero intermediate tensors."""
+    num_reqs, num_kv_heads, heads_per_kv, head_dim = q_raw.shape
+    if num_reqs == 0:
+        return torch.empty(
+            (0, num_kv_heads, heads_per_kv, head_dim),
+            dtype=torch.float32, device=kv_cache.device)
+
+    block_d = triton.next_power_of_2(head_dim)
+    tile_k = min(32, block_d)
+    block_size = kv_cache.shape[1]
+    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+
+    kv_fp16 = kv_cache.contiguous()
+    kv_u8 = kv_fp16.view(torch.uint8)
+
+    out = torch.empty(
+        (num_reqs, num_kv_heads, heads_per_kv, head_dim),
+        dtype=torch.float32, device=kv_cache.device,
+    )
+
+    use_wht = rotation == "wht"
+    if use_wht and val_sigma is not None:
+        val_sigma_f = val_sigma.float().contiguous().to(kv_cache.device)
+    else:
+        val_sigma_f = torch.ones(
+            head_dim, dtype=torch.float32, device=kv_cache.device)
+    val_pi_f = val_pi.float().contiguous().to(kv_cache.device)
+    sigma_f = sigma.float().contiguous().to(kv_cache.device)
+    s_t_f = s_t.float().contiguous().to(kv_cache.device)
+
+    kc = key_centroids.float().contiguous()
+    vc = val_centroids.float().contiguous()
+
+    block_table_i = block_table.int().contiguous()
+    seq_lens_i = seq_lens.int().contiguous()
+    q_raw_c = q_raw.float().contiguous()
+
+    grid = (num_reqs, num_kv_heads, heads_per_kv)
+    _tq_fused_decode_prerot_kernel[grid](
+        q_raw_c, sigma_f, s_t_f,
+        kv_u8, kv_fp16,
+        block_table_i, seq_lens_i,
+        val_sigma_f, val_pi_f,
+        out,
+        q_raw_c.stride(0), q_raw_c.stride(1), q_raw_c.stride(2),
+        s_t_f.stride(0), s_t_f.stride(1),
+        kv_u8.stride(0), kv_u8.stride(1), kv_u8.stride(2),
+        kv_fp16.stride(0), kv_fp16.stride(1), kv_fp16.stride(2),
+        block_table_i.stride(0),
+        val_pi_f.stride(0), val_pi_f.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        qjl_corr, sm_scale,
+        float(kc[0].item()), float(kc[1].item()),
+        float(kc[2].item()), float(kc[3].item()),
+        float(vc[0].item()), float(vc[1].item()),
+        float(vc[2].item()), float(vc[3].item()),
+        float(vc[4].item()), float(vc[5].item()),
+        float(vc[6].item()), float(vc[7].item()),
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        BLOCK_N=block_n,
+        CACHE_BLOCK_SIZE=block_size,
+        USE_WHT=use_wht,
+        TILE_K=tile_k,
+        KM_OFF=layout.km_off,
+        KQ_OFF=layout.kq_off,
+        KR_FP16_OFF=layout.kr_off // 2,
+        KN_FP16_OFF=layout.kn_off // 2,
+        VM_OFF=layout.vm_off,
+        VN_FP16_OFF=layout.vn_off // 2,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def _tq_fused_decode_prerot(
+    q_raw: torch.Tensor,
+    sigma: torch.Tensor,
+    s_t: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: "_CompressedLayout",
+    *,
+    key_centroids: torch.Tensor,
+    val_centroids: torch.Tensor,
+    val_pi: torch.Tensor,
+    val_sigma: "torch.Tensor | None",
+    qjl_corr: float,
+    sm_scale: float,
+    rotation: str = "wht",
+) -> "torch.Tensor | None":
+    """Dispatch fused decode with inline prerotation.
+
+    Returns None when Triton is unavailable or conditions aren't met.
+    """
+    prerot_ok = (
+        TRITON_AVAILABLE
+        and q_raw.is_cuda
+        and layout.key_mse_bits == 2
+        and layout.val_mse_bits <= 4
+        and len(key_centroids) == 4
+        and len(val_centroids) == 8
+        and rotation == "wht"
+        and sigma is not None
+        and s_t.shape[-1] == layout.head_dim
+        and layout.head_dim <= 256
+    )
+    if not prerot_ok:
+        return None
+
+    return _fused_decode_prerot_triton(
+        q_raw, sigma, s_t, kv_cache, block_table, seq_lens, layout,
+        key_centroids=key_centroids,
+        val_centroids=val_centroids,
+        val_pi=val_pi,
+        val_sigma=val_sigma,
+        qjl_corr=qjl_corr,
+        sm_scale=sm_scale,
+        rotation=rotation,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fused compress + pack — single kernel from raw K/V to packed bytes
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _fused_compress_pack_triton(
+    key_flat: torch.Tensor,
+    val_flat: torch.Tensor,
+    key_sigma: torch.Tensor,
+    val_sigma: torch.Tensor,
+    key_boundaries: torch.Tensor,
+    key_centroids: torch.Tensor,
+    val_boundaries: torch.Tensor,
+    s_matrix: torch.Tensor,
+    layout: "_CompressedLayout",
+) -> torch.Tensor:
+    """Launch fused compress+pack kernel; return packed bytes directly."""
+    num_rows = key_flat.shape[0]
+    head_dim = key_flat.shape[1]
+    device = key_flat.device
+    block_d = triton.next_power_of_2(head_dim)
+    qjl_dim = s_matrix.shape[0]
+    block_qjl = min(16, triton.next_power_of_2(qjl_dim))
+
+    key_f = key_flat.float().contiguous()
+    val_f = val_flat.float().contiguous()
+    key_sigma_f = key_sigma.float().contiguous()
+    val_sigma_f = val_sigma.float().contiguous()
+    key_bounds_f = key_boundaries.float().contiguous()
+    key_cents_f = key_centroids.float().contiguous()
+    val_bounds_f = val_boundaries.float().contiguous()
+    s_f = s_matrix.float().contiguous()
+
+    out = torch.zeros(
+        num_rows, layout.total_bytes, dtype=torch.uint8, device=device,
+    )
+
+    grid = (num_rows,)
+    _tq_fused_compress_pack_kernel[grid](
+        key_f, val_f,
+        key_sigma_f, val_sigma_f,
+        key_bounds_f, key_cents_f, val_bounds_f,
+        s_f,
+        out,
+        key_f.stride(0), s_f.stride(0), out.stride(0),
+        num_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        QJL_DIM=qjl_dim,
+        BLOCK_QJL=block_qjl,
+        NUM_KEY_BOUNDS=len(key_bounds_f),
+        NUM_VAL_BOUNDS=len(val_bounds_f),
+        KM_OFF=layout.km_off,
+        KM_BYTES=layout.km_len,
+        KQ_OFF=layout.kq_off,
+        KQ_BYTES=layout.kq_len,
+        KR_OFF=layout.kr_off,
+        KN_OFF=layout.kn_off,
+        VM_OFF=layout.vm_off,
+        VM_BYTES=layout.vm_len,
+        VN_OFF=layout.vn_off,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out

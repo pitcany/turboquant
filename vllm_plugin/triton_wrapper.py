@@ -20,6 +20,7 @@ from vllm_plugin.triton_kernels import (
     _tq_decode_stage1,
     _tq_decode_stage2,
     _tq_fused_decode,
+    _tq_fused_decode_prerot,
 )
 
 if TYPE_CHECKING:
@@ -230,16 +231,14 @@ def fused_decode_attention(
     num_reqs = queries.shape[0]
     num_kv_heads = kv_cache.shape[2]
     head_dim = layout.head_dim
-
-    # Batch pre-rotate all queries at once
-    q_view = queries.reshape(num_reqs, num_kv_heads, heads_per_kv, head_dim)
-    q_rot, q_sketch = prerotate_queries(
-        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
-
     qjl_corr = math.sqrt(math.pi / 2.0) / qjl_dim
 
-    out = _tq_fused_decode(
-        q_rot, q_sketch, kv_cache, block_table, seq_lens, layout,
+    q_view = queries.reshape(num_reqs, num_kv_heads, heads_per_kv, head_dim)
+
+    # Fast path: fused prerotation + decode in one kernel (no intermediates)
+    out = _tq_fused_decode_prerot(
+        q_view, key_sigma, s_t,
+        kv_cache, block_table, seq_lens, layout,
         key_centroids=key_centroids.float(),
         val_centroids=val_centroids.float(),
         val_pi=val_pi,
@@ -248,6 +247,22 @@ def fused_decode_attention(
         sm_scale=sm_scale,
         rotation=rotation,
     )
+
+    # Fallback: separate prerotation + fused decode
+    if out is None:
+        q_rot, q_sketch = prerotate_queries(
+            q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
+        out = _tq_fused_decode(
+            q_rot, q_sketch, kv_cache, block_table, seq_lens, layout,
+            key_centroids=key_centroids.float(),
+            val_centroids=val_centroids.float(),
+            val_pi=val_pi,
+            val_sigma=val_sigma,
+            qjl_corr=qjl_corr,
+            sm_scale=sm_scale,
+            rotation=rotation,
+        )
+
     if out is None:
         return None
 
