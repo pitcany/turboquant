@@ -936,13 +936,17 @@ def _fused_decode_triton(
     """Launch the fused decode kernel for all requests in one shot."""
 
     num_reqs, num_kv_heads, heads_per_kv, head_dim = q_rot.shape
+    if num_reqs == 0:
+        return torch.empty(
+            (0, num_kv_heads, heads_per_kv, head_dim),
+            dtype=torch.float32, device=kv_cache.device)
     block_d = triton.next_power_of_2(head_dim)
     block_size = kv_cache.shape[1]
     block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
 
-    # Two typed views of the same memory
-    kv_u8 = kv_cache.contiguous().view(torch.uint8)
+    # Two typed views of the same contiguous memory
     kv_fp16 = kv_cache.contiguous()
+    kv_u8 = kv_fp16.view(torch.uint8)
 
     out = torch.empty(
         (num_reqs, num_kv_heads, heads_per_kv, head_dim),
@@ -956,10 +960,13 @@ def _fused_decode_triton(
     else:
         val_sigma_f = torch.ones(
             head_dim, dtype=torch.float32, device=kv_cache.device)
-    val_pi_f = val_pi.float().contiguous()
+    val_pi_f = val_pi.float().contiguous().to(kv_cache.device)
 
     kc = key_centroids.float().contiguous()
     vc = val_centroids.float().contiguous()
+
+    block_table_i = block_table.int().contiguous()
+    seq_lens_i = seq_lens.int().contiguous()
 
     grid = (num_reqs, num_kv_heads, heads_per_kv)
     _tq_fused_decode_kernel[grid](
@@ -967,8 +974,8 @@ def _fused_decode_triton(
         q_sketch.contiguous(),
         kv_u8,
         kv_fp16,
-        block_table.int().contiguous(),
-        seq_lens.int().contiguous(),
+        block_table_i,
+        seq_lens_i,
         val_sigma_f,
         val_pi_f,
         out,
@@ -981,7 +988,7 @@ def _fused_decode_triton(
         # KV_FP16 strides (fp16 elements)
         kv_fp16.stride(0), kv_fp16.stride(1), kv_fp16.stride(2),
         # Block-table stride
-        block_table.stride(0),
+        block_table_i.stride(0),
         # Val_pi strides
         val_pi_f.stride(0), val_pi_f.stride(1),
         # Output strides

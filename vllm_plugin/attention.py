@@ -546,7 +546,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             s_t=self._key_q.S.T,
             heads_per_kv=self._heads_per_kv,
             qjl_dim=self._key_q.qjl_dim,
-            sm_scale=1.0 / math.sqrt(self.head_size),
+            sm_scale=self.scale,
             rotation=self._rotation,
             key_sigma=self._key_sigma,
             val_sigma=self._val_sigma,
