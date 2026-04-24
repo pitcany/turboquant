@@ -1892,6 +1892,8 @@ def _tq_fused_decode(
         and layout.val_mse_bits <= 4
         and len(key_centroids) == 4
         and len(val_centroids) == 8
+        and layout.head_dim <= 256
+        and layout.kq_len * 8 == layout.head_dim
     )
     if not triton_ok:
         return None
