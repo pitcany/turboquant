@@ -1202,7 +1202,6 @@ if _HAS_TRITON:
         HEAD_DIM: tl.constexpr,
         BLOCK_D: tl.constexpr,
         QJL_DIM: tl.constexpr,
-        BLOCK_QJL: tl.constexpr,
         NUM_KEY_BOUNDS: tl.constexpr,
         NUM_VAL_BOUNDS: tl.constexpr,
         KM_OFF: tl.constexpr,
@@ -2055,7 +2054,6 @@ def _fused_compress_pack_triton(
     device = key_flat.device
     block_d = triton.next_power_of_2(head_dim)
     qjl_dim = s_matrix.shape[0]
-    block_qjl = min(16, triton.next_power_of_2(qjl_dim))
 
     key_f = key_flat.float().contiguous()
     val_f = val_flat.float().contiguous()
@@ -2082,7 +2080,6 @@ def _fused_compress_pack_triton(
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
         QJL_DIM=qjl_dim,
-        BLOCK_QJL=block_qjl,
         NUM_KEY_BOUNDS=len(key_bounds_f),
         NUM_VAL_BOUNDS=len(val_bounds_f),
         KM_OFF=layout.km_off,
