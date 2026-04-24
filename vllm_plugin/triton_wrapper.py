@@ -15,7 +15,11 @@ import torch
 import torch.nn.functional as F
 
 from turboquant import wht_rotate, wht_unrotate
-from vllm_plugin.triton_kernels import _tq_decode_stage1, _tq_decode_stage2
+from vllm_plugin.triton_kernels import (
+    _tq_decode_stage1,
+    _tq_decode_stage2,
+    _tq_fused_decode,
+)
 
 if TYPE_CHECKING:
     from vllm_plugin.attention import _CompressedLayout
@@ -161,4 +165,58 @@ def turboquant_decode_attention(
         partial_acc, partial_lse, val_pi, use_triton=use_triton,
         rotation=rotation, val_sigma=val_sigma)
     return out.reshape(1, num_kv_heads * heads_per_kv, head_dim).to(
+        dtype=queries.dtype)
+
+
+def fused_decode_attention(
+    queries: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: "_CompressedLayout",
+    *,
+    key_centroids: torch.Tensor,
+    val_centroids: torch.Tensor,
+    key_pi_t: torch.Tensor,
+    val_pi: torch.Tensor,
+    s_t: torch.Tensor,
+    heads_per_kv: int,
+    qjl_dim: int,
+    sm_scale: float,
+    rotation: str = "wht",
+    key_sigma: Optional[torch.Tensor] = None,
+    val_sigma: Optional[torch.Tensor] = None,
+) -> "torch.Tensor | None":
+    """Fused decode: pre-rotate queries + score/accumulate/unrotate in one launch.
+
+    Returns the output tensor ``(num_reqs, num_heads, head_dim)`` on success,
+    or ``None`` when the Triton fused path is unavailable (caller should fall
+    back to the per-request loop).
+    """
+
+    num_reqs = queries.shape[0]
+    num_kv_heads = kv_cache.shape[2]
+    head_dim = layout.head_dim
+
+    # Batch pre-rotate all queries at once
+    q_view = queries.reshape(num_reqs, num_kv_heads, heads_per_kv, head_dim)
+    q_rot, q_sketch = prerotate_queries(
+        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
+
+    qjl_corr = math.sqrt(math.pi / 2.0) / qjl_dim
+
+    out = _tq_fused_decode(
+        q_rot, q_sketch, kv_cache, block_table, seq_lens, layout,
+        key_centroids=key_centroids.float(),
+        val_centroids=val_centroids.float(),
+        val_pi=val_pi,
+        val_sigma=val_sigma,
+        qjl_corr=qjl_corr,
+        sm_scale=sm_scale,
+        rotation=rotation,
+    )
+    if out is None:
+        return None
+
+    return out.reshape(num_reqs, num_kv_heads * heads_per_kv, head_dim).to(
         dtype=queries.dtype)
