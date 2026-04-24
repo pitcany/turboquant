@@ -1678,6 +1678,7 @@ def _tq_decode_stage1(
         and layout.val_mse_bits <= 4
         and len(key_centroids) == 4
         and len(val_centroids) == 8
+        and q_sketch.shape[-1] == layout.head_dim
         and layout.kq_len * 8 == layout.head_dim
     )
     if use_triton and triton_compatible and TRITON_AVAILABLE and comp_bytes.is_cuda and q_rot.is_cuda:
@@ -1863,6 +1864,7 @@ def _tq_fused_decode(
         and layout.val_mse_bits <= 4
         and len(key_centroids) == 4
         and len(val_centroids) == 8
+        and q_sketch.shape[-1] == layout.head_dim
         and layout.head_dim <= 256
         and layout.kq_len * 8 == layout.head_dim
     )
