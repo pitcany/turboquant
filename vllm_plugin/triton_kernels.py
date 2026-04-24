@@ -2013,6 +2013,7 @@ def _tq_fused_decode_prerot(
         and sigma is not None
         and s_t.shape[-1] == layout.head_dim
         and layout.head_dim <= 256
+        and layout.kq_len * 8 == layout.head_dim
     )
     if not prerot_ok:
         return None
