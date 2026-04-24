@@ -105,10 +105,6 @@ class TurboQuantConfig:
                 f"num_heads ({self.num_heads}) must be divisible by "
                 f"num_kv_heads ({self.num_kv_heads})"
             )
-        if self.head_dim <= 0 or (self.head_dim & (self.head_dim - 1)) != 0:
-            raise ValueError(
-                f"head_dim ({self.head_dim}) must be a positive power of 2"
-            )
         if self.flush_interval < 1:
             raise ValueError(
                 f"flush_interval ({self.flush_interval}) must be >= 1"

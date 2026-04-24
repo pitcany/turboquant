@@ -40,40 +40,9 @@ from vllm_plugin.vllm_compat import (
     MultipleOf,
 )
 
-try:
-    from vllm.model_executor.models.utils import extract_layer_index as _extract_layer_index
-except ModuleNotFoundError:
-    _extract_layer_index = None
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import AttentionSpec
-
-try:
-    from vllm.model_executor.models.utils import extract_layer_index as _extract_layer_index
-except ModuleNotFoundError:
-
-    def _extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-        subnames = layer_name.split(".")
-        int_vals: list[int] = []
-        for subname in subnames:
-            try:
-                int_vals.append(int(subname))
-            except ValueError:
-                continue
-        if num_attn_module == 1 or "attn" not in layer_name:
-            if len(int_vals) != 1:
-                raise ValueError(
-                    f"layer name {layer_name} should only contain one integer"
-                )
-            return int_vals[0]
-        if len(int_vals) > 2:
-            raise ValueError(
-                f"layer name {layer_name} should contain most two integers"
-            )
-        if len(int_vals) == 2:
-            return int_vals[0] * num_attn_module + int_vals[1]
-        return int_vals[0]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Bit-packing utilities
