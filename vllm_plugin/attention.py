@@ -27,7 +27,10 @@ import torch.nn.functional as F
 from turboquant import TurboQuantProd, TurboQuantMSE, wht_rotate, wht_unrotate
 from vllm_plugin.compress_utils import initialize_quantizers, store_compressed_kv
 from vllm_plugin.config import TurboQuantConfig
-from vllm_plugin.triton_wrapper import turboquant_decode_attention
+from vllm_plugin.triton_wrapper import (
+    fused_decode_attention,
+    turboquant_decode_attention,
+)
 from vllm_plugin.vllm_compat import (
     AttentionBackend,
     AttentionImpl,
@@ -486,7 +489,14 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 key[:N], value[:N], kv_cache,
                 attn_metadata.slot_mapping[:N], block_size)
 
-        # 2) Compute attention per request
+        # 2) Fused decode fast-path (all requests are single-token decode)
+        if attn_metadata.max_query_len == 1 and self._use_triton:
+            fused = self._fused_decode(
+                query[:N], kv_cache, attn_metadata, output)
+            if fused is not None:
+                return fused
+
+        # 3) Compute attention per request (prefill / fallback)
         for ri in range(num_reqs):
             qs = attn_metadata.query_start_loc[ri].item()
             qe = attn_metadata.query_start_loc[ri + 1].item()
@@ -513,6 +523,42 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 q, comp_bytes, seq_len, q_len, pos_offset,
                 output, qs, attn_metadata.causal)
 
+        return output
+
+    # ── fused decode (all requests q_len=1) ───────────────────────────
+
+    def _fused_decode(
+        self, queries: torch.Tensor, kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        output: torch.Tensor,
+    ) -> "torch.Tensor | None":
+        """Try the fused Triton decode path.  Returns None on fallback."""
+
+        out = fused_decode_attention(
+            queries, kv_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            self._layout,
+            key_centroids=self._key_centroids.float(),
+            val_centroids=self._val_centroids.float(),
+            key_pi_t=self._key_q.mse.Pi.T,
+            val_pi=self._val_q.Pi,
+            s_t=self._key_q.S.T,
+            heads_per_kv=self._heads_per_kv,
+            qjl_dim=self._key_q.qjl_dim,
+            sm_scale=1.0 / math.sqrt(self.head_size),
+            rotation=self._rotation,
+            key_sigma=self._key_sigma,
+            val_sigma=self._val_sigma,
+        )
+        if out is None:
+            return None
+
+        N = queries.shape[0]
+        if output.dim() == 3:
+            output[:N] = out.to(output.dtype)
+        else:
+            output[:N] = out.reshape(N, -1).to(output.dtype)
         return output
 
     # ── compress & store ─────────────────────────────────────────────

@@ -1,11 +1,12 @@
 """Tests for the vLLM TurboQuant plugin.
 
 Covers config validation, compressed layout pack/unpack roundtrips,
-and KV spec page size calculations.
+KV spec page size calculations, and fused decode kernel correctness.
 """
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -220,3 +221,187 @@ class TestKVSpec:
         assert tq_size < fp16_size, (
             f"TQ page ({tq_size}) should be smaller than FP16 ({fp16_size})"
         )
+
+
+# ── Fused decode kernel ───────────────────────────────────────────
+
+
+_CUDA = torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA required for fused decode kernel")
+class TestFusedDecode:
+    """Compare fused Triton decode kernel against per-request reference."""
+
+    HEAD_DIM = 128
+    NUM_KV_HEADS = 8
+    HEADS_PER_KV = 4
+    B_MSE = 2
+    B_QJL = 1
+    BLOCK_SIZE = 16
+
+    @pytest.fixture
+    def setup(self):
+        """Build quantizers, kv_cache with block table, and random queries."""
+
+        from vllm_plugin.compress_utils import (
+            initialize_quantizers,
+            store_compressed_kv,
+        )
+
+        hd = self.HEAD_DIM
+        nkh = self.NUM_KV_HEADS
+        hpkv = self.HEADS_PER_KV
+        b_total = self.B_MSE + self.B_QJL
+        bs = self.BLOCK_SIZE
+        device = torch.device("cuda")
+
+        layout = _CompressedLayout(hd, self.B_MSE, self.B_QJL, b_total)
+        quants = initialize_quantizers(hd, b_total, 0, device, rotation="wht")
+
+        # Two requests with different seq_lens
+        seq_lens_list = [48, 80]
+        num_reqs = len(seq_lens_list)
+
+        # Allocate kv_cache blocks
+        total_blocks = sum((s + bs - 1) // bs for s in seq_lens_list)
+        kv_cache = torch.zeros(
+            total_blocks + 2, bs, nkh, layout.fp16_elems,
+            dtype=torch.float16, device=device,
+        )
+
+        # Sequential block allocation
+        max_blocks = max((s + bs - 1) // bs for s in seq_lens_list)
+        block_table = torch.zeros(
+            num_reqs, max_blocks, dtype=torch.int32, device=device)
+        blk_cursor = 0
+        for ri, sl in enumerate(seq_lens_list):
+            n_blk = (sl + bs - 1) // bs
+            for bi in range(n_blk):
+                block_table[ri, bi] = blk_cursor
+                blk_cursor += 1
+
+        # Compress random KV data and store into the cache
+        key_q = quants["key_q"]
+        val_q = quants["val_q"]
+        for ri, sl in enumerate(seq_lens_list):
+            keys = torch.randn(sl, nkh, hd, device=device)
+            values = torch.randn(sl, nkh, hd, device=device)
+            slot_mapping = torch.empty(sl, dtype=torch.long, device=device)
+            for t in range(sl):
+                blk = t // bs
+                off = t % bs
+                slot_mapping[t] = int(block_table[ri, blk].item()) * bs + off
+            store_compressed_kv(
+                keys, values, kv_cache, slot_mapping,
+                bs, nkh, hd, layout, key_q, val_q,
+            )
+
+        queries = torch.randn(
+            num_reqs, nkh * hpkv, hd, device=device, dtype=torch.float16)
+
+        return {
+            "queries": queries,
+            "kv_cache": kv_cache,
+            "block_table": block_table,
+            "seq_lens": torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=device),
+            "layout": layout,
+            "quants": quants,
+            "hd": hd,
+            "nkh": nkh,
+            "hpkv": hpkv,
+            "bs": bs,
+        }
+
+    def test_fused_vs_reference(self, setup) -> None:
+        """Fused kernel output matches per-request torch reference < 1e-3."""
+        from vllm_plugin.triton_wrapper import (
+            fused_decode_attention,
+            turboquant_decode_attention,
+        )
+
+        d = setup
+        q = d["quants"]
+        key_q = q["key_q"]
+
+        fused_out = fused_decode_attention(
+            d["queries"], d["kv_cache"],
+            d["block_table"], d["seq_lens"], d["layout"],
+            key_centroids=q["key_centroids"].float(),
+            val_centroids=q["val_centroids"].float(),
+            key_pi_t=key_q.mse.Pi.T,
+            val_pi=q["val_pi"],
+            s_t=key_q.S.T,
+            heads_per_kv=d["hpkv"],
+            qjl_dim=key_q.qjl_dim,
+            sm_scale=1.0 / math.sqrt(d["hd"]),
+            rotation="wht",
+            key_sigma=q["key_sigma"],
+            val_sigma=q["val_sigma"],
+        )
+        assert fused_out is not None, "Fused path should be available on CUDA"
+
+        # Per-request reference (gather + non-Triton decode)
+        ref_parts = []
+        bs = d["bs"]
+        for ri in range(d["seq_lens"].shape[0]):
+            sl = d["seq_lens"][ri].item()
+            n_blk = (sl + bs - 1) // bs
+            blk_ids = d["block_table"][ri, :n_blk]
+            comp = d["kv_cache"][blk_ids].reshape(
+                -1, d["nkh"], d["layout"].fp16_elems)[:sl]
+            comp_bytes = comp.contiguous().view(torch.uint8).reshape(
+                sl, d["nkh"], d["layout"].total_bytes)
+
+            ref = turboquant_decode_attention(
+                d["queries"][ri:ri + 1], comp_bytes, d["layout"],
+                key_centroids=q["key_centroids"].float(),
+                val_centroids=q["val_centroids"].float(),
+                key_pi=key_q.mse.Pi,
+                key_pi_t=key_q.mse.Pi.T,
+                val_pi=q["val_pi"],
+                s_t=key_q.S.T,
+                heads_per_kv=d["hpkv"],
+                qjl_dim=key_q.qjl_dim,
+                sm_scale=1.0 / math.sqrt(d["hd"]),
+                causal=False,
+                pos_offset=0,
+                num_kv_splits=1,
+                use_triton=False,
+                rotation="wht",
+                key_sigma=q["key_sigma"],
+                val_sigma=q["val_sigma"],
+            )
+            ref_parts.append(ref)
+
+        ref_out = torch.cat(ref_parts, dim=0)
+        max_diff = (fused_out.float() - ref_out.float()).abs().max().item()
+        assert max_diff < 1e-3, f"fused vs reference max diff = {max_diff}"
+
+    def test_single_request(self, setup) -> None:
+        """Fused kernel works with a single request."""
+        from vllm_plugin.triton_wrapper import fused_decode_attention
+
+        d = setup
+        q = d["quants"]
+        key_q = q["key_q"]
+
+        # Take only the first request
+        out = fused_decode_attention(
+            d["queries"][:1], d["kv_cache"],
+            d["block_table"][:1], d["seq_lens"][:1], d["layout"],
+            key_centroids=q["key_centroids"].float(),
+            val_centroids=q["val_centroids"].float(),
+            key_pi_t=key_q.mse.Pi.T,
+            val_pi=q["val_pi"],
+            s_t=key_q.S.T,
+            heads_per_kv=d["hpkv"],
+            qjl_dim=key_q.qjl_dim,
+            sm_scale=1.0 / math.sqrt(d["hd"]),
+            rotation="wht",
+            key_sigma=q["key_sigma"],
+            val_sigma=q["val_sigma"],
+        )
+        assert out is not None
+        assert out.shape == (1, d["nkh"] * d["hpkv"], d["hd"])

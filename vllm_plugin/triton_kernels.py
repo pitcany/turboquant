@@ -487,6 +487,222 @@ if _HAS_TRITON:
             mask=mask_d,
         )
 
+    # ── Fused decode kernel: score + softmax + accumulate + unrotate ──
+    # One program per (request, kv_head, query_group).  Walks the block
+    # table directly so the Python host never gathers KV data.
+
+    @triton.jit
+    def _tq_fused_decode_kernel(
+        # Pre-rotated queries: (num_reqs, num_kv_heads, heads_per_kv, D)
+        Q_ROT, Q_SKETCH,
+        # KV cache – two typed views of the same memory
+        KV_U8,       # uint8 view  (num_blocks, block_size, nkh, total_bytes)
+        KV_FP16,     # fp16  view  (num_blocks, block_size, nkh, fp16_elems)
+        # Indirection
+        BLOCK_TABLE,  # (num_reqs, max_blocks)  int32
+        SEQ_LENS,     # (num_reqs,)             int32
+        # Unrotation
+        VAL_SIGMA,    # (D,) float32   – WHT path
+        VAL_PI,       # (D, D) float32 – Haar path
+        # Output: (num_reqs, nkh, hpkv, D)
+        OUT,
+        # ── strides (element counts in each pointer's dtype) ──
+        stride_qr_r, stride_qr_h, stride_qr_g,
+        stride_qs_r, stride_qs_h, stride_qs_g,
+        stride_u8_b, stride_u8_t, stride_u8_h,
+        stride_fp16_b, stride_fp16_t, stride_fp16_h,
+        stride_bt_r,
+        stride_vp_row, stride_vp_col,
+        stride_out_r, stride_out_h, stride_out_g,
+        # ── scalar params ──
+        qjl_corr, sm_scale,
+        # Key centroids (2-bit → 4 values)
+        c0, c1, c2, c3,
+        # Value centroids (4-bit packing → 8 values)
+        vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+        # ── compile-time constants ──
+        HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        CACHE_BLOCK_SIZE: tl.constexpr,
+        USE_WHT: tl.constexpr,
+        KM_OFF: tl.constexpr,
+        KQ_OFF: tl.constexpr,
+        KR_FP16_OFF: tl.constexpr,
+        KN_FP16_OFF: tl.constexpr,
+        VM_OFF: tl.constexpr,
+        VN_FP16_OFF: tl.constexpr,
+        KM_BYTES: tl.constexpr,
+        KQ_BYTES: tl.constexpr,
+        VM_BYTES: tl.constexpr,
+    ):
+        req_id = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        q_group = tl.program_id(2)
+
+        seq_len = tl.load(SEQ_LENS + req_id).to(tl.int32)
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
+
+        qr_base = (Q_ROT + req_id * stride_qr_r
+                    + kv_head * stride_qr_h + q_group * stride_qr_g)
+        qs_base = (Q_SKETCH + req_id * stride_qs_r
+                    + kv_head * stride_qs_h + q_group * stride_qs_g)
+
+        # Online-softmax accumulators
+        e_max = -float("inf")
+        e_sum = 0.0
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        offs_km = tl.arange(0, KM_BYTES)
+        offs_kq = tl.arange(0, KQ_BYTES)
+        offs_vm = tl.arange(0, VM_BYTES)
+
+        # ── iterate over KV tokens via block table ──────────────────
+        for start_n in range(0, seq_len, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < seq_len
+
+            # Block-table indirection
+            blk_indices = (offs_n // CACHE_BLOCK_SIZE).to(tl.int32)
+            tok_offsets = (offs_n % CACHE_BLOCK_SIZE).to(tl.int64)
+            block_ids = tl.load(
+                BLOCK_TABLE + req_id * stride_bt_r + blk_indices,
+                mask=mask_n, other=0,
+            ).to(tl.int64)
+
+            u8_bases = (block_ids * stride_u8_b
+                        + tok_offsets * stride_u8_t
+                        + kv_head * stride_u8_h)
+            fp16_bases = (block_ids * stride_fp16_b
+                          + tok_offsets * stride_fp16_t
+                          + kv_head * stride_fp16_h)
+
+            # ── MSE scoring ──
+            km_ptrs = (KV_U8 + u8_bases[:, None]
+                       + (KM_OFF + offs_km.to(tl.int64))[None, :])
+            packed_km = tl.load(km_ptrs, mask=mask_n[:, None], other=0)
+
+            score_mse = tl.zeros([BLOCK_N], dtype=tl.float32)
+            for shift_idx in range(4):
+                q_coords = offs_km * 4 + shift_idx
+                q_vals = tl.load(
+                    qr_base + q_coords,
+                    mask=q_coords < HEAD_DIM, other=0.0,
+                ).to(tl.float32)
+                idx = ((packed_km >> (shift_idx * 2)) & 0x3).to(tl.int32)
+                vals = _lookup_4(idx, c0, c1, c2, c3).to(tl.float32)
+                score_mse += tl.sum(vals * q_vals[None, :], axis=1)
+
+            # ── QJL scoring ──
+            qq_ptrs = (KV_U8 + u8_bases[:, None]
+                       + (KQ_OFF + offs_kq.to(tl.int64))[None, :])
+            packed_qjl = tl.load(qq_ptrs, mask=mask_n[:, None], other=0)
+
+            score_qjl = tl.zeros([BLOCK_N], dtype=tl.float32)
+            for bit_idx in range(8):
+                q_coords = offs_kq * 8 + bit_idx
+                q_vals = tl.load(
+                    qs_base + q_coords,
+                    mask=q_coords < HEAD_DIM, other=0.0,
+                ).to(tl.float32)
+                bits = ((packed_qjl >> bit_idx) & 1).to(tl.float32)
+                signs = bits * 2.0 - 1.0
+                score_qjl += tl.sum(signs * q_vals[None, :], axis=1)
+
+            # ── norms (fp16 view) ──
+            residual_norm = tl.load(
+                KV_FP16 + fp16_bases + KR_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+            key_norm = tl.load(
+                KV_FP16 + fp16_bases + KN_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+
+            scores = ((score_mse + qjl_corr * score_qjl * residual_norm)
+                      * key_norm * sm_scale)
+            scores = tl.where(mask_n, scores, -float("inf"))
+
+            # ── online softmax ──
+            n_e_max = tl.maximum(tl.max(scores, axis=0), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(scores - n_e_max)
+            p = tl.where(mask_n, p, 0.0)
+            acc *= re_scale
+
+            # ── value accumulation ──
+            vm_ptrs = (KV_U8 + u8_bases[:, None]
+                       + (VM_OFF + offs_vm.to(tl.int64))[None, :])
+            packed_vm = tl.load(vm_ptrs, mask=mask_n[:, None], other=0)
+            value_norm = tl.load(
+                KV_FP16 + fp16_bases + VN_FP16_OFF,
+                mask=mask_n, other=0.0,
+            ).to(tl.float32)
+
+            block_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+            for nibble_idx in range(2):
+                coords = offs_vm * 2 + nibble_idx
+                idx = ((packed_vm >> (nibble_idx * 4)) & 0xF).to(tl.int32)
+                vals = _lookup_8(
+                    idx, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+                ).to(tl.float32)
+                vals *= value_norm[:, None]
+                updates = tl.sum(p[:, None] * vals, axis=0)
+                coord_mask = coords[:, None] == offs_d[None, :]
+                block_acc += tl.sum(
+                    tl.where(coord_mask, updates[:, None], 0.0),
+                    axis=0,
+                )
+
+            acc += block_acc
+            e_sum = e_sum * re_scale + tl.sum(p, axis=0)
+            e_max = n_e_max
+
+        # ── normalise (safe for seq_len==0) ──
+        safe_denom = tl.where(e_sum > 0, e_sum, 1.0)
+        result = tl.where(mask_d, acc / safe_denom, 0.0)
+
+        # ── unrotation (fused stage-2) ──
+        if USE_WHT:
+            transformed = result
+            if BLOCK_D >= 2:
+                transformed = _tq_fwht_step(transformed, 1, BLOCK_D)
+            if BLOCK_D >= 4:
+                transformed = _tq_fwht_step(transformed, 2, BLOCK_D)
+            if BLOCK_D >= 8:
+                transformed = _tq_fwht_step(transformed, 4, BLOCK_D)
+            if BLOCK_D >= 16:
+                transformed = _tq_fwht_step(transformed, 8, BLOCK_D)
+            if BLOCK_D >= 32:
+                transformed = _tq_fwht_step(transformed, 16, BLOCK_D)
+            if BLOCK_D >= 64:
+                transformed = _tq_fwht_step(transformed, 32, BLOCK_D)
+            if BLOCK_D >= 128:
+                transformed = _tq_fwht_step(transformed, 64, BLOCK_D)
+            if BLOCK_D >= 256:
+                transformed = _tq_fwht_step(transformed, 128, BLOCK_D)
+            rsqrt_d = 1.0 / tl.sqrt(float(HEAD_DIM))
+            sigma = tl.load(
+                VAL_SIGMA + offs_d, mask=mask_d, other=1.0,
+            ).to(tl.float32)
+            result = sigma * transformed * rsqrt_d
+        else:
+            val_pi = tl.load(
+                VAL_PI
+                + offs_d[:, None] * stride_vp_row
+                + offs_d[None, :] * stride_vp_col,
+                mask=mask_d[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            result = tl.sum(result[:, None] * val_pi, axis=0)
+
+        # ── store ──
+        out_base = (OUT + req_id * stride_out_r
+                    + kv_head * stride_out_h + q_group * stride_out_g)
+        tl.store(out_base + offs_d, result, mask=mask_d)
+
 
 def _stage1_triton(
     q_rot: torch.Tensor,
@@ -694,3 +910,150 @@ def _tq_decode_stage2(
     return _stage2_torch(
         partial_acc, partial_lse, val_pi,
         rotation=rotation, val_sigma=val_sigma)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fused decode — single-launch path with block-table indirection
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _fused_decode_triton(
+    q_rot: torch.Tensor,
+    q_sketch: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: "_CompressedLayout",
+    *,
+    key_centroids: torch.Tensor,
+    val_centroids: torch.Tensor,
+    val_pi: torch.Tensor,
+    val_sigma: "torch.Tensor | None",
+    qjl_corr: float,
+    sm_scale: float,
+    rotation: str = "wht",
+) -> torch.Tensor:
+    """Launch the fused decode kernel for all requests in one shot."""
+
+    num_reqs, num_kv_heads, heads_per_kv, head_dim = q_rot.shape
+    block_d = triton.next_power_of_2(head_dim)
+    block_size = kv_cache.shape[1]
+    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+
+    # Two typed views of the same memory
+    kv_u8 = kv_cache.contiguous().view(torch.uint8)
+    kv_fp16 = kv_cache.contiguous()
+
+    out = torch.empty(
+        (num_reqs, num_kv_heads, heads_per_kv, head_dim),
+        dtype=torch.float32,
+        device=kv_cache.device,
+    )
+
+    use_wht = rotation == "wht"
+    if use_wht and val_sigma is not None:
+        val_sigma_f = val_sigma.float().contiguous().to(kv_cache.device)
+    else:
+        val_sigma_f = torch.ones(
+            head_dim, dtype=torch.float32, device=kv_cache.device)
+    val_pi_f = val_pi.float().contiguous()
+
+    kc = key_centroids.float().contiguous()
+    vc = val_centroids.float().contiguous()
+
+    grid = (num_reqs, num_kv_heads, heads_per_kv)
+    _tq_fused_decode_kernel[grid](
+        q_rot.contiguous(),
+        q_sketch.contiguous(),
+        kv_u8,
+        kv_fp16,
+        block_table.int().contiguous(),
+        seq_lens.int().contiguous(),
+        val_sigma_f,
+        val_pi_f,
+        out,
+        # Q_ROT strides
+        q_rot.stride(0), q_rot.stride(1), q_rot.stride(2),
+        # Q_SKETCH strides
+        q_sketch.stride(0), q_sketch.stride(1), q_sketch.stride(2),
+        # KV_U8 strides (bytes)
+        kv_u8.stride(0), kv_u8.stride(1), kv_u8.stride(2),
+        # KV_FP16 strides (fp16 elements)
+        kv_fp16.stride(0), kv_fp16.stride(1), kv_fp16.stride(2),
+        # Block-table stride
+        block_table.stride(0),
+        # Val_pi strides
+        val_pi_f.stride(0), val_pi_f.stride(1),
+        # Output strides
+        out.stride(0), out.stride(1), out.stride(2),
+        # Scalars
+        qjl_corr,
+        sm_scale,
+        # Key centroids
+        float(kc[0].item()), float(kc[1].item()),
+        float(kc[2].item()), float(kc[3].item()),
+        # Val centroids
+        float(vc[0].item()), float(vc[1].item()),
+        float(vc[2].item()), float(vc[3].item()),
+        float(vc[4].item()), float(vc[5].item()),
+        float(vc[6].item()), float(vc[7].item()),
+        # Constexprs
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        BLOCK_N=block_n,
+        CACHE_BLOCK_SIZE=block_size,
+        USE_WHT=use_wht,
+        KM_OFF=layout.km_off,
+        KQ_OFF=layout.kq_off,
+        KR_FP16_OFF=layout.kr_off // 2,
+        KN_FP16_OFF=layout.kn_off // 2,
+        VM_OFF=layout.vm_off,
+        VN_FP16_OFF=layout.vn_off // 2,
+        KM_BYTES=layout.km_len,
+        KQ_BYTES=layout.kq_len,
+        VM_BYTES=layout.vm_len,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+def _tq_fused_decode(
+    q_rot: torch.Tensor,
+    q_sketch: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: "_CompressedLayout",
+    *,
+    key_centroids: torch.Tensor,
+    val_centroids: torch.Tensor,
+    val_pi: torch.Tensor,
+    val_sigma: "torch.Tensor | None",
+    qjl_corr: float,
+    sm_scale: float,
+    rotation: str = "wht",
+) -> "torch.Tensor | None":
+    """Dispatch fused decode.  Returns None when Triton is unavailable."""
+
+    triton_ok = (
+        TRITON_AVAILABLE
+        and q_rot.is_cuda
+        and layout.key_mse_bits == 2
+        and layout.val_mse_bits <= 4
+        and len(key_centroids) == 4
+        and len(val_centroids) == 8
+    )
+    if not triton_ok:
+        return None
+
+    return _fused_decode_triton(
+        q_rot, q_sketch, kv_cache, block_table, seq_lens, layout,
+        key_centroids=key_centroids,
+        val_centroids=val_centroids,
+        val_pi=val_pi,
+        val_sigma=val_sigma,
+        qjl_corr=qjl_corr,
+        sm_scale=sm_scale,
+        rotation=rotation,
+    )
