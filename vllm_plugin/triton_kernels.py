@@ -984,22 +984,24 @@ def _prerotate_triton(
     s_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused prerotate kernel (WHT + QJL sketch)."""
-    num_kv_heads, heads_per_kv, head_dim = q_view.shape[1], q_view.shape[2], q_view.shape[3]
+    q_len, num_kv_heads, heads_per_kv, head_dim = q_view.shape
     block_d = triton.next_power_of_2(head_dim)
     tile_k = min(32, block_d)
     device = q_view.device
 
-    q_f = q_view.squeeze(0).float().contiguous()
+    q_f = q_view.float().contiguous().reshape(
+        q_len * num_kv_heads, heads_per_kv, head_dim,
+    )
     sigma_f = sigma.float().contiguous().to(device)
     s_t_f = s_t.float().contiguous().to(device)
 
     q_rot = torch.empty(
-        (num_kv_heads, heads_per_kv, head_dim),
+        (q_len * num_kv_heads, heads_per_kv, head_dim),
         dtype=torch.float32, device=device,
     )
     q_sketch = torch.empty_like(q_rot)
 
-    grid = (num_kv_heads, heads_per_kv)
+    grid = (q_len * num_kv_heads, heads_per_kv)
     _tq_prerotate_kernel[grid](
         q_f, sigma_f, s_t_f, q_rot, q_sketch,
         q_f.stride(0), q_f.stride(1),
@@ -1012,7 +1014,10 @@ def _prerotate_triton(
         num_warps=4,
         num_stages=1,
     )
-    return q_rot.unsqueeze(0), q_sketch.unsqueeze(0)
+    return (
+        q_rot.reshape(q_len, num_kv_heads, heads_per_kv, head_dim),
+        q_sketch.reshape(q_len, num_kv_heads, heads_per_kv, head_dim),
+    )
 
 
 def _pack_triton(
@@ -1025,6 +1030,9 @@ def _pack_triton(
     layout: "_CompressedLayout",
 ) -> torch.Tensor:
     """Launch the fused pack kernel — replaces ``layout.pack``."""
+    if layout.key_mse_bits != 2 or layout.val_mse_bits > 4:
+        return layout.pack(k_mse, qjl_signs, k_rnorm, k_norm, v_mse, v_norm)
+
     num_rows = k_mse.shape[0]
     device = k_mse.device
 
