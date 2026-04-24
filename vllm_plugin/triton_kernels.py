@@ -139,6 +139,163 @@ if _HAS_TRITON:
         return x
 
     # ═══════════════════════════════════════════════════════════════════
+    # Prerotate kernel — fuse WHT + QJL sketch into one launch
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_prerotate_kernel(
+        Q_RAW,
+        SIGMA,
+        S_T,
+        Q_ROT,
+        Q_SKETCH,
+        stride_q_h,
+        stride_q_g,
+        stride_st_row,
+        stride_st_col,
+        stride_qr_h,
+        stride_qr_g,
+        stride_qs_h,
+        stride_qs_g,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        TILE_K: tl.constexpr,
+    ):
+        """Fused query prerotation: WHT rotation + QJL sketch in one launch.
+
+        Replaces ~22 CUDA kernel launches (vectorised FWHT + batched matmul)
+        with a single Triton kernel.  One program per (kv_head, q_group).
+        """
+        kv_head = tl.program_id(0)
+        q_group = tl.program_id(1)
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
+
+        q_raw = tl.load(
+            Q_RAW + kv_head * stride_q_h + q_group * stride_q_g + offs_d,
+            mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        # WHT rotate: q_rot = (1/√d) · FWHT(σ ⊙ q)
+        sigma = tl.load(SIGMA + offs_d, mask=mask_d, other=1.0).to(tl.float32)
+        q_rot = _tq_fwht_full(q_raw * sigma, BLOCK_D)
+        q_rot = q_rot * (1.0 / tl.sqrt(float(HEAD_DIM)))
+
+        tl.store(
+            Q_ROT + kv_head * stride_qr_h + q_group * stride_qr_g + offs_d,
+            q_rot, mask=mask_d,
+        )
+
+        # QJL sketch: q_sketch = q_raw @ S_T  (tiled matmul)
+        q_sketch = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for k_start in range(0, HEAD_DIM, TILE_K):
+            k_offs = k_start + tl.arange(0, TILE_K)
+            k_mask = k_offs < HEAD_DIM
+            q_chunk = tl.load(
+                Q_RAW + kv_head * stride_q_h + q_group * stride_q_g + k_offs,
+                mask=k_mask, other=0.0,
+            ).to(tl.float32)
+            st_chunk = tl.load(
+                S_T + k_offs[:, None] * stride_st_row
+                + offs_d[None, :] * stride_st_col,
+                mask=k_mask[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            q_sketch += tl.sum(q_chunk[:, None] * st_chunk, axis=0)
+
+        tl.store(
+            Q_SKETCH + kv_head * stride_qs_h + q_group * stride_qs_g + offs_d,
+            q_sketch, mask=mask_d,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Pack kernel — fuse bit-packing into one launch
+    # ═══════════════════════════════════════════════════════════════════
+
+    @triton.jit
+    def _tq_pack_kernel(
+        K_IDX,
+        QJL_SIGNS,
+        K_RNORM,
+        K_NORM,
+        V_IDX,
+        V_NORM,
+        OUT,
+        stride_kidx,
+        stride_qjl,
+        stride_vidx,
+        stride_out,
+        HEAD_DIM: tl.constexpr,
+        KM_OFF: tl.constexpr,
+        KM_BYTES: tl.constexpr,
+        KQ_OFF: tl.constexpr,
+        KQ_BYTES: tl.constexpr,
+        KR_OFF: tl.constexpr,
+        KN_OFF: tl.constexpr,
+        VM_OFF: tl.constexpr,
+        VM_BYTES: tl.constexpr,
+        VN_OFF: tl.constexpr,
+    ):
+        """Pack raw indices/norms into the compressed byte layout.
+
+        One program per row (token × kv_head).  Replaces ~20 small CUDA
+        kernel launches from the Python ``layout.pack`` path.
+        """
+        pid = tl.program_id(0)
+
+        # ── Key MSE: 2-bit pack (4 indices → 1 byte) ──
+        offs_km = tl.arange(0, KM_BYTES)
+        packed_km = tl.zeros([KM_BYTES], dtype=tl.int32)
+        for s in tl.static_range(4):
+            d = offs_km * 4 + s
+            idx = tl.load(K_IDX + pid * stride_kidx + d, mask=d < HEAD_DIM, other=0)
+            packed_km |= (idx.to(tl.int32) & 0x3) << (s * 2)
+        tl.store(OUT + pid * stride_out + KM_OFF + offs_km, packed_km.to(tl.uint8))
+
+        # ── QJL signs: 1-bit pack (8 signs → 1 byte) ──
+        offs_kq = tl.arange(0, KQ_BYTES)
+        packed_qjl = tl.zeros([KQ_BYTES], dtype=tl.int32)
+        for b in tl.static_range(8):
+            d = offs_kq * 8 + b
+            sign = tl.load(
+                QJL_SIGNS + pid * stride_qjl + d, mask=d < HEAD_DIM, other=0.0,
+            )
+            packed_qjl |= (sign > 0).to(tl.int32) << b
+        tl.store(OUT + pid * stride_out + KQ_OFF + offs_kq, packed_qjl.to(tl.uint8))
+
+        # ── Key residual norm (fp16 → 2 bytes) ──
+        kr = tl.load(K_RNORM + pid).to(tl.float16)
+        # Store via a float16 pointer offset
+        tl.store(
+            (OUT + pid * stride_out + KR_OFF).to(tl.pointer_type(tl.float16)),
+            kr,
+        )
+
+        # ── Key original norm (fp16 → 2 bytes) ──
+        kn = tl.load(K_NORM + pid).to(tl.float16)
+        tl.store(
+            (OUT + pid * stride_out + KN_OFF).to(tl.pointer_type(tl.float16)),
+            kn,
+        )
+
+        # ── Value MSE: 4-bit pack (2 indices → 1 byte) ──
+        offs_vm = tl.arange(0, VM_BYTES)
+        packed_vm = tl.zeros([VM_BYTES], dtype=tl.int32)
+        for s in tl.static_range(2):
+            d = offs_vm * 2 + s
+            idx = tl.load(V_IDX + pid * stride_vidx + d, mask=d < HEAD_DIM, other=0)
+            packed_vm |= (idx.to(tl.int32) & 0xF) << (s * 4)
+        tl.store(OUT + pid * stride_out + VM_OFF + offs_vm, packed_vm.to(tl.uint8))
+
+        # ── Value norm (fp16 → 2 bytes) ──
+        vn = tl.load(V_NORM + pid).to(tl.float16)
+        tl.store(
+            (OUT + pid * stride_out + VN_OFF).to(tl.pointer_type(tl.float16)),
+            vn,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
     # Decode kernels
     # ═══════════════════════════════════════════════════════════════════
 
@@ -817,6 +974,88 @@ def _stage2_triton(
         USE_WHT=use_wht,
         num_warps=4,
         num_stages=2,
+    )
+    return out
+
+
+def _prerotate_triton(
+    q_view: torch.Tensor,
+    sigma: torch.Tensor,
+    s_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the fused prerotate kernel (WHT + QJL sketch)."""
+    num_kv_heads, heads_per_kv, head_dim = q_view.shape[1], q_view.shape[2], q_view.shape[3]
+    block_d = triton.next_power_of_2(head_dim)
+    tile_k = min(32, block_d)
+    device = q_view.device
+
+    q_f = q_view.squeeze(0).float().contiguous()
+    sigma_f = sigma.float().contiguous().to(device)
+    s_t_f = s_t.float().contiguous().to(device)
+
+    q_rot = torch.empty(
+        (num_kv_heads, heads_per_kv, head_dim),
+        dtype=torch.float32, device=device,
+    )
+    q_sketch = torch.empty_like(q_rot)
+
+    grid = (num_kv_heads, heads_per_kv)
+    _tq_prerotate_kernel[grid](
+        q_f, sigma_f, s_t_f, q_rot, q_sketch,
+        q_f.stride(0), q_f.stride(1),
+        s_t_f.stride(0), s_t_f.stride(1),
+        q_rot.stride(0), q_rot.stride(1),
+        q_sketch.stride(0), q_sketch.stride(1),
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
+        TILE_K=tile_k,
+        num_warps=4,
+        num_stages=1,
+    )
+    return q_rot.unsqueeze(0), q_sketch.unsqueeze(0)
+
+
+def _pack_triton(
+    k_mse: torch.Tensor,
+    qjl_signs: torch.Tensor,
+    k_rnorm: torch.Tensor,
+    k_norm: torch.Tensor,
+    v_mse: torch.Tensor,
+    v_norm: torch.Tensor,
+    layout: "_CompressedLayout",
+) -> torch.Tensor:
+    """Launch the fused pack kernel — replaces ``layout.pack``."""
+    num_rows = k_mse.shape[0]
+    device = k_mse.device
+
+    out = torch.zeros(
+        num_rows, layout.total_bytes, dtype=torch.uint8, device=device,
+    )
+
+    _tq_pack_kernel[(num_rows,)](
+        k_mse.to(torch.int32).contiguous(),
+        qjl_signs.float().contiguous(),
+        k_rnorm.float().contiguous(),
+        k_norm.float().contiguous(),
+        v_mse.to(torch.int32).contiguous(),
+        v_norm.float().contiguous(),
+        out,
+        k_mse.stride(0),
+        qjl_signs.stride(0),
+        v_mse.stride(0),
+        out.stride(0),
+        HEAD_DIM=layout.head_dim,
+        KM_OFF=layout.km_off,
+        KM_BYTES=layout.km_len,
+        KQ_OFF=layout.kq_off,
+        KQ_BYTES=layout.kq_len,
+        KR_OFF=layout.kr_off,
+        KN_OFF=layout.kn_off,
+        VM_OFF=layout.vm_off,
+        VM_BYTES=layout.vm_len,
+        VN_OFF=layout.vn_off,
+        num_warps=1,
+        num_stages=1,
     )
     return out
 

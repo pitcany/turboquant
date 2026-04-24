@@ -15,7 +15,11 @@ import torch
 import torch.nn.functional as F
 
 from turboquant import wht_rotate, wht_unrotate
-from vllm_plugin.triton_kernels import _tq_decode_stage1, _tq_decode_stage2
+from vllm_plugin.triton_kernels import (
+    TRITON_AVAILABLE,
+    _tq_decode_stage1,
+    _tq_decode_stage2,
+)
 
 if TYPE_CHECKING:
     from vllm_plugin.attention import _CompressedLayout
@@ -29,6 +33,17 @@ def prerotate_queries(
     key_sigma: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return rotated queries and QJL sketches for the decode kernels."""
+
+    # Fast path: fused Triton kernel for WHT rotation + QJL sketch
+    if (
+        rotation == "wht"
+        and key_sigma is not None
+        and TRITON_AVAILABLE
+        and queries.is_cuda
+    ):
+        from vllm_plugin.triton_kernels import _prerotate_triton
+
+        return _prerotate_triton(queries, key_sigma, s_t)
 
     q_float = queries.float()
     if rotation == "wht":
