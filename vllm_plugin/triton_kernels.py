@@ -1256,17 +1256,24 @@ def _pack_triton(
         num_rows, layout.total_bytes, dtype=torch.uint8, device=device,
     )
 
+    k_mse_c = k_mse.to(torch.int32).contiguous()
+    qjl_c = qjl_signs.float().contiguous()
+    k_rnorm_c = k_rnorm.float().contiguous()
+    k_norm_c = k_norm.float().contiguous()
+    v_mse_c = v_mse.to(torch.int32).contiguous()
+    v_norm_c = v_norm.float().contiguous()
+
     _tq_pack_kernel[(num_rows,)](
-        k_mse.to(torch.int32).contiguous(),
-        qjl_signs.float().contiguous(),
-        k_rnorm.float().contiguous(),
-        k_norm.float().contiguous(),
-        v_mse.to(torch.int32).contiguous(),
-        v_norm.float().contiguous(),
+        k_mse_c,
+        qjl_c,
+        k_rnorm_c,
+        k_norm_c,
+        v_mse_c,
+        v_norm_c,
         out,
-        k_mse.stride(0),
-        qjl_signs.stride(0),
-        v_mse.stride(0),
+        k_mse_c.stride(0),
+        qjl_c.stride(0),
+        v_mse_c.stride(0),
         out.stride(0),
         HEAD_DIM=layout.head_dim,
         KM_OFF=layout.km_off,
