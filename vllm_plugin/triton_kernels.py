@@ -221,9 +221,6 @@ if _HAS_TRITON:
         KN_FP16_OFF: tl.constexpr,
         VM_OFF: tl.constexpr,
         VN_FP16_OFF: tl.constexpr,
-        KM_BYTES: tl.constexpr,
-        KQ_BYTES: tl.constexpr,
-        VM_BYTES: tl.constexpr,
     ):
         kv_head = tl.program_id(0)
         q_group = tl.program_id(1)
@@ -252,16 +249,16 @@ if _HAS_TRITON:
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
         has_tokens = split_kv_end > split_kv_start
 
-        # Vectorized address mappings: map each head dimension to its
-        # packed byte offset and bit-shift within that byte.
-        km_byte = offs_d // 4           # 2-bit key: 4 indices per byte
-        km_shift = (offs_d % 4) * 2
-        kq_byte = offs_d // 8           # 1-bit QJL: 8 signs per byte
-        kq_shift = offs_d % 8
-        vm_byte = offs_d // 2           # 4-bit value: 2 indices per byte
-        vm_shift = (offs_d % 2) * 4
-
         if has_tokens:
+            # Vectorized address mappings: map each head dimension to its
+            # packed byte offset and bit-shift within that byte.
+            km_byte = offs_d // 4           # 2-bit key: 4 indices per byte
+            km_shift = (offs_d % 4) * 2
+            kq_byte = offs_d // 8           # 1-bit QJL: 8 signs per byte
+            kq_shift = offs_d % 8
+            vm_byte = offs_d // 2           # 4-bit value: 2 indices per byte
+            vm_shift = (offs_d % 2) * 4
+
             for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
                 offs_n = start_n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < split_kv_end
@@ -769,9 +766,6 @@ def _stage1_triton(
         KN_FP16_OFF=layout.kn_off // 2,
         VM_OFF=layout.vm_off,
         VN_FP16_OFF=layout.vn_off // 2,
-        KM_BYTES=layout.km_len,
-        KQ_BYTES=layout.kq_len,
-        VM_BYTES=layout.vm_len,
         num_warps=4,
         num_stages=2,
     )
