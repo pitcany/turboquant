@@ -37,6 +37,8 @@ def prerotate_queries(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return rotated queries and QJL sketches for the decode kernels."""
 
+    head_dim = queries.shape[-1]
+    qjl_dim = s_t.shape[-1]
     # Fast path: fused Triton kernel for WHT rotation + QJL sketch
     if (
         use_triton
@@ -44,6 +46,7 @@ def prerotate_queries(
         and key_sigma is not None
         and TRITON_AVAILABLE
         and queries.is_cuda
+        and qjl_dim == head_dim
     ):
         from vllm_plugin.triton_kernels import _prerotate_triton
 
