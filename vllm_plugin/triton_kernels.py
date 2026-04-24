@@ -356,18 +356,6 @@ if _HAS_TRITON:
         seq_len,
         qjl_corr,
         sm_scale,
-        c0,
-        c1,
-        c2,
-        c3,
-        vc0,
-        vc1,
-        vc2,
-        vc3,
-        vc4,
-        vc5,
-        vc6,
-        vc7,
         HEAD_DIM: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -385,6 +373,24 @@ if _HAS_TRITON:
 
         offs_d = tl.arange(0, BLOCK_D)
         mask_d = offs_d < HEAD_DIM
+        key_centroids = tl.load(
+            KEY_CENTROIDS + tl.arange(0, 4),
+        ).to(tl.float32)
+        val_centroids = tl.load(
+            VAL_CENTROIDS + tl.arange(0, 8),
+        ).to(tl.float32)
+        c0, c1, c2, c3 = (
+            key_centroids[0], key_centroids[1],
+            key_centroids[2], key_centroids[3],
+        )
+        vc0, vc1, vc2, vc3 = (
+            val_centroids[0], val_centroids[1],
+            val_centroids[2], val_centroids[3],
+        )
+        vc4, vc5, vc6, vc7 = (
+            val_centroids[4], val_centroids[5],
+            val_centroids[6], val_centroids[7],
+        )
 
         q_rot = tl.load(
             Q_ROT + kv_head * stride_qrot_h + q_group * stride_qrot_g + offs_d,
@@ -702,7 +708,6 @@ if _HAS_TRITON:
 
         offs_d = tl.arange(0, BLOCK_D)
         mask_d = offs_d < HEAD_DIM
-
         qr_base = (Q_ROT + req_id * stride_qr_r
                     + kv_head * stride_qr_h + q_group * stride_qr_g)
         qs_base = (Q_SKETCH + req_id * stride_qs_r
@@ -876,6 +881,8 @@ if _HAS_TRITON:
         BLOCK_TABLE, SEQ_LENS,
         # Unrotation
         VAL_SIGMA, VAL_PI,
+        # Centroids (device pointers)
+        KEY_CENTROIDS, VAL_CENTROIDS,
         # Output
         OUT,
         # Strides
@@ -888,8 +895,6 @@ if _HAS_TRITON:
         stride_out_r, stride_out_h, stride_out_g,
         # Scalars
         qjl_corr, sm_scale,
-        c0, c1, c2, c3,
-        vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
         # Constexprs
         HEAD_DIM: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -919,6 +924,24 @@ if _HAS_TRITON:
 
         offs_d = tl.arange(0, BLOCK_D)
         mask_d = offs_d < HEAD_DIM
+        key_centroids = tl.load(
+            KEY_CENTROIDS + tl.arange(0, 4),
+        ).to(tl.float32)
+        val_centroids = tl.load(
+            VAL_CENTROIDS + tl.arange(0, 8),
+        ).to(tl.float32)
+        c0, c1, c2, c3 = (
+            key_centroids[0], key_centroids[1],
+            key_centroids[2], key_centroids[3],
+        )
+        vc0, vc1, vc2, vc3 = (
+            val_centroids[0], val_centroids[1],
+            val_centroids[2], val_centroids[3],
+        )
+        vc4, vc5, vc6, vc7 = (
+            val_centroids[4], val_centroids[5],
+            val_centroids[6], val_centroids[7],
+        )
 
         # ── Inline prerotation ──────────────────────────────────────
         qraw_base = (Q_RAW + req_id * stride_qraw_r
@@ -1284,18 +1307,16 @@ if _HAS_TRITON:
 
         # ── Key MSE: 2-bit pack (4 indices → 1 byte) ─────────────
         offs_km = tl.arange(0, KM_BYTES)
-        packed_km = tl.zeros([KM_BYTES], dtype=tl.int32)
-        for s in tl.static_range(4):
-            d = offs_km * 4 + s
-            idx_at_d = tl.sum(
-                tl.where(
-                    offs_d[None, :] == d[:, None],
-                    k_idx[None, :], 0,
-                ),
-                axis=1,
-            )
-            packed_km |= (idx_at_d & 0x3) << (s * 2)
-        tl.store(out_row + KM_OFF + offs_km, packed_km.to(tl.uint8))
+        k_idx_4 = tl.reshape(k_idx, (BLOCK_D // 4, 4))
+        packed_km = (k_idx_4[:, 0] & 0x3)
+        packed_km |= (k_idx_4[:, 1] & 0x3) << 2
+        packed_km |= (k_idx_4[:, 2] & 0x3) << 4
+        packed_km |= (k_idx_4[:, 3] & 0x3) << 6
+        tl.store(
+            out_row + KM_OFF + offs_km,
+            packed_km.to(tl.uint8),
+            mask=offs_km < KM_BYTES,
+        )
 
         # ── QJL signs: compute + 1-bit pack inline ───────────────
         offs_kq = tl.arange(0, KQ_BYTES)
@@ -1327,18 +1348,14 @@ if _HAS_TRITON:
 
         # ── Value MSE: 4-bit pack (2 indices → 1 byte) ───────────
         offs_vm = tl.arange(0, VM_BYTES)
-        packed_vm = tl.zeros([VM_BYTES], dtype=tl.int32)
-        for s in tl.static_range(2):
-            d = offs_vm * 2 + s
-            idx_at_d = tl.sum(
-                tl.where(
-                    offs_d[None, :] == d[:, None],
-                    v_idx[None, :], 0,
-                ),
-                axis=1,
-            )
-            packed_vm |= (idx_at_d & 0xF) << (s * 4)
-        tl.store(out_row + VM_OFF + offs_vm, packed_vm.to(tl.uint8))
+        v_idx_2 = tl.reshape(v_idx, (BLOCK_D // 2, 2))
+        packed_vm = (v_idx_2[:, 0] & 0xF)
+        packed_vm |= (v_idx_2[:, 1] & 0xF) << 4
+        tl.store(
+            out_row + VM_OFF + offs_vm,
+            packed_vm.to(tl.uint8),
+            mask=offs_vm < VM_BYTES,
+        )
 
         # ── Value norm (fp16) ─────────────────────────────────────
         tl.store(
@@ -1413,41 +1430,6 @@ def _fused_compress_triton(
     }
 
 
-def _fused_compress_pack_triton(
-    key_flat: torch.Tensor,
-    val_flat: torch.Tensor,
-    key_sigma: torch.Tensor,
-    val_sigma: torch.Tensor,
-    key_boundaries: torch.Tensor,
-    key_centroids: torch.Tensor,
-    val_boundaries: torch.Tensor,
-    s_matrix: torch.Tensor,
-    layout: "_CompressedLayout",
-) -> torch.Tensor:
-    """Launch fused compress and pack the result into bytes."""
-    raw = _fused_compress_triton(
-        key_flat,
-        val_flat,
-        key_sigma=key_sigma,
-        val_sigma=val_sigma,
-        key_boundaries=key_boundaries,
-        key_centroids=key_centroids,
-        val_boundaries=val_boundaries,
-        s_matrix=s_matrix,
-        head_dim=layout.head_dim,
-        qjl_dim=s_matrix.shape[0],
-    )
-    return _pack_triton(
-        raw["key_mse_indices"],
-        raw["qjl_signs"],
-        raw["key_residual_norm"],
-        raw["key_norm"],
-        raw["val_mse_indices"],
-        raw["val_norm"],
-        layout,
-    )
-
-
 def _stage1_triton(
     q_rot: torch.Tensor,
     q_sketch: torch.Tensor,
@@ -1512,18 +1494,8 @@ def _stage1_triton(
         seq_len,
         qjl_corr,
         sm_scale,
-        float(key_centroids_f[0].item()),
-        float(key_centroids_f[1].item()),
-        float(key_centroids_f[2].item()),
-        float(key_centroids_f[3].item()),
-        float(val_centroids_f[0].item()),
-        float(val_centroids_f[1].item()),
-        float(val_centroids_f[2].item()),
-        float(val_centroids_f[3].item()),
-        float(val_centroids_f[4].item()),
-        float(val_centroids_f[5].item()),
-        float(val_centroids_f[6].item()),
-        float(val_centroids_f[7].item()),
+        key_centroids_f,
+        val_centroids_f,
         HEAD_DIM=layout.head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
@@ -1631,6 +1603,15 @@ def _prerotate_triton(
     )
 
 
+def _ensure_fp16_alignment(layout: "_CompressedLayout") -> None:
+    if (layout.kr_off % 2 != 0
+            or layout.kn_off % 2 != 0
+            or layout.vn_off % 2 != 0):
+        raise ValueError("Packed fp16 offsets must be 2-byte aligned.")
+    if layout.total_bytes % 2 != 0:
+        raise ValueError("Packed row stride must be 2-byte aligned.")
+
+
 def _pack_triton(
     k_mse: torch.Tensor,
     qjl_signs: torch.Tensor,
@@ -1643,6 +1624,7 @@ def _pack_triton(
     """Launch the fused pack kernel — replaces ``layout.pack``."""
     if layout.key_mse_bits != 2 or layout.val_mse_bits > 4:
         return layout.pack(k_mse, qjl_signs, k_rnorm, k_norm, v_mse, v_norm)
+    _ensure_fp16_alignment(layout)
 
     num_rows = k_mse.shape[0]
     device = k_mse.device
@@ -1782,7 +1764,7 @@ def _fused_decode_triton(
             dtype=torch.float32, device=kv_cache.device)
     block_d = triton.next_power_of_2(head_dim)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    block_n = 64 if block_size >= 64 else 32
 
     # Two typed views of the same contiguous memory
     kv_fp16 = kv_cache.contiguous()
@@ -1802,8 +1784,8 @@ def _fused_decode_triton(
             head_dim, dtype=torch.float32, device=kv_cache.device)
     val_pi_f = val_pi.float().contiguous().to(kv_cache.device)
 
-    kc = key_centroids.float().contiguous()
-    vc = val_centroids.float().contiguous()
+    kc = key_centroids.float().contiguous().to(kv_cache.device)
+    vc = val_centroids.float().contiguous().to(kv_cache.device)
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1820,6 +1802,8 @@ def _fused_decode_triton(
         seq_lens_i,
         val_sigma_f,
         val_pi_f,
+        kc,
+        vc,
         out,
         # Q_ROT strides
         q_rot_c.stride(0), q_rot_c.stride(1), q_rot_c.stride(2),
@@ -1838,14 +1822,6 @@ def _fused_decode_triton(
         # Scalars
         qjl_corr,
         sm_scale,
-        # Key centroids
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
-        # Val centroids
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
         # Constexprs
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
@@ -1942,7 +1918,7 @@ def _fused_decode_prerot_triton(
     block_d = triton.next_power_of_2(head_dim)
     tile_k = min(32, block_d)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    block_n = 64 if block_size >= 64 else 32
 
     kv_fp16 = kv_cache.contiguous()
     kv_u8 = kv_fp16.view(torch.uint8)
@@ -1962,8 +1938,8 @@ def _fused_decode_prerot_triton(
     sigma_f = sigma.float().contiguous().to(kv_cache.device)
     s_t_f = s_t.float().contiguous().to(kv_cache.device)
 
-    kc = key_centroids.float().contiguous()
-    vc = val_centroids.float().contiguous()
+    kc = key_centroids.float().contiguous().to(kv_cache.device)
+    vc = val_centroids.float().contiguous().to(kv_cache.device)
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1975,6 +1951,7 @@ def _fused_decode_prerot_triton(
         kv_u8, kv_fp16,
         block_table_i, seq_lens_i,
         val_sigma_f, val_pi_f,
+        kc, vc,
         out,
         q_raw_c.stride(0), q_raw_c.stride(1), q_raw_c.stride(2),
         s_t_f.stride(0), s_t_f.stride(1),
@@ -1984,12 +1961,6 @@ def _fused_decode_prerot_triton(
         val_pi_f.stride(0), val_pi_f.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         qjl_corr, sm_scale,
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
@@ -2073,6 +2044,7 @@ def _fused_compress_pack_triton(
     layout: "_CompressedLayout",
 ) -> torch.Tensor:
     """Launch fused compress+pack kernel; return packed bytes directly."""
+    _ensure_fp16_alignment(layout)
     num_rows = key_flat.shape[0]
     head_dim = key_flat.shape[1]
     device = key_flat.device
