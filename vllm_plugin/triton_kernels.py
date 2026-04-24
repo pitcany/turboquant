@@ -1220,6 +1220,12 @@ if _HAS_TRITON:
         Eliminates the separate pack kernel and all intermediate index/sign/norm
         tensors.  Same compute as _tq_fused_compress_kernel but packs output
         bytes inline using broadcast-gather from register vectors.
+
+        Note: the broadcast-gather packing is O(KM_BYTES * BLOCK_D) per shift
+        step, which is negligible at BLOCK_D=128 (~48K ops total) but grows
+        quadratically.  At BLOCK_D=256 consider falling back to the separate
+        compress + pack path (the _can_fuse_pack guard already rejects
+        head_dim > 256 via _can_fuse).
         """
         pid = tl.program_id(0)
         if pid >= NUM_ROWS:
@@ -1942,7 +1948,9 @@ def _fused_decode_prerot_triton(
     block_d = triton.next_power_of_2(head_dim)
     tile_k = min(32, block_d)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    # Always use BLOCK_N=64 for CUDAGraph safety — no .item() call,
+    # deterministic constexpr.  The mask_n guard handles short sequences.
+    block_n = 64
 
     kv_fp16 = kv_cache.contiguous()
     kv_u8 = kv_fp16.view(torch.uint8)

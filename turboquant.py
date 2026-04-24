@@ -46,9 +46,10 @@ def generate_sign_vector(d: int, seed: Optional[int] = None, device: str = "cpu"
     return (2 * torch.randint(0, 2, (d,), generator=gen) - 1).float().to(device)
 
 
-def fwht_inplace(x: torch.Tensor) -> torch.Tensor:
+def fwht(x: torch.Tensor) -> torch.Tensor:
     """Fast Walsh-Hadamard Transform along the last dimension.
 
+    Returns a new tensor (not in-place).
     Operates on the unnormalized transform (multiply by 1/sqrt(d) after).
     Requires the last dimension to be a power of 2.
 
@@ -71,14 +72,14 @@ def wht_rotate(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Apply randomized Hadamard rotation: y = (1/sqrt(d)) * WHT(sigma * x)."""
     d = x.shape[-1]
     y = x * sigma
-    y = fwht_inplace(y)
+    y = fwht(y)
     return y * (1.0 / math.sqrt(d))
 
 
 def wht_unrotate(y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Inverse randomized Hadamard rotation: x = sigma * (1/sqrt(d)) * WHT(y)."""
     d = y.shape[-1]
-    x = fwht_inplace(y.clone())
+    x = fwht(y.clone())
     return sigma * x * (1.0 / math.sqrt(d))
 
 

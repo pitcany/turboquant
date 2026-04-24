@@ -266,7 +266,7 @@ Measured on 2x A100-80GB, Qwen2.5-72B-Instruct-AWQ, TP=2:
 
 ```
 turboquant/
-├── turboquant.py              # Core: TurboQuantMSE, TurboQuantProd, fwht_inplace
+├── turboquant.py              # Core: TurboQuantMSE, TurboQuantProd, fwht
 ├── lloyd_max.py               # Lloyd-Max optimal scalar quantizer
 ├── compressors.py             # Production compressors for real model tensors
 ├── ollama_resolver.py         # Ollama GGUF resolver + TQ metadata export
