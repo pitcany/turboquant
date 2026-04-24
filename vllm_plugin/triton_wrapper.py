@@ -54,6 +54,9 @@ def turboquant_decode_attention_pytorch(
     sm_scale: float,
     causal: bool,
     pos_offset: int,
+    rotation: str = "haar",
+    key_sigma: Optional[torch.Tensor] = None,
+    val_sigma: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reference attention path using rotated-domain score/value math."""
 
@@ -80,7 +83,8 @@ def turboquant_decode_attention_pytorch(
     v_rot = v_rot * v_norm.unsqueeze(-1)
 
     q_view = queries.reshape(q_len, num_kv_heads, heads_per_kv, head_dim)
-    q_rot, q_sketch = prerotate_queries(q_view, key_pi_t, s_t)
+    q_rot, q_sketch = prerotate_queries(
+        q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
 
     mse_scores = torch.einsum("qghd,sgd->qghs", q_rot, k_rot.float())
     qjl_scores = torch.einsum("qghd,sgd->qghs", q_sketch, k_signs.float())
@@ -98,7 +102,10 @@ def turboquant_decode_attention_pytorch(
 
     weights = F.softmax(scores, dim=-1)
     out_rot = torch.einsum("qghs,sgd->qghd", weights, v_rot.float())
-    out = out_rot @ val_pi.float()
+    if rotation == "wht":
+        out = wht_unrotate(out_rot.float(), val_sigma)
+    else:
+        out = out_rot @ val_pi.float()
     return out.reshape(q_len, num_kv_heads * heads_per_kv, head_dim).to(
         dtype=queries.dtype)
 
