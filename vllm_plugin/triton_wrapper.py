@@ -220,6 +220,8 @@ def fused_decode_attention(
     rotation: str = "wht",
     key_sigma: Optional[torch.Tensor] = None,
     val_sigma: Optional[torch.Tensor] = None,
+    key_centroid_scalars: Optional[tuple[float, ...]] = None,
+    val_centroid_scalars: Optional[tuple[float, ...]] = None,
 ) -> "torch.Tensor | None":
     """Fused decode: pre-rotate queries + score/accumulate/unrotate in one launch.
 
@@ -246,6 +248,8 @@ def fused_decode_attention(
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        key_centroid_scalars=key_centroid_scalars,
+        val_centroid_scalars=val_centroid_scalars,
     )
 
     # Fallback: separate prerotation + fused decode
@@ -261,6 +265,8 @@ def fused_decode_attention(
             qjl_corr=qjl_corr,
             sm_scale=sm_scale,
             rotation=rotation,
+            key_centroid_scalars=key_centroid_scalars,
+            val_centroid_scalars=val_centroid_scalars,
         )
 
     if out is None:

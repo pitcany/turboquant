@@ -1430,6 +1430,8 @@ def _stage1_triton(
     qjl_corr: float,
     sm_scale: float,
     num_kv_splits: int,
+    key_centroid_scalars: "tuple[float, ...] | None" = None,
+    val_centroid_scalars: "tuple[float, ...] | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     seq_len, num_kv_heads = comp_bytes.shape[:2]
     heads_per_kv = q_rot.shape[1]
@@ -1444,6 +1446,16 @@ def _stage1_triton(
     q_sketch_f = q_sketch.float().contiguous()
     key_centroids_f = key_centroids.float().contiguous()
     val_centroids_f = val_centroids.float().contiguous()
+
+    # Use cached scalars if available (CUDAGraph-safe), else extract.
+    if key_centroid_scalars is not None:
+        kcs = key_centroid_scalars
+    else:
+        kcs = tuple(float(key_centroids_f[i].item()) for i in range(len(key_centroids_f)))
+    if val_centroid_scalars is not None:
+        vcs = val_centroid_scalars
+    else:
+        vcs = tuple(float(val_centroids_f[i].item()) for i in range(len(val_centroids_f)))
 
     partial_acc = torch.empty(
         (num_splits, num_kv_heads, heads_per_kv, layout.head_dim),
@@ -1483,18 +1495,9 @@ def _stage1_triton(
         seq_len,
         qjl_corr,
         sm_scale,
-        float(key_centroids_f[0].item()),
-        float(key_centroids_f[1].item()),
-        float(key_centroids_f[2].item()),
-        float(key_centroids_f[3].item()),
-        float(val_centroids_f[0].item()),
-        float(val_centroids_f[1].item()),
-        float(val_centroids_f[2].item()),
-        float(val_centroids_f[3].item()),
-        float(val_centroids_f[4].item()),
-        float(val_centroids_f[5].item()),
-        float(val_centroids_f[6].item()),
-        float(val_centroids_f[7].item()),
+        kcs[0], kcs[1], kcs[2], kcs[3],
+        vcs[0], vcs[1], vcs[2], vcs[3],
+        vcs[4], vcs[5], vcs[6], vcs[7],
         HEAD_DIM=layout.head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
@@ -1744,6 +1747,8 @@ def _fused_decode_triton(
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    key_centroid_scalars: "tuple[float, ...] | None" = None,
+    val_centroid_scalars: "tuple[float, ...] | None" = None,
 ) -> torch.Tensor:
     """Launch the fused decode kernel for all requests in one shot."""
 
@@ -1777,6 +1782,8 @@ def _fused_decode_triton(
 
     kc = key_centroids.float().contiguous()
     vc = val_centroids.float().contiguous()
+    kcs = key_centroid_scalars or tuple(float(kc[i].item()) for i in range(len(kc)))
+    vcs = val_centroid_scalars or tuple(float(vc[i].item()) for i in range(len(vc)))
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1794,31 +1801,18 @@ def _fused_decode_triton(
         val_sigma_f,
         val_pi_f,
         out,
-        # Q_ROT strides
         q_rot_c.stride(0), q_rot_c.stride(1), q_rot_c.stride(2),
-        # Q_SKETCH strides
         q_sketch_c.stride(0), q_sketch_c.stride(1), q_sketch_c.stride(2),
-        # KV_U8 strides (bytes)
         kv_u8.stride(0), kv_u8.stride(1), kv_u8.stride(2),
-        # KV_FP16 strides (fp16 elements)
         kv_fp16.stride(0), kv_fp16.stride(1), kv_fp16.stride(2),
-        # Block-table stride
         block_table_i.stride(0),
-        # Val_pi strides
         val_pi_f.stride(0), val_pi_f.stride(1),
-        # Output strides
         out.stride(0), out.stride(1), out.stride(2),
-        # Scalars
         qjl_corr,
         sm_scale,
-        # Key centroids
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
-        # Val centroids
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
+        kcs[0], kcs[1], kcs[2], kcs[3],
+        vcs[0], vcs[1], vcs[2], vcs[3],
+        vcs[4], vcs[5], vcs[6], vcs[7],
         # Constexprs
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
@@ -1855,6 +1849,8 @@ def _tq_fused_decode(
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    key_centroid_scalars: "tuple[float, ...] | None" = None,
+    val_centroid_scalars: "tuple[float, ...] | None" = None,
 ) -> "torch.Tensor | None":
     """Dispatch fused decode.  Returns None when Triton is unavailable."""
 
@@ -1881,6 +1877,8 @@ def _tq_fused_decode(
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        key_centroid_scalars=key_centroid_scalars,
+        val_centroid_scalars=val_centroid_scalars,
     )
 
 
@@ -1905,6 +1903,8 @@ def _fused_decode_prerot_triton(
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    key_centroid_scalars: "tuple[float, ...] | None" = None,
+    val_centroid_scalars: "tuple[float, ...] | None" = None,
 ) -> torch.Tensor:
     """Launch fused decode with inline prerotation — zero intermediate tensors."""
     num_reqs, num_kv_heads, heads_per_kv, head_dim = q_raw.shape
@@ -1940,6 +1940,8 @@ def _fused_decode_prerot_triton(
 
     kc = key_centroids.float().contiguous()
     vc = val_centroids.float().contiguous()
+    kcs = key_centroid_scalars or tuple(float(kc[i].item()) for i in range(len(kc)))
+    vcs = val_centroid_scalars or tuple(float(vc[i].item()) for i in range(len(vc)))
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1960,12 +1962,9 @@ def _fused_decode_prerot_triton(
         val_pi_f.stride(0), val_pi_f.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         qjl_corr, sm_scale,
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
+        kcs[0], kcs[1], kcs[2], kcs[3],
+        vcs[0], vcs[1], vcs[2], vcs[3],
+        vcs[4], vcs[5], vcs[6], vcs[7],
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
@@ -2000,6 +1999,8 @@ def _tq_fused_decode_prerot(
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    key_centroid_scalars: "tuple[float, ...] | None" = None,
+    val_centroid_scalars: "tuple[float, ...] | None" = None,
 ) -> "torch.Tensor | None":
     """Dispatch fused decode with inline prerotation.
 
@@ -2030,6 +2031,8 @@ def _tq_fused_decode_prerot(
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        key_centroid_scalars=key_centroid_scalars,
+        val_centroid_scalars=val_centroid_scalars,
     )
 
 

@@ -361,10 +361,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = True
-    # CUDAGraph requires no .item() calls in the forward path.
-    # The fused decode kernel still uses .item() for centroids and
-    # seq_lens.max() — disable until those are removed.
-    use_cudagraph: bool = False
+    # CUDAGraph-safe: centroid scalars are cached as Python floats at
+    # init (no .item()), BLOCK_N is fixed at 64 (no seq_lens.max()),
+    # and the per-request fallback loop (prefill) is never captured.
+    use_cudagraph: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16, torch.bfloat16,
     ]
@@ -508,6 +508,13 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._key_sigma = quantizers["key_sigma"]
         self._val_sigma = quantizers["val_sigma"]
 
+        # Cache centroid scalars as plain Python floats so kernel launchers
+        # never call .item() (which forces GPU→CPU sync and breaks CUDAGraph).
+        kc = self._key_centroids.float()
+        vc = self._val_centroids.float()
+        self._key_centroid_scalars = tuple(float(kc[i]) for i in range(len(kc)))
+        self._val_centroid_scalars = tuple(float(vc[i]) for i in range(len(vc)))
+
     # ── forward ──────────────────────────────────────────────────────
 
     def forward(
@@ -616,6 +623,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             rotation=self._rotation,
             key_sigma=self._key_sigma,
             val_sigma=self._val_sigma,
+            key_centroid_scalars=self._key_centroid_scalars,
+            val_centroid_scalars=self._val_centroid_scalars,
         )
         if out is None:
             return None
