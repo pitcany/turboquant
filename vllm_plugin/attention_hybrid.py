@@ -117,8 +117,8 @@ class HybridTQAttentionImpl(AttentionImpl):
         self.num_kv_heads = num_kv_heads or num_heads
         self.kv_cache_dtype = kv_cache_dtype
 
-        self.layer_idx = HybridTQAttentionImpl._layer_counter
-        HybridTQAttentionImpl._layer_counter += 1
+        # Deterministic seed per layer (resolved lazily).
+        self.layer_idx: int | None = None
 
         cfg = TurboQuantConfig(
             num_heads=num_heads,
@@ -138,13 +138,33 @@ class HybridTQAttentionImpl(AttentionImpl):
         self._val_q: TurboQuantMSE | None = None
         self._init_device: torch.device | None = None
 
-    def _ensure_quantizers(self, device: torch.device) -> None:
+    def _resolve_layer_idx(self, layer: Any) -> int:
+        if self.layer_idx is not None:
+            return self.layer_idx
+
+        layer_name = getattr(layer, "layer_name", None)
+        if isinstance(layer_name, str):
+            for part in layer_name.split("."):
+                try:
+                    self.layer_idx = int(part)
+                    break
+                except ValueError:
+                    continue
+
+        if self.layer_idx is None:
+            self.layer_idx = HybridTQAttentionImpl._layer_counter
+            HybridTQAttentionImpl._layer_counter += 1
+
+        return self.layer_idx
+
+    def _ensure_quantizers(self, device: torch.device, layer: Any) -> None:
         if self._key_q is not None and self._init_device == device:
             return
+        layer_idx = self._resolve_layer_idx(layer)
         quantizers = initialize_quantizers(
             self.head_size,
             self._b_total,
-            self.layer_idx,
+            layer_idx,
             device,
             rotation=self._rotation,
         )
@@ -181,7 +201,7 @@ class HybridTQAttentionImpl(AttentionImpl):
                     dtype=query.dtype, device=device)
             return output
 
-        self._ensure_quantizers(device)
+        self._ensure_quantizers(device, layer)
 
         N = attn_metadata.num_actual_tokens
         num_reqs = attn_metadata.seq_lens.shape[0]

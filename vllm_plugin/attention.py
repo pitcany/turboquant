@@ -37,9 +37,40 @@ from vllm_plugin.vllm_compat import (
     MultipleOf,
 )
 
+try:
+    from vllm.model_executor.models.utils import extract_layer_index as _extract_layer_index
+except ModuleNotFoundError:
+    _extract_layer_index = None
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import AttentionSpec
+
+try:
+    from vllm.model_executor.models.utils import extract_layer_index as _extract_layer_index
+except ModuleNotFoundError:
+
+    def _extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+        subnames = layer_name.split(".")
+        int_vals: list[int] = []
+        for subname in subnames:
+            try:
+                int_vals.append(int(subname))
+            except ValueError:
+                continue
+        if num_attn_module == 1 or "attn" not in layer_name:
+            if len(int_vals) != 1:
+                raise ValueError(
+                    f"layer name {layer_name} should only contain one integer"
+                )
+            return int_vals[0]
+        if len(int_vals) > 2:
+            raise ValueError(
+                f"layer name {layer_name} should contain most two integers"
+            )
+        if len(int_vals) == 2:
+            return int_vals[0] * num_attn_module + int_vals[1]
+        return int_vals[0]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Bit-packing utilities
@@ -392,9 +423,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.logits_soft_cap = logits_soft_cap
 
-        # Deterministic seed per layer
-        self.layer_idx = TurboQuantAttentionImpl._layer_counter
-        TurboQuantAttentionImpl._layer_counter += 1
+        # Deterministic seed per layer (resolved lazily).
+        self.layer_idx: int | None = None
 
         # TQ params
         cfg = TurboQuantConfig(
@@ -422,13 +452,33 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
     # ── lazy quantizer creation ──────────────────────────────────────
 
-    def _ensure_quantizers(self, device: torch.device) -> None:
+    def _resolve_layer_idx(self, layer: Any) -> int:
+        if self.layer_idx is not None:
+            return self.layer_idx
+
+        layer_name = getattr(layer, "layer_name", None)
+        if isinstance(layer_name, str):
+            for part in layer_name.split("."):
+                try:
+                    self.layer_idx = int(part)
+                    break
+                except ValueError:
+                    continue
+
+        if self.layer_idx is None:
+            self.layer_idx = TurboQuantAttentionImpl._layer_counter
+            TurboQuantAttentionImpl._layer_counter += 1
+
+        return self.layer_idx
+
+    def _ensure_quantizers(self, device: torch.device, layer: Any) -> None:
         if self._key_q is not None and self._init_device == device:
             return
+        layer_idx = self._resolve_layer_idx(layer)
         quantizers = initialize_quantizers(
             self.head_size,
             self._b_total,
-            self.layer_idx,
+            layer_idx,
             device,
             rotation=self._rotation,
         )
@@ -468,7 +518,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
                     dtype=query.dtype, device=device)
             return output
 
-        self._ensure_quantizers(device)
+        self._ensure_quantizers(device, layer)
 
         N = attn_metadata.num_actual_tokens
         num_reqs = attn_metadata.seq_lens.shape[0]
