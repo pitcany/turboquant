@@ -968,10 +968,12 @@ def _fused_decode_triton(
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
 
+    q_rot_c = q_rot.contiguous()
+    q_sketch_c = q_sketch.contiguous()
     grid = (num_reqs, num_kv_heads, heads_per_kv)
     _tq_fused_decode_kernel[grid](
-        q_rot.contiguous(),
-        q_sketch.contiguous(),
+        q_rot_c,
+        q_sketch_c,
         kv_u8,
         kv_fp16,
         block_table_i,
@@ -980,9 +982,9 @@ def _fused_decode_triton(
         val_pi_f,
         out,
         # Q_ROT strides
-        q_rot.stride(0), q_rot.stride(1), q_rot.stride(2),
+        q_rot_c.stride(0), q_rot_c.stride(1), q_rot_c.stride(2),
         # Q_SKETCH strides
-        q_sketch.stride(0), q_sketch.stride(1), q_sketch.stride(2),
+        q_sketch_c.stride(0), q_sketch_c.stride(1), q_sketch_c.stride(2),
         # KV_U8 strides (bytes)
         kv_u8.stride(0), kv_u8.stride(1), kv_u8.stride(2),
         # KV_FP16 strides (fp16 elements)
