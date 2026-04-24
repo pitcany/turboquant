@@ -46,40 +46,40 @@ def generate_sign_vector(d: int, seed: Optional[int] = None, device: str = "cpu"
     return (2 * torch.randint(0, 2, (d,), generator=gen) - 1).float().to(device)
 
 
-def fwht_inplace(x: torch.Tensor) -> torch.Tensor:
-    """In-place Fast Walsh-Hadamard Transform along the last dimension.
+def fwht(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard Transform along the last dimension.
 
+    Returns a new tensor (not in-place).
     Operates on the unnormalized transform (multiply by 1/sqrt(d) after).
     Requires the last dimension to be a power of 2.
+
+    Uses vectorized reshape+stack butterfly steps — each step is one
+    batched tensor operation instead of a Python loop over index pairs.
     """
     d = x.shape[-1]
+    batch_shape = x.shape[:-1]
     h = 1
     while h < d:
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, d)
-        n = x_flat.shape[0]
-        for i in range(0, d, 2 * h):
-            a = x_flat[:, i:i + h].clone()
-            b = x_flat[:, i + h:i + 2 * h].clone()
-            x_flat[:, i:i + h] = a + b
-            x_flat[:, i + h:i + 2 * h] = a - b
-        x = x_flat.reshape(orig_shape)
+        x = x.view(*batch_shape, d // (2 * h), 2, h)
+        a = x[..., 0, :]
+        b = x[..., 1, :]
+        x = torch.stack([a + b, a - b], dim=-2)
         h <<= 1
-    return x
+    return x.view(*batch_shape, d)
 
 
 def wht_rotate(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Apply randomized Hadamard rotation: y = (1/sqrt(d)) * WHT(sigma * x)."""
     d = x.shape[-1]
     y = x * sigma
-    y = fwht_inplace(y)
+    y = fwht(y)
     return y * (1.0 / math.sqrt(d))
 
 
 def wht_unrotate(y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Inverse randomized Hadamard rotation: x = sigma * (1/sqrt(d)) * WHT(y)."""
     d = y.shape[-1]
-    x = fwht_inplace(y.clone())
+    x = fwht(y)
     return sigma * x * (1.0 / math.sqrt(d))
 
 

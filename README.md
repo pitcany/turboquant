@@ -209,15 +209,77 @@ curl -s http://127.0.0.1:11507/api/generate -d '{
 Swap `tqp_d256_b2` for `tqp_d256_b4` to exercise the second `d256` path, or
 use the corresponding `tqp_d128_*` types with a 128-head model.
 
+### vLLM Plugin (`vllm_plugin/`)
+
+TurboQuant also ships as a native vLLM attention backend, enabling KV cache compression for any model served by vLLM — including tensor-parallel multi-GPU setups with AWQ/GPTQ weight quantization.
+
+#### How it works
+
+The plugin registers a custom attention backend (`TurboQuantAttentionImpl`) that intercepts vLLM's KV cache path:
+
+1. **Compress on write**: Each new KV token is compressed in a fused Triton kernel (`_tq_fused_compress_kernel`) that performs WHT rotation, MSE quantization, QJL sign projection, and byte packing in a single GPU launch. The packed bytes (~3 bits/element) are stored directly in vLLM's paged KV cache.
+
+2. **Decode attention**: A two-stage Triton kernel replaces standard attention:
+   - **Prerotation** (`_tq_prerotate_kernel`): fuses WHT rotation + QJL sketch of the query vector into one launch
+   - **Stage 1** (`_tq_decode_stage1_kernel`): vectorized byte-to-dimension unpacking of compressed keys/values, computing attention scores and weighted value accumulation directly from packed bytes — no intermediate decompression buffer
+   - **Stage 2** (`_tq_decode_stage2_kernel`): merges partial results across KV splits and applies inverse rotation
+
+3. **Transparent fallback**: all Triton kernels have matching PyTorch reference paths. Non-CUDA devices, unsupported bit-widths, or head dimensions > 256 automatically fall back to the torch path.
+
+#### Quick start
+
+```bash
+# Install as editable package
+pip install -e /path/to/turboquant
+
+# Start vLLM with TurboQuant attention
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-72B-Instruct-AWQ \
+    --quantization awq_marlin \
+    --tensor-parallel-size 2 \
+    --attention-backend CUSTOM \
+    --trust-remote-code \
+    --enforce-eager
+```
+
+#### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `TQ_USE_TRITON` | `0` | Set `1` to enable Triton decode kernels |
+| `TQ_NUM_KV_SPLITS` | `8` | Number of KV splits for the stage1 kernel |
+| `TQ_B_MSE` | `2` | PolarQuant bits (2, 3, or 4) |
+| `TQ_B_QJL` | `1` | QJL bits per coordinate |
+| `TQ_PATCH_KV` | `0` | Set `1` to enable KV cache compression |
+| `TQ_ROTATION` | `wht` | Rotation type: `wht` or `haar` |
+
+#### Performance
+
+Measured on 2x A100-80GB, Qwen2.5-72B-Instruct-AWQ, TP=2:
+
+| Configuration | Decode tok/s | TTFT |
+|---|---:|---:|
+| Before optimization | 3.1 | 600 ms |
+| After optimization | 13.7 | 121 ms |
+
 ## Project Structure
 
 ```
 turboquant/
-├── turboquant.py              # Core: TurboQuantMSE, TurboQuantProd, TurboQuantKVCache
+├── turboquant.py              # Core: TurboQuantMSE, TurboQuantProd, fwht
 ├── lloyd_max.py               # Lloyd-Max optimal scalar quantizer
 ├── compressors.py             # Production compressors for real model tensors
 ├── ollama_resolver.py         # Ollama GGUF resolver + TQ metadata export
 ├── validate.py                # C-library attention fidelity validation
+├── vllm_plugin/               # vLLM attention backend (pip install -e)
+│   ├── __init__.py            # Package entry point, TurboQuantConfig export
+│   ├── attention.py           # TurboQuantAttentionImpl, _CompressedLayout, packing
+│   ├── triton_kernels.py      # Triton kernels: stage1, stage2, compress, prerotate, pack
+│   ├── triton_wrapper.py      # Python wrappers: prerotate_queries, decode_attention
+│   ├── compress_utils.py      # store_compressed_kv, quantizer init
+│   ├── config.py              # TurboQuantConfig dataclass + env-var overrides
+│   ├── kv_spec.py             # TurboQuantSpec for vLLM block allocator
+│   └── platform.py            # vLLM platform registration
 ├── patches/stage2-qjl/
 │   ├── c/                     # TQ4P C implementation (ggml integration)
 │   ├── cuda/                  # CUDA kernel implementation (in progress)
@@ -227,12 +289,15 @@ turboquant/
 │   └── apply_hooks.sh         # Idempotent ggml patching
 ├── scripts/
 │   ├── build_ollama_tq.sh     # One-step ollama build with TQ4P
+│   ├── bench_fused_decode.py  # vLLM decode throughput benchmark
 │   ├── patch_ollama_kv_types.sh  # Go KV-type allowlist patch
 │   └── smoke_test_tq4p.sh     # End-to-end smoke test
 ├── docs/
 │   └── OLLAMA_NATIVE.md       # Full workflow, rollback, troubleshooting
 ├── tests/
 │   ├── test_core.py           # Core algorithm unit tests
+│   ├── test_fast_decode.py    # Triton decode kernel correctness + timing
+│   ├── test_fused_compress.py # Fused compress kernel correctness
 │   ├── test_ollama_resolver.py # Ollama resolver tests
 │   └── test_stability.py     # Numerical stability tests
 ├── autoresearch/              # Automated research experiment scripts
