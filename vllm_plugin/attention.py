@@ -460,6 +460,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._key_q: TurboQuantProd | None = None
         self._val_q: TurboQuantMSE | None = None
         self._init_device: torch.device | None = None
+        self._key_centroids_host: tuple[float, ...] | None = None
+        self._val_centroids_host: tuple[float, ...] | None = None
 
     # ── lazy quantizer creation ──────────────────────────────────────
 
@@ -504,6 +506,12 @@ class TurboQuantAttentionImpl(AttentionImpl):
         self._S_T = quantizers["s_t"]
         self._key_sigma = quantizers["key_sigma"]
         self._val_sigma = quantizers["val_sigma"]
+        self._key_centroids_host = tuple(
+            float(x) for x in self._key_q.mse.codebook.centroids.cpu().tolist()
+        )
+        self._val_centroids_host = tuple(
+            float(x) for x in self._val_q.codebook.centroids.cpu().tolist()
+        )
 
     # ── forward ──────────────────────────────────────────────────────
 
@@ -602,8 +610,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             attn_metadata.block_table,
             attn_metadata.seq_lens,
             self._layout,
-            key_centroids=self._key_centroids.float(),
-            val_centroids=self._val_centroids.float(),
+            key_centroids=self._key_centroids_host,
+            val_centroids=self._val_centroids_host,
             key_pi_t=self._key_q.mse.Pi.T,
             val_pi=self._val_q.Pi,
             s_t=self._key_q.S.T,

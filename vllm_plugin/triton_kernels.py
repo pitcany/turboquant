@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -1413,7 +1413,7 @@ def _fused_compress_triton(
     }
 
 
-def _fused_compress_pack_triton(
+def _fused_compress_pack_triton_two_step(
     key_flat: torch.Tensor,
     val_flat: torch.Tensor,
     key_sigma: torch.Tensor,
@@ -1424,7 +1424,7 @@ def _fused_compress_pack_triton(
     s_matrix: torch.Tensor,
     layout: "_CompressedLayout",
 ) -> torch.Tensor:
-    """Launch fused compress and pack the result into bytes."""
+    """Deprecated: use _fused_compress_pack_triton for the single-kernel path."""
     raw = _fused_compress_triton(
         key_flat,
         val_flat,
@@ -1765,13 +1765,14 @@ def _fused_decode_triton(
     seq_lens: torch.Tensor,
     layout: "_CompressedLayout",
     *,
-    key_centroids: torch.Tensor,
-    val_centroids: torch.Tensor,
+    key_centroids: torch.Tensor | Sequence[float],
+    val_centroids: torch.Tensor | Sequence[float],
     val_pi: torch.Tensor,
     val_sigma: "torch.Tensor | None",
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    block_n: int = 64,
 ) -> torch.Tensor:
     """Launch the fused decode kernel for all requests in one shot."""
 
@@ -1782,7 +1783,7 @@ def _fused_decode_triton(
             dtype=torch.float32, device=kv_cache.device)
     block_d = triton.next_power_of_2(head_dim)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    block_n = 64 if block_n >= 64 else 32
 
     # Two typed views of the same contiguous memory
     kv_fp16 = kv_cache.contiguous()
@@ -1802,8 +1803,14 @@ def _fused_decode_triton(
             head_dim, dtype=torch.float32, device=kv_cache.device)
     val_pi_f = val_pi.float().contiguous().to(kv_cache.device)
 
-    kc = key_centroids.float().contiguous()
-    vc = val_centroids.float().contiguous()
+    if isinstance(key_centroids, torch.Tensor):
+        kc = key_centroids.float().tolist()
+    else:
+        kc = list(float(x) for x in key_centroids)
+    if isinstance(val_centroids, torch.Tensor):
+        vc = val_centroids.float().tolist()
+    else:
+        vc = list(float(x) for x in val_centroids)
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1839,13 +1846,10 @@ def _fused_decode_triton(
         qjl_corr,
         sm_scale,
         # Key centroids
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
+        kc[0], kc[1], kc[2], kc[3],
         # Val centroids
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
+        vc[0], vc[1], vc[2], vc[3],
+        vc[4], vc[5], vc[6], vc[7],
         # Constexprs
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
@@ -1875,13 +1879,14 @@ def _tq_fused_decode(
     seq_lens: torch.Tensor,
     layout: "_CompressedLayout",
     *,
-    key_centroids: torch.Tensor,
-    val_centroids: torch.Tensor,
+    key_centroids: torch.Tensor | Sequence[float],
+    val_centroids: torch.Tensor | Sequence[float],
     val_pi: torch.Tensor,
     val_sigma: "torch.Tensor | None",
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    block_n: int = 64,
 ) -> "torch.Tensor | None":
     """Dispatch fused decode.  Returns None when Triton is unavailable."""
 
@@ -1907,6 +1912,7 @@ def _tq_fused_decode(
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        block_n=block_n,
     )
 
 
@@ -1924,13 +1930,14 @@ def _fused_decode_prerot_triton(
     seq_lens: torch.Tensor,
     layout: "_CompressedLayout",
     *,
-    key_centroids: torch.Tensor,
-    val_centroids: torch.Tensor,
+    key_centroids: torch.Tensor | Sequence[float],
+    val_centroids: torch.Tensor | Sequence[float],
     val_pi: torch.Tensor,
     val_sigma: "torch.Tensor | None",
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    block_n: int = 64,
 ) -> torch.Tensor:
     """Launch fused decode with inline prerotation — zero intermediate tensors."""
     num_reqs, num_kv_heads, heads_per_kv, head_dim = q_raw.shape
@@ -1942,7 +1949,7 @@ def _fused_decode_prerot_triton(
     block_d = triton.next_power_of_2(head_dim)
     tile_k = min(32, block_d)
     block_size = kv_cache.shape[1]
-    block_n = 64 if int(seq_lens.max().item()) >= 64 else 32
+    block_n = 64 if block_n >= 64 else 32
 
     kv_fp16 = kv_cache.contiguous()
     kv_u8 = kv_fp16.view(torch.uint8)
@@ -1962,8 +1969,14 @@ def _fused_decode_prerot_triton(
     sigma_f = sigma.float().contiguous().to(kv_cache.device)
     s_t_f = s_t.float().contiguous().to(kv_cache.device)
 
-    kc = key_centroids.float().contiguous()
-    vc = val_centroids.float().contiguous()
+    if isinstance(key_centroids, torch.Tensor):
+        kc = key_centroids.float().tolist()
+    else:
+        kc = list(float(x) for x in key_centroids)
+    if isinstance(val_centroids, torch.Tensor):
+        vc = val_centroids.float().tolist()
+    else:
+        vc = list(float(x) for x in val_centroids)
 
     block_table_i = block_table.int().contiguous()
     seq_lens_i = seq_lens.int().contiguous()
@@ -1984,12 +1997,9 @@ def _fused_decode_prerot_triton(
         val_pi_f.stride(0), val_pi_f.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         qjl_corr, sm_scale,
-        float(kc[0].item()), float(kc[1].item()),
-        float(kc[2].item()), float(kc[3].item()),
-        float(vc[0].item()), float(vc[1].item()),
-        float(vc[2].item()), float(vc[3].item()),
-        float(vc[4].item()), float(vc[5].item()),
-        float(vc[6].item()), float(vc[7].item()),
+        kc[0], kc[1], kc[2], kc[3],
+        vc[0], vc[1], vc[2], vc[3],
+        vc[4], vc[5], vc[6], vc[7],
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
@@ -2017,13 +2027,14 @@ def _tq_fused_decode_prerot(
     seq_lens: torch.Tensor,
     layout: "_CompressedLayout",
     *,
-    key_centroids: torch.Tensor,
-    val_centroids: torch.Tensor,
+    key_centroids: torch.Tensor | Sequence[float],
+    val_centroids: torch.Tensor | Sequence[float],
     val_pi: torch.Tensor,
     val_sigma: "torch.Tensor | None",
     qjl_corr: float,
     sm_scale: float,
     rotation: str = "wht",
+    block_n: int = 64,
 ) -> "torch.Tensor | None":
     """Dispatch fused decode with inline prerotation.
 
@@ -2053,6 +2064,7 @@ def _tq_fused_decode_prerot(
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        block_n=block_n,
     )
 
 

@@ -9,7 +9,8 @@ PyTorch path.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -209,8 +210,8 @@ def fused_decode_attention(
     seq_lens: torch.Tensor,
     layout: "_CompressedLayout",
     *,
-    key_centroids: torch.Tensor,
-    val_centroids: torch.Tensor,
+    key_centroids: torch.Tensor | Sequence[float],
+    val_centroids: torch.Tensor | Sequence[float],
     key_pi_t: torch.Tensor,
     val_pi: torch.Tensor,
     s_t: torch.Tensor,
@@ -220,6 +221,7 @@ def fused_decode_attention(
     rotation: str = "wht",
     key_sigma: Optional[torch.Tensor] = None,
     val_sigma: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
 ) -> "torch.Tensor | None":
     """Fused decode: pre-rotate queries + score/accumulate/unrotate in one launch.
 
@@ -232,6 +234,16 @@ def fused_decode_attention(
     num_kv_heads = kv_cache.shape[2]
     head_dim = layout.head_dim
     qjl_corr = math.sqrt(math.pi / 2.0) / qjl_dim
+    if max_seq_len is None:
+        max_seq_len = int(os.environ.get("TQ_MAX_SEQ_LEN", "4096"))
+    if isinstance(key_centroids, torch.Tensor):
+        key_centroids_values = key_centroids.float().tolist()
+    else:
+        key_centroids_values = list(float(x) for x in key_centroids)
+    if isinstance(val_centroids, torch.Tensor):
+        val_centroids_values = val_centroids.float().tolist()
+    else:
+        val_centroids_values = list(float(x) for x in val_centroids)
 
     q_view = queries.reshape(num_reqs, num_kv_heads, heads_per_kv, head_dim)
 
@@ -239,13 +251,14 @@ def fused_decode_attention(
     out = _tq_fused_decode_prerot(
         q_view, key_sigma, s_t,
         kv_cache, block_table, seq_lens, layout,
-        key_centroids=key_centroids.float(),
-        val_centroids=val_centroids.float(),
+        key_centroids=key_centroids_values,
+        val_centroids=val_centroids_values,
         val_pi=val_pi,
         val_sigma=val_sigma,
         qjl_corr=qjl_corr,
         sm_scale=sm_scale,
         rotation=rotation,
+        block_n=64 if max_seq_len >= 64 else 32,
     )
 
     # Fallback: separate prerotation + fused decode
@@ -254,13 +267,14 @@ def fused_decode_attention(
             q_view, key_pi_t, s_t, rotation=rotation, key_sigma=key_sigma)
         out = _tq_fused_decode(
             q_rot, q_sketch, kv_cache, block_table, seq_lens, layout,
-            key_centroids=key_centroids.float(),
-            val_centroids=val_centroids.float(),
+            key_centroids=key_centroids_values,
+            val_centroids=val_centroids_values,
             val_pi=val_pi,
             val_sigma=val_sigma,
             qjl_corr=qjl_corr,
             sm_scale=sm_scale,
             rotation=rotation,
+            block_n=64 if max_seq_len >= 64 else 32,
         )
 
     if out is None:
