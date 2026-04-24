@@ -714,7 +714,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         # Logit soft capping (Gemma-style)
         if self.logits_soft_cap is not None:
-            scores = scores.float().tanh() * self.logits_soft_cap
+            scores = (scores.float() / self.logits_soft_cap).tanh() * self.logits_soft_cap
 
         # Causal mask
         if causal and Q > 1:

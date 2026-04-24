@@ -113,8 +113,11 @@ class TurboQuantConfig:
             raise ValueError(
                 f"b_mse ({self.b_mse}) must be 2, 3, or 4"
             )
-        if self.b_qjl < 1:
-            raise ValueError(f"b_qjl ({self.b_qjl}) must be >= 1")
+        if self.b_qjl != 1:
+            raise ValueError(
+                f"b_qjl ({self.b_qjl}) must be 1 "
+                "(pack/unpack only supports 1-bit QJL signs)"
+            )
         if self.head_dim not in (64, 128, 256):
             raise ValueError(
                 f"head_dim ({self.head_dim}) must be 64, 128, or 256"
