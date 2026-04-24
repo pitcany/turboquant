@@ -372,10 +372,30 @@ if _HAS_TRITON:
 
 
     @triton.jit
+    def _tq_fwht_step(x, h: tl.constexpr, BLOCK_D: tl.constexpr):
+        """One butterfly step of the Fast Walsh-Hadamard Transform."""
+        offs = tl.arange(0, BLOCK_D)
+        # For each index, determine if it's in the "even" half of its group
+        # Group = offs // h, is_even = (group & 1) == 0
+        is_even = ((offs // h) & 1) == 0
+        # Partner: flip the h-bit (even→+h, odd→-h)
+        partner_offs = tl.where(is_even, offs + h, offs - h)
+        # Gather partner values using the standard Triton pattern
+        partner_val = tl.sum(
+            tl.where(
+                tl.arange(0, BLOCK_D)[None, :] == partner_offs[:, None],
+                x[None, :], 0.0,
+            ),
+            axis=1,
+        )
+        return tl.where(is_even, x + partner_val, partner_val - x)
+
+    @triton.jit
     def _tq_decode_stage2_kernel(
         PARTIAL_ACC,
         PARTIAL_LSE,
         VAL_PI,
+        VAL_SIGMA,
         OUT,
         stride_pacc_s,
         stride_pacc_h,
@@ -390,6 +410,7 @@ if _HAS_TRITON:
         HEAD_DIM: tl.constexpr,
         BLOCK_D: tl.constexpr,
         NUM_KV_SPLITS: tl.constexpr,
+        USE_WHT: tl.constexpr,
     ):
         kv_head = tl.program_id(0)
         q_group = tl.program_id(1)
@@ -427,12 +448,39 @@ if _HAS_TRITON:
             e_max = n_e_max
 
         merged_rot = tl.where(mask_d, merged_rot / e_sum, 0.0)
-        val_pi = tl.load(
-            VAL_PI + offs_d[:, None] * stride_val_pi_row + offs_d[None, :] * stride_val_pi_col,
-            mask=mask_d[:, None] & mask_d[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        out = tl.sum(merged_rot[:, None] * val_pi, axis=0)
+
+        if USE_WHT:
+            # Inverse WHT rotation: out = sigma * (1/sqrt(d)) * FWHT(merged_rot)
+            # Unrolled butterfly: up to 8 steps for BLOCK_D <= 256
+            transformed = merged_rot
+            if BLOCK_D >= 2:
+                transformed = _tq_fwht_step(transformed, 1, BLOCK_D)
+            if BLOCK_D >= 4:
+                transformed = _tq_fwht_step(transformed, 2, BLOCK_D)
+            if BLOCK_D >= 8:
+                transformed = _tq_fwht_step(transformed, 4, BLOCK_D)
+            if BLOCK_D >= 16:
+                transformed = _tq_fwht_step(transformed, 8, BLOCK_D)
+            if BLOCK_D >= 32:
+                transformed = _tq_fwht_step(transformed, 16, BLOCK_D)
+            if BLOCK_D >= 64:
+                transformed = _tq_fwht_step(transformed, 32, BLOCK_D)
+            if BLOCK_D >= 128:
+                transformed = _tq_fwht_step(transformed, 64, BLOCK_D)
+            if BLOCK_D >= 256:
+                transformed = _tq_fwht_step(transformed, 128, BLOCK_D)
+            rsqrt_d = 1.0 / tl.sqrt(float(HEAD_DIM))
+            sigma = tl.load(VAL_SIGMA + offs_d, mask=mask_d, other=1.0).to(tl.float32)
+            out = sigma * transformed * rsqrt_d
+        else:
+            # Dense Haar rotation: out = merged_rot @ val_pi
+            val_pi = tl.load(
+                VAL_PI + offs_d[:, None] * stride_val_pi_row + offs_d[None, :] * stride_val_pi_col,
+                mask=mask_d[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            out = tl.sum(merged_rot[:, None] * val_pi, axis=0)
+
         tl.store(
             OUT + kv_head * stride_out_h + q_group * stride_out_g + offs_d,
             out,
@@ -539,6 +587,8 @@ def _stage2_triton(
     partial_acc: torch.Tensor,
     partial_lse: torch.Tensor,
     val_pi: torch.Tensor,
+    rotation: str = "haar",
+    val_sigma: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     num_splits, num_kv_heads, heads_per_kv, head_dim = partial_acc.shape
     block_d = triton.next_power_of_2(head_dim)
@@ -548,12 +598,19 @@ def _stage2_triton(
         device=partial_acc.device,
     )
     val_pi_f = val_pi.float().contiguous()
+    use_wht = rotation == "wht"
+    # For WHT, we need sigma on device; for Haar, pass a dummy pointer
+    if use_wht and val_sigma is not None:
+        val_sigma_f = val_sigma.float().contiguous().to(partial_acc.device)
+    else:
+        val_sigma_f = torch.ones(head_dim, dtype=torch.float32, device=partial_acc.device)
 
     grid = (num_kv_heads, heads_per_kv)
     _tq_decode_stage2_kernel[grid](
         partial_acc.contiguous(),
         partial_lse.contiguous(),
         val_pi_f,
+        val_sigma_f,
         out,
         partial_acc.stride(0),
         partial_acc.stride(1),
@@ -568,6 +625,7 @@ def _stage2_triton(
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
         NUM_KV_SPLITS=num_splits,
+        USE_WHT=use_wht,
         num_warps=4,
         num_stages=2,
     )
@@ -629,10 +687,10 @@ def _tq_decode_stage2(
     rotation: str = "haar",
     val_sigma: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    # The Triton stage2 kernel hardcodes Pi as a dense matrix multiply,
-    # so WHT must use the torch path.
-    if rotation == "haar" and use_triton and TRITON_AVAILABLE and partial_acc.is_cuda:
-        return _stage2_triton(partial_acc, partial_lse, val_pi)
+    if use_triton and TRITON_AVAILABLE and partial_acc.is_cuda:
+        return _stage2_triton(
+            partial_acc, partial_lse, val_pi,
+            rotation=rotation, val_sigma=val_sigma)
     return _stage2_torch(
         partial_acc, partial_lse, val_pi,
         rotation=rotation, val_sigma=val_sigma)
