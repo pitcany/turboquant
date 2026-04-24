@@ -361,7 +361,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = True
-    use_cudagraph: bool = True
+    # CUDAGraph requires no .item() calls in the forward path.
+    # The fused decode kernel still uses .item() for centroids and
+    # seq_lens.max() — disable until those are removed.
+    use_cudagraph: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16, torch.bfloat16,
     ]
