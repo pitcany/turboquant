@@ -159,6 +159,8 @@ class TestFastDecodeStage1:
         )
         lse_diff = (tri_lse - ref_lse).abs().max().item()
         assert lse_diff < 0.05, f"LSE max diff {lse_diff:.4f} (single token)"
+        acc_diff = (tri_acc - ref_acc).abs().max().item()
+        assert acc_diff < 0.02, f"Partial acc max diff {acc_diff:.6f} (single token)"
 
     def test_short_sequence(self) -> None:
         """Edge case: seq_len < BLOCK_N."""
@@ -167,6 +169,8 @@ class TestFastDecodeStage1:
         )
         lse_diff = (tri_lse - ref_lse).abs().max().item()
         assert lse_diff < 0.05
+        acc_diff = (tri_acc - ref_acc).abs().max().item()
+        assert acc_diff < 0.02, f"Partial acc max diff {acc_diff:.6f} (short seq)"
 
 
 class TestFastDecodeEndToEnd:
@@ -284,8 +288,8 @@ class TestFastDecodeBenchmark:
         ms_per_call = (t1 - t0) / n_iter * 1000
         print(f"\n  stage1 @ seq_len={seq_len}: {ms_per_call:.3f} ms/call")
 
-        # Soft target: <1ms for seq_len=2048 (80-layer model needs <1ms/layer)
+        # Hard gate: <3ms; performance goal: <1ms for seq_len=2048
         if seq_len == 2048:
             assert ms_per_call < 3.0, (
-                f"stage1 too slow: {ms_per_call:.2f}ms (target <1ms)"
+                f"stage1 too slow: {ms_per_call:.2f}ms (target <3ms; goal <1ms)"
             )
