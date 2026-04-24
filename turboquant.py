@@ -56,6 +56,8 @@ def fwht(x: torch.Tensor) -> torch.Tensor:
     Uses vectorized reshape+stack butterfly steps — each step is one
     batched tensor operation instead of a Python loop over index pairs.
     """
+    if not x.is_contiguous():
+        x = x.contiguous()
     d = x.shape[-1]
     batch_shape = x.shape[:-1]
     h = 1

@@ -227,6 +227,7 @@ if _HAS_TRITON:
         stride_vidx,
         stride_out,
         HEAD_DIM: tl.constexpr,
+        QJL_DIM: tl.constexpr,
         KM_OFF: tl.constexpr,
         KM_BYTES: tl.constexpr,
         KQ_OFF: tl.constexpr,
@@ -235,6 +236,7 @@ if _HAS_TRITON:
         KN_OFF: tl.constexpr,
         VM_OFF: tl.constexpr,
         VM_BYTES: tl.constexpr,
+        VM_PACK_BITS: tl.constexpr,
         VN_OFF: tl.constexpr,
     ):
         """Pack raw indices/norms into the compressed byte layout.
@@ -259,7 +261,7 @@ if _HAS_TRITON:
         for b in tl.static_range(8):
             d = offs_kq * 8 + b
             sign = tl.load(
-                QJL_SIGNS + pid * stride_qjl + d, mask=d < HEAD_DIM, other=0.0,
+                QJL_SIGNS + pid * stride_qjl + d, mask=d < QJL_DIM, other=0.0,
             )
             packed_qjl |= (sign > 0).to(tl.int32) << b
         tl.store(OUT + pid * stride_out + KQ_OFF + offs_kq, packed_qjl.to(tl.uint8))
@@ -285,7 +287,9 @@ if _HAS_TRITON:
         for s in tl.static_range(2):
             d = offs_vm * 2 + s
             idx = tl.load(V_IDX + pid * stride_vidx + d, mask=d < HEAD_DIM, other=0)
-            packed_vm |= (idx.to(tl.int32) & 0xF) << (s * 4)
+            packed_vm |= (
+                idx.to(tl.int32) & ((1 << VM_PACK_BITS) - 1)
+            ) << (s * VM_PACK_BITS)
         tl.store(OUT + pid * stride_out + VM_OFF + offs_vm, packed_vm.to(tl.uint8))
 
         # ── Value norm (fp16 → 2 bytes) ──
@@ -722,9 +726,10 @@ if _HAS_TRITON:
             offs_n = start_n + tl.arange(0, BLOCK_N)
             mask_n = offs_n < seq_len
 
-            # Block-table indirection
-            blk_indices = (offs_n // CACHE_BLOCK_SIZE).to(tl.int32)
-            tok_offsets = (offs_n % CACHE_BLOCK_SIZE).to(tl.int64)
+        # Block-table indirection
+        blk_indices = (offs_n // CACHE_BLOCK_SIZE).to(tl.int32)
+        blk_indices = tl.where(mask_n, blk_indices, 0)
+        tok_offsets = (offs_n % CACHE_BLOCK_SIZE).to(tl.int64)
             block_ids = tl.load(
                 BLOCK_TABLE + req_id * stride_bt_r + blk_indices,
                 mask=mask_n, other=0,
@@ -965,7 +970,9 @@ if _HAS_TRITON:
             mask_nd = mask_n[:, None] & mask_d[None, :]
 
             # Block-table indirection
-            blk_indices = (offs_n // CACHE_BLOCK_SIZE).to(tl.int32)
+            blk_indices = tl.where(
+                mask_n, (offs_n // CACHE_BLOCK_SIZE).to(tl.int32), 0,
+            )
             tok_offsets = (offs_n % CACHE_BLOCK_SIZE).to(tl.int64)
             block_ids = tl.load(
                 BLOCK_TABLE + req_id * stride_bt_r + blk_indices,
@@ -1213,6 +1220,7 @@ if _HAS_TRITON:
         KN_OFF: tl.constexpr,
         VM_OFF: tl.constexpr,
         VM_BYTES: tl.constexpr,
+        VM_PACK_BITS: tl.constexpr,
         VN_OFF: tl.constexpr,
     ):
         """Fused compress + pack: raw K/V to packed bytes in one kernel.
@@ -1331,7 +1339,7 @@ if _HAS_TRITON:
             k_norm.to(tl.float16),
         )
 
-        # ── Value MSE: 4-bit pack (2 indices → 1 byte) ───────────
+        # ── Value MSE: nibble pack (2 indices → 1 byte) ───────────
         offs_vm = tl.arange(0, VM_BYTES)
         packed_vm = tl.zeros([VM_BYTES], dtype=tl.int32)
         for s in tl.static_range(2):
@@ -1343,7 +1351,9 @@ if _HAS_TRITON:
                 ),
                 axis=1,
             )
-            packed_vm |= (idx_at_d & 0xF) << (s * 4)
+            packed_vm |= (
+                (idx_at_d & ((1 << VM_PACK_BITS) - 1)) << (s * VM_PACK_BITS)
+            )
         tl.store(out_row + VM_OFF + offs_vm, packed_vm.to(tl.uint8))
 
         # ── Value norm (fp16) ─────────────────────────────────────
@@ -1380,12 +1390,12 @@ def _fused_compress_triton(
     val_bounds_f = val_boundaries.float().contiguous()
     s_f = s_matrix.float().contiguous()
 
-    key_mse_out = torch.empty((num_rows, head_dim), dtype=torch.int32, device=device)
-    qjl_signs_out = torch.empty((num_rows, qjl_dim), dtype=torch.float32, device=device)
-    key_rnorm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
-    key_norm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
-    val_mse_out = torch.empty((num_rows, head_dim), dtype=torch.int32, device=device)
-    val_norm_out = torch.empty(num_rows, dtype=torch.float32, device=device)
+    key_mse_out = torch.zeros((num_rows, head_dim), dtype=torch.int32, device=device)
+    qjl_signs_out = torch.zeros((num_rows, qjl_dim), dtype=torch.float32, device=device)
+    key_rnorm_out = torch.zeros(num_rows, dtype=torch.float32, device=device)
+    key_norm_out = torch.zeros(num_rows, dtype=torch.float32, device=device)
+    val_mse_out = torch.zeros((num_rows, head_dim), dtype=torch.int32, device=device)
+    val_norm_out = torch.zeros(num_rows, dtype=torch.float32, device=device)
 
     grid = (num_rows,)
     _tq_fused_compress_kernel[grid](
@@ -1677,6 +1687,7 @@ def _pack_triton(
         v_mse_c.stride(0),
         out.stride(0),
         HEAD_DIM=layout.head_dim,
+        QJL_DIM=qjl_c.shape[1],
         KM_OFF=layout.km_off,
         KM_BYTES=layout.km_len,
         KQ_OFF=layout.kq_off,
@@ -1685,6 +1696,7 @@ def _pack_triton(
         KN_OFF=layout.kn_off,
         VM_OFF=layout.vm_off,
         VM_BYTES=layout.vm_len,
+        VM_PACK_BITS=layout._val_pack_bits,
         VN_OFF=layout.vn_off,
         num_warps=1,
         num_stages=1,
@@ -2124,6 +2136,7 @@ def _fused_compress_pack_triton(
         KN_OFF=layout.kn_off,
         VM_OFF=layout.vm_off,
         VM_BYTES=layout.vm_len,
+        VM_PACK_BITS=layout._val_pack_bits,
         VN_OFF=layout.vn_off,
         num_warps=4,
         num_stages=1,
