@@ -47,10 +47,10 @@ def register_turboquant() -> None:
         # TQ_USE_TRITON or TQ_HYBRID are set.
         patch_kv = os.environ.get("TQ_PATCH_KV", "")
         if patch_kv == "":
-            # Auto-detect: patch if TQ features are enabled
-            patch_kv = "1" if (
-                os.environ.get("TQ_USE_TRITON", "0") == "1" or use_hybrid
-            ) else "0"
+            # Always patch when the CUSTOM backend is registered — the
+            # backend uses compressed KV dimensions regardless of whether
+            # the Triton or torch path is active.
+            patch_kv = "1"
         if patch_kv == "1":
             _patch_kv_cache_spec()
         else:

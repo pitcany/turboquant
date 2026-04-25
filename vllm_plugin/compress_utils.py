@@ -103,13 +103,16 @@ def store_compressed_kv(
     else:
         packed = _compress_torch(k_flat, v_flat, layout, key_q, val_q)
 
-    packed_fp16 = packed.view(kv_cache.dtype).reshape(
+    # The packed layout is always fp16-aligned (total_bytes is even,
+    # fp16_elems = total_bytes // 2).  Always view as fp16 regardless
+    # of the kv_cache tensor's dtype to avoid misalignment.
+    packed_fp16 = packed.view(torch.float16).reshape(
         num_tokens,
         num_kv_heads,
         layout.fp16_elems,
     )
 
-    kv_cache[block_indices, block_offsets] = packed_fp16
+    kv_cache[block_indices, block_offsets] = packed_fp16.to(kv_cache.dtype)
 
 
 def _compress_torch(

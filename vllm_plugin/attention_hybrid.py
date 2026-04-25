@@ -116,6 +116,7 @@ class HybridTQAttentionImpl(AttentionImpl):
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.logits_soft_cap = logits_soft_cap
 
         # Deterministic seed per layer (resolved lazily).
         self.layer_idx: int | None = None
@@ -328,9 +329,19 @@ class HybridTQAttentionImpl(AttentionImpl):
         k = k_deq.half().permute(1, 0, 2).unsqueeze(0)     # (1, nh, s_len, hd)
         v = v_deq.half().permute(1, 0, 2).unsqueeze(0)     # (1, nh, s_len, hd)
 
-        # For decode (q_len=1), causal masking is not needed (single query attends to all)
-        # For prefill (q_len>1), we need a causal mask offset by pos_offset
-        if causal and q_len > 1 and pos_offset == 0 and q_len == seq_len:
+        # When logits_soft_cap is set, SDPA can't apply it (the cap goes
+        # between score computation and softmax), so fall back to manual attention.
+        if self.logits_soft_cap is not None:
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            cap = self.logits_soft_cap
+            scores = (scores / cap).tanh() * cap
+            if causal and q_len > 1:
+                qpos = torch.arange(q_len, device=queries.device) + pos_offset
+                kpos = torch.arange(seq_len, device=queries.device)
+                cmask = kpos[None, :] > qpos[:, None]
+                scores.masked_fill_(cmask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            out = torch.matmul(F.softmax(scores, dim=-1), v)
+        elif causal and q_len > 1 and pos_offset == 0 and q_len == seq_len:
             # Full prefill — use is_causal=True (efficient fused path)
             out = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True, scale=self.scale)
