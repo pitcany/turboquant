@@ -120,9 +120,10 @@ class TurboQuantMSE(nn.Module):
             self.register_buffer("Pi", generate_rotation_matrix(d, seed=seed, device=device))
         elif rotation == "wht":
             self.register_buffer("sigma", generate_sign_vector(d, seed=seed, device=device))
-            # Store a dummy Pi for code that reads Pi.shape (e.g. vLLM plugin).
-            # This is never used for actual rotation when rotation=="wht".
-            self.register_buffer("Pi", torch.eye(d, device=device))
+            # Materialize the WHT rotation matrix so downstream consumers
+            # (e.g. vLLM plugin) can use Pi / Pi.T for rotation/unrotation.
+            wht_pi_t = wht_rotate(torch.eye(d, device=device), self.sigma)
+            self.register_buffer("Pi", wht_pi_t.T.contiguous())
         else:
             raise ValueError(f"rotation must be 'haar' or 'wht', got {rotation!r}")
 

@@ -148,14 +148,24 @@ class TurboQuantConfig:
 
     @property
     def compression_ratio(self) -> float:
-        """Approximate compression ratio vs FP16 (K+V combined)."""
+        """Approximate compression ratio vs FP16 (K+V combined).
+
+        Accounts for both key and value storage including norms,
+        matching the actual byte layout in ``_CompressedLayout``.
+        """
         fp16_bits = self.head_dim * 16 * 2  # K + V in FP16
-        # Keys: b_mse bits/coord + 1 bit/coord QJL signs + 2×fp16 norms
-        key_bits = self.head_dim * self.b_mse + self.head_dim * self.b_qjl + 16 + 16
+        # Keys: b_mse bits/coord + b_qjl bits/coord QJL signs + 2×fp16 norms
+        key_bits = (self.head_dim * self.b_mse
+                    + self.head_dim * self.b_qjl
+                    + 16 + 16)  # residual norm + original norm
         # Values: 4-bit packing if val_bits <= 4, else exact + fp16 norm
         val_pack_bits = 4 if self.b_total <= 4 else self.b_total
-        val_bits = self.head_dim * val_pack_bits + 16
-        return fp16_bits / (key_bits + val_bits)
+        val_bits = self.head_dim * val_pack_bits + 16  # indices + norm
+        # Padding to even byte count (matches _CompressedLayout)
+        total_bits = key_bits + val_bits
+        total_bytes = (total_bits + 7) // 8
+        total_bytes += total_bytes % 2  # pad to even
+        return (fp16_bits / 8) / total_bytes
 
     def summary(self) -> str:
         """Human-readable one-line summary."""

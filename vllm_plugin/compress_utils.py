@@ -115,8 +115,13 @@ def store_compressed_kv(
     if kv_cache.dtype == torch.bfloat16:
         # Preserve raw packed bytes when kv_cache uses bf16 storage.
         packed_view = packed_fp16.view(torch.bfloat16)
+    elif kv_cache.dtype == torch.float16:
+        packed_view = packed_fp16
     else:
-        packed_view = packed_fp16.view(kv_cache.dtype)
+        raise ValueError(
+            f"TurboQuant KV cache requires fp16 or bf16 storage, "
+            f"got {kv_cache.dtype}. Set kv_cache_dtype='auto' or 'fp16'."
+        )
 
     kv_cache[block_indices, block_offsets] = packed_view
 
