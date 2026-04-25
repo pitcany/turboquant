@@ -1764,6 +1764,8 @@ def _fused_decode_triton(
 
     # Two typed views of the same contiguous memory
     kv_fp16 = kv_cache.contiguous()
+    if kv_fp16.dtype == torch.bfloat16:
+        kv_fp16 = kv_fp16.view(torch.float16)
     kv_u8 = kv_fp16.view(torch.uint8)
 
     out = torch.empty(
@@ -1921,6 +1923,8 @@ def _fused_decode_prerot_triton(
     block_n = 64
 
     kv_fp16 = kv_cache.contiguous()
+    if kv_fp16.dtype == torch.bfloat16:
+        kv_fp16 = kv_fp16.view(torch.float16)
     kv_u8 = kv_fp16.view(torch.uint8)
 
     out = torch.empty(
