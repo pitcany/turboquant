@@ -116,7 +116,7 @@ def store_compressed_kv(
         # Preserve raw packed bytes when kv_cache uses bf16 storage.
         packed_view = packed_fp16.view(torch.bfloat16)
     else:
-        packed_view = packed_fp16.to(kv_cache.dtype)
+        packed_view = packed_fp16.view(kv_cache.dtype)
 
     kv_cache[block_indices, block_offsets] = packed_view
 
