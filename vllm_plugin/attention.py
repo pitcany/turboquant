@@ -674,9 +674,11 @@ class TurboQuantAttentionImpl(AttentionImpl):
         contexts where the manual path would materialise a huge score
         tensor.
 
-        When Q < S (prefix-cache hit / chunked prefill), SDPA's
-        ``is_causal=True`` produces a bottom-right aligned causal mask,
-        which is exactly correct.
+        When Q < S (prefix-cache hit / chunked prefill), PyTorch SDPA's
+        ``is_causal=True`` applies a **top-left** aligned causal mask,
+        which is wrong — the queries correspond to the *last* Q
+        positions.  In that case we construct an explicit bottom-right
+        aligned boolean mask instead.
 
         Args:
             q: (Q, num_heads, head_dim)
@@ -688,6 +690,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             (Q, num_heads, head_dim)
         """
         Q_len = q.shape[0]
+        S_len = k.shape[0]
 
         # SDPA expects (batch, heads, seq, dim)
         q_sdpa = q.permute(1, 0, 2).unsqueeze(0)   # (1, NH, Q, HD)
@@ -699,11 +702,28 @@ class TurboQuantAttentionImpl(AttentionImpl):
             k_sdpa = k_sdpa.repeat_interleave(self._heads_per_kv, dim=1)
             v_sdpa = v_sdpa.repeat_interleave(self._heads_per_kv, dim=1)
 
-        out = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa,
-            is_causal=causal and Q_len > 1,
-            scale=self.scale,
-        )
+        use_causal = causal and Q_len > 1
+
+        if use_causal and Q_len < S_len:
+            # Bottom-right aligned causal mask for chunked prefill.
+            # Query i sits at sequence position (S-Q+i) and may attend
+            # to KV positions 0 .. (S-Q+i).
+            pos_offset = S_len - Q_len
+            q_pos = torch.arange(Q_len, device=q.device) + pos_offset
+            k_pos = torch.arange(S_len, device=q.device)
+            mask = k_pos[None, :] <= q_pos[:, None]   # (Q, S) bool
+            out = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask=mask,
+                scale=self.scale,
+            )
+        else:
+            # Q == S (full prefill) — is_causal top-left == bottom-right
+            out = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                is_causal=use_causal,
+                scale=self.scale,
+            )
         # (1, NH, Q, HD) → (Q, NH, HD)
         return out.squeeze(0).permute(1, 0, 2)
 
