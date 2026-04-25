@@ -522,7 +522,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         # 1) Compress and store new KV tokens
         #    During CUDAGraph replay key/value are None — skip storage.
-        if key is not None and value is not None:
+        has_raw_kv = key is not None and value is not None
+        if has_raw_kv:
             self._store_compressed(
                 key[:N], value[:N], kv_cache,
                 attn_metadata.slot_mapping[:N], block_size)
@@ -547,7 +548,38 @@ class TurboQuantAttentionImpl(AttentionImpl):
             if q_len == 0 or seq_len == 0:
                 continue
 
-            # Gather compressed KV for this request
+            q = query[qs:qe]  # (q_len, nh, hd)
+
+            # 3a) SDPA prefill: use raw K/V with memory-efficient attention.
+            #     FlashAttention uses O(1) memory vs O(Q*S) for the manual
+            #     path, preventing OOM on long contexts.
+            #     Falls back to manual path for logit soft-capping (Gemma)
+            #     or when raw K/V are unavailable (CUDAGraph replay).
+            if has_raw_kv and q_len > 1 and self.logits_soft_cap is None:
+                k_new = key[qs:qe]    # (q_len, nkh, hd)
+                v_new = value[qs:qe]  # (q_len, nkh, hd)
+
+                cached_len = seq_len - q_len
+                if cached_len > 0:
+                    k_cached, v_cached = self._decompress_kv_from_cache(
+                        kv_cache, attn_metadata.block_table[ri],
+                        cached_len, block_size)
+                    k_full = torch.cat([k_cached, k_new], dim=0)
+                    v_full = torch.cat([v_cached, v_new], dim=0)
+                else:
+                    k_full = k_new
+                    v_full = v_new
+
+                out = self._sdpa_prefill(
+                    q, k_full, v_full, causal=attn_metadata.causal)
+
+                if output.dim() == 3:
+                    output[qs:qe] = out.to(output.dtype)
+                else:
+                    output[qs:qe] = out.reshape(q_len, -1).to(output.dtype)
+                continue
+
+            # 3b) Fallback: TQ decompress + manual attention
             n_blk = (seq_len + block_size - 1) // block_size
             blk_ids = attn_metadata.block_table[ri, :n_blk]
             comp = kv_cache[blk_ids]   # (n_blk, bs, nkh, fp16)
@@ -558,7 +590,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
             comp_bytes = comp.contiguous().view(torch.uint8).reshape(
                 seq_len, self.num_kv_heads, self._layout.total_bytes)
 
-            q = query[qs:qe]  # (q_len, nh, hd)
             pos_offset = seq_len - q_len  # first query's position in sequence
 
             self._attn_one_request(
@@ -625,6 +656,106 @@ class TurboQuantAttentionImpl(AttentionImpl):
             self._key_q,
             self._val_q,
         )
+
+    # ── SDPA prefill (memory-efficient) ────────────────────────────────
+
+    def _sdpa_prefill(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Prefill attention via F.scaled_dot_product_attention.
+
+        Uses FlashAttention or the memory-efficient SDPA backend which
+        requires O(1) extra memory for the attention matrix — versus
+        O(Q*S*H) for the manual einsum path.  This prevents OOM on long
+        contexts where the manual path would materialise a huge score
+        tensor.
+
+        When Q < S (prefix-cache hit / chunked prefill), SDPA's
+        ``is_causal=True`` produces a bottom-right aligned causal mask,
+        which is exactly correct.
+
+        Args:
+            q: (Q, num_heads, head_dim)
+            k: (S, num_kv_heads, head_dim)
+            v: (S, num_kv_heads, head_dim)
+            causal: whether to apply causal mask
+
+        Returns:
+            (Q, num_heads, head_dim)
+        """
+        Q_len = q.shape[0]
+
+        # SDPA expects (batch, heads, seq, dim)
+        q_sdpa = q.permute(1, 0, 2).unsqueeze(0)   # (1, NH, Q, HD)
+        k_sdpa = k.permute(1, 0, 2).unsqueeze(0)   # (1, NKH, S, HD)
+        v_sdpa = v.permute(1, 0, 2).unsqueeze(0)   # (1, NKH, S, HD)
+
+        # Expand KV heads for GQA
+        if self._heads_per_kv > 1:
+            k_sdpa = k_sdpa.repeat_interleave(self._heads_per_kv, dim=1)
+            v_sdpa = v_sdpa.repeat_interleave(self._heads_per_kv, dim=1)
+
+        out = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            is_causal=causal and Q_len > 1,
+            scale=self.scale,
+        )
+        # (1, NH, Q, HD) → (Q, NH, HD)
+        return out.squeeze(0).permute(1, 0, 2)
+
+    def _decompress_kv_from_cache(
+        self, kv_cache: torch.Tensor, block_table_row: torch.Tensor,
+        num_tokens: int, block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decompress prefix-cached KV tokens to dense tensors for SDPA.
+
+        Uses MSE reconstruction only (no QJL correction, which is
+        query-dependent and cannot be pre-applied).  MSE at 2-bit gives
+        a good approximation — prefill quality on the cached prefix is
+        not as critical as decode accuracy.
+
+        Returns:
+            (keys, values) each shaped (num_tokens, num_kv_heads, head_dim)
+        """
+        n_blk = (num_tokens + block_size - 1) // block_size
+        blk_ids = block_table_row[:n_blk]
+        comp = kv_cache[blk_ids]
+        comp = comp.reshape(-1, self.num_kv_heads, self._layout.fp16_elems)
+        comp = comp[:num_tokens]
+
+        comp_bytes = comp.contiguous().view(torch.uint8).reshape(
+            num_tokens, self.num_kv_heads, self._layout.total_bytes)
+
+        S = num_tokens
+        nkh = self.num_kv_heads
+        hd = self.head_size
+
+        flat_bytes = comp_bytes.reshape(S * nkh, self._layout.total_bytes)
+        (km_idx, _, _,
+         k_norm, vm_idx, v_norm) = self._layout.unpack(flat_bytes)
+        km_idx = km_idx.reshape(S, nkh, hd)
+        k_norm = k_norm.reshape(S, nkh)
+        vm_idx = vm_idx.reshape(S, nkh, hd)
+        v_norm = v_norm.reshape(S, nkh)
+
+        # Keys: k ≈ k_norm * inverse_rotate(centroids[mse_idx])
+        k_rotated = self._key_centroids[km_idx.reshape(-1, hd)]
+        if self._rotation == "wht":
+            k_dir = wht_unrotate(k_rotated.float(), self._key_sigma).half()
+        else:
+            k_dir = (k_rotated @ self._key_Pi).half()
+        k_full = k_dir.reshape(S, nkh, hd) * k_norm.half().unsqueeze(-1)
+
+        # Values: v ≈ v_norm * inverse_rotate(centroids[val_idx])
+        v_rotated = self._val_centroids[vm_idx.reshape(-1, hd)]
+        if self._rotation == "wht":
+            v_dir = wht_unrotate(v_rotated.float(), self._val_sigma).half()
+        else:
+            v_dir = (v_rotated @ self._val_Pi).half()
+        v_full = v_dir.reshape(S, nkh, hd) * v_norm.half().unsqueeze(-1)
+
+        return k_full, v_full
 
     # ── attention for one request (batched across all KV heads) ─────
 
