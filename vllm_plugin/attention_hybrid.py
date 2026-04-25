@@ -302,6 +302,29 @@ class HybridTQAttentionImpl(AttentionImpl):
 
         return k_deq, v_deq
 
+    def _attn_manual_softcap(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        q_len: int, seq_len: int, pos_offset: int, causal: bool,
+    ) -> torch.Tensor:
+        """Manual attention with Gemma-style tanh logit soft-capping.
+
+        SDPA has no hook for soft-capping, so when ``self.logits_soft_cap``
+        is set we compute scores → tanh-cap → (optional causal mask) →
+        softmax → @V ourselves.  Inputs are already shaped for SDPA:
+        ``(1, nh, *, hd)``.
+        """
+        cap = self.logits_soft_cap
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        scores = (scores.float() / cap).tanh() * cap
+        if causal and q_len > 1:
+            qpos = torch.arange(q_len, device=q.device) + pos_offset
+            kpos = torch.arange(seq_len, device=q.device)
+            mask = kpos[None, :] > qpos[:, None]            # (q_len, s_len)
+            scores = scores.masked_fill(
+                mask[None, None, :, :], float("-inf"))
+        weights = F.softmax(scores, dim=-1).to(v.dtype)
+        return torch.matmul(weights, v)
+
     def _attn_sdpa(
         self, queries: torch.Tensor, comp_bytes: torch.Tensor,
         seq_len: int, q_len: int, pos_offset: int,
@@ -329,18 +352,11 @@ class HybridTQAttentionImpl(AttentionImpl):
         k = k_deq.half().permute(1, 0, 2).unsqueeze(0)     # (1, nh, s_len, hd)
         v = v_deq.half().permute(1, 0, 2).unsqueeze(0)     # (1, nh, s_len, hd)
 
-        # When logits_soft_cap is set, SDPA can't apply it (the cap goes
-        # between score computation and softmax), so fall back to manual attention.
         if self.logits_soft_cap is not None:
-            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            cap = self.logits_soft_cap
-            scores = (scores / cap).tanh() * cap
-            if causal and q_len > 1:
-                qpos = torch.arange(q_len, device=queries.device) + pos_offset
-                kpos = torch.arange(seq_len, device=queries.device)
-                cmask = kpos[None, :] > qpos[:, None]
-                scores.masked_fill_(cmask.unsqueeze(0).unsqueeze(0), float("-inf"))
-            out = torch.matmul(F.softmax(scores, dim=-1), v)
+            # SDPA has no soft-cap option — do the attention manually so we
+            # can apply tanh(x / cap) * cap to the pre-softmax logits.
+            out = self._attn_manual_softcap(
+                q, k, v, q_len, seq_len, pos_offset, causal)
         elif causal and q_len > 1 and pos_offset == 0 and q_len == seq_len:
             # Full prefill — use is_causal=True (efficient fused path)
             out = F.scaled_dot_product_attention(
