@@ -354,10 +354,13 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def get_kv_cache_shape(num_blocks: int, block_size: int,
                            num_kv_heads: int, head_size: int,
                            cache_dtype_str: str = "auto") -> tuple[int, ...]:
-        b_mse = int(os.environ.get("TQ_B_MSE", "2"))
-        b_qjl = int(os.environ.get("TQ_B_QJL", "1"))
-        val_bits = b_mse + b_qjl
-        fp16 = _compressed_fp16_elems(head_size, b_mse, b_qjl, val_bits)
+        cfg = TurboQuantConfig(
+            num_heads=num_kv_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_size,
+        )
+        fp16 = _compressed_fp16_elems(
+            head_size, cfg.b_mse, cfg.b_qjl, cfg.b_total)
         return (num_blocks, block_size, num_kv_heads, fp16)
 
     @staticmethod
