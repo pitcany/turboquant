@@ -8,7 +8,6 @@ than inside a closure.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from vllm.v1.kv_cache_interface import FullAttentionSpec, get_dtype_size
@@ -22,20 +21,29 @@ class TurboQuantSpec(FullAttentionSpec):
     Tells vLLM's block allocator to use ~4.3x less memory per KV cache
     page, matching the TurboQuant compressed layout.
 
-    The page size is snapshotted once in ``__post_init__`` and baked into
-    the pickled state, so every TP worker sees an identical value —
-    re-reading ``TQ_B_MSE`` / ``TQ_B_QJL`` on each access would let a worker
-    with a divergent environment compute a different page size than the
-    driver that owns the allocator.
+    The page size is snapshotted once in ``__post_init__`` (via
+    ``TurboQuantConfig`` so env *and* GGUF overrides are honoured) and
+    baked into the pickled state, so every TP worker sees an identical
+    value regardless of its own environment.
     """
 
     def __post_init__(self) -> None:
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
-        b_mse = int(os.environ.get("TQ_B_MSE", "2"))
-        b_qjl = int(os.environ.get("TQ_B_QJL", "1"))
-        val_bits = b_mse + b_qjl
-        fp16 = _compressed_fp16_elems(self.head_size, b_mse, b_qjl, val_bits)
+        # Route through TurboQuantConfig so b_mse / b_qjl honour both env
+        # vars and GGUF metadata (TQ_GGUF_PATH).  Reading os.environ directly
+        # would skip GGUF overrides and produce a page size that disagrees
+        # with what TurboQuantAttentionImpl writes — silent buffer overrun.
+        # Pass num_heads = num_kv_heads to trivially satisfy the config's
+        # divisibility validation when env/GGUF leave num_heads at its default.
+        from vllm_plugin.config import TurboQuantConfig
+        cfg = TurboQuantConfig(
+            num_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+        )
+        fp16 = _compressed_fp16_elems(
+            self.head_size, cfg.b_mse, cfg.b_qjl, cfg.b_total)
         size = (
             self.block_size * self.num_kv_heads
             * fp16 * get_dtype_size(self.dtype)
