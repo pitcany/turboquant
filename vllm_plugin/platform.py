@@ -40,17 +40,13 @@ def register_turboquant() -> None:
             )
             logger.info("[TurboQuant] Registered as CUSTOM attention backend")
 
-        # Only patch KV cache allocation when TQ is enabled.
-        # Without this guard, standard (non-TQ) configs get compressed-sized
-        # cache pages but the standard backend writes full fp16 data → crash.
-        # TQ_PATCH_KV=1 is the explicit opt-in; defaults to enabled when
-        # TQ_USE_TRITON or TQ_HYBRID are set.
-        patch_kv = os.environ.get("TQ_PATCH_KV", "")
-        if patch_kv == "":
-            # Auto-detect: patch if TQ features are enabled
-            patch_kv = "1" if (
-                os.environ.get("TQ_USE_TRITON", "0") == "1" or use_hybrid
-            ) else "0"
+        # Patch KV cache allocation whenever the TQ backend is registered.
+        # Every TQ backend variant (pure-torch, hybrid, triton) reads/writes
+        # the compressed byte layout via the same get_kv_cache_shape, so the
+        # allocator must use the compressed page size too — otherwise the
+        # default FP16-sized pages silently waste ~4× the memory.
+        # Set TQ_PATCH_KV=0 to opt out explicitly.
+        patch_kv = os.environ.get("TQ_PATCH_KV", "1")
         if patch_kv == "1":
             _patch_kv_cache_spec()
         else:
