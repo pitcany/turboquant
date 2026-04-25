@@ -1,5 +1,31 @@
 # TurboQuant — Changelog
 
+## 2026-04-24: Restore vLLM plugin with configurable bit-widths
+
+Re-introduced the vLLM attention backend plugin (`vllm_plugin/`), which was
+removed on 2026-04-12 to focus on Ollama. The plugin is now restored from
+git history with the following enhancements:
+
+### Added
+
+- Configurable MSE bit-width: `TQ_B_MSE` supports 2, 3, or 4 (was hardcoded to 2)
+- Head dimension support: d64, d128, d256 (was hardcoded to d128)
+- Generic bitplane packing for 3-bit and 5-bit value indices
+- Config validation for `b_mse ∈ {2,3,4}` and `head_dim ∈ {64,128,256}`
+- `tests/test_vllm_plugin.py`: 57 tests covering config, packing, layout, KV spec
+
+### Preserved
+
+- Backward-compatible wire format: d128/b_mse=2 still produces 118-byte blocks
+- Triton decode kernel works unchanged for b_mse=2 (auto-fallback to torch for b_mse=3,4)
+- All existing infrastructure (`gpu-models` presets, env files, profile switching) works as-is
+
+### Restored
+
+- `vllm_plugin/` — 10 Python modules (attention, config, platform, triton kernels, etc.)
+- `setup.py` — vLLM entry point registration (`vllm.general_plugins`)
+- `tests/test_triton_kernels.py` — Triton kernel tests
+
 ## 2026-04-14: Fix garbled output with TQ4P KV cache + flash attention
 
 Flash attention with TQ4P KV cache produced completely garbled output
