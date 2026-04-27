@@ -52,6 +52,9 @@ class HybridTQAttentionBackend(AttentionBackend):
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = True
+    # Not CUDAGraph-safe: the forward loop iterates over requests in Python
+    # and calls SDPA per-request with dynamic shapes.
+    use_cudagraph: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16, torch.bfloat16,
     ]
